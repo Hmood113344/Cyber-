@@ -19,7 +19,7 @@ const CONFIG = {
     BOT_TOKEN: process.env.BOT_TOKEN || "",
     GUILD_ID: process.env.GUILD_ID || "",
     MONGO_URI: process.env.MONGO_URI || "",
-    CYBER_ROLE_ID: process.env.CYBER_ROLE_ID || "",                  // رتبة منسوبي الأمن السيبراني (شرط الدخول)
+    CYBER_ROLE_ID: process.env.CYBER_ROLE_ID || "1554783236369031240",                  // رتبة منسوبي الأمن السيبراني (شرط الدخول)
     SESSION_SECRET: process.env.SESSION_SECRET || "غيّر_هذا_السر_2026",
     PORT: process.env.PORT || 7800,
     SITE_NAME: "الأمن السيبراني",
