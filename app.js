@@ -21,7 +21,9 @@ const CONFIG = {
     GUILD_ID: process.env.GUILD_ID || "1497233353030766662",
     MONGO_URI: process.env.MONGO_URI || "",
     // ⬇️ حط آيدي رتبة الأمن السيبراني هنا بين علامتي التنصيص (شرط الدخول للموقع)
-    CYBER_ROLE_ID: "1554783236369031240",
+    CYBER_ROLE_ID: "1554783236369031240",       // رتبة عضو الأمن السيبراني (شرط أصل الدخول)
+    LEADER_ROLE_ID: "1554992888260337736",       // رتبة قائد الأمن السيبراني (صلاحيات كاملة)
+    DEPUTY_ROLE_ID: "1554992975887728760",       // رتبة نائب قائد الأمن السيبراني (صلاحيات كاملة)
     SESSION_SECRET: process.env.SESSION_SECRET || "غيّر_هذا_السر_2026",
     PORT: process.env.PORT || 7800,
     SITE_NAME: "الأمن السيبراني",
@@ -492,34 +494,31 @@ app.use(session({
 const wrap = fn => (req, res, next) => Promise.resolve(fn(req, res, next)).catch(e => { console.error("❌", req.method, req.path, e); if (!res.headersSent) res.status(500).json({ error: e.message || "صار خطأ بالسيرفر" }); });
 
 const roleCheck = new Map();
-const lastReason = new Map();
 async function stillAuthorized(uid) {
     const c = roleCheck.get(uid);
-    if (c && Date.now() - c.t < 30000) return c.ok;
-    let ok = false, reason = "";
+    if (c && Date.now() - c.t < 30000) return c;
+    let level = null; // 'full' | 'view' | null
     try {
-        if (!CONFIG.CYBER_ROLE_ID || /[^0-9]/.test(CONFIG.CYBER_ROLE_ID)) reason = "آيدي الرتبة CYBER_ROLE_ID ما انحط بالكود (لازم أرقام فقط). القيمة الحالية: " + CONFIG.CYBER_ROLE_ID;
-        else if (!client || !client.isReady()) reason = "البوت مو شغال (تأكد من BOT_TOKEN وشوف Logs في Render).";
-        else {
-            let g = null;
-            try { g = await getGuild(); } catch {}
-            if (!g) reason = "البوت ما لقى السيرفر — GUILD_ID غلط أو البوت مو داخل السيرفر. القيمة الحالية: " + CONFIG.GUILD_ID;
-            else {
-                const m = await g.members.fetch({ user: uid }).catch(() => null);
-                if (!m) reason = "ما لقيت حسابك داخل السيرفر «" + g.name + "» — تأكد إنك داخل نفس السيرفر اللي فيه البوت، ومن تفعيل Server Members Intent.";
-                else if (!m.roles.cache.has(CONFIG.CYBER_ROLE_ID)) reason = "حسابك موجود بالسيرفر «" + g.name + "» لكن ما عنده الرتبة المطلوبة (" + CONFIG.CYBER_ROLE_ID + ").\nرتبك الحالية:\n" + m.roles.cache.filter(r => r.id !== g.id).map(r => r.name + " = " + r.id).join("\n");
-                else ok = true;
-            }
-        }
-    } catch (e) { reason = "خطأ: " + e.message; }
-    roleCheck.set(uid, { ok, t: Date.now() });
-    lastReason.set(uid, reason);
-    return ok;
+        const g = await getGuild();
+        const m = await g.members.fetch({ user: uid });
+        const isFull = (CONFIG.LEADER_ROLE_ID && m.roles.cache.has(CONFIG.LEADER_ROLE_ID)) || (CONFIG.DEPUTY_ROLE_ID && m.roles.cache.has(CONFIG.DEPUTY_ROLE_ID));
+        const isMember = CONFIG.CYBER_ROLE_ID && m.roles.cache.has(CONFIG.CYBER_ROLE_ID);
+        level = isFull ? "full" : isMember ? "view" : null;
+    } catch { level = null; }
+    const res = { ok: !!level, level };
+    roleCheck.set(uid, { ...res, t: Date.now() });
+    return res;
 }
 const auth = wrap(async (req, res, next) => {
     const u = req.session.user;
     if (!u) return res.status(401).json({ error: "سجّل دخولك" });
-    if (!(await stillAuthorized(u.id))) { req.session.destroy(() => {}); return res.status(401).json({ error: "تم سحب صلاحيتك" }); }
+    const r = await stillAuthorized(u.id);
+    if (!r.ok) { req.session.destroy(() => {}); return res.status(401).json({ error: "تم سحب صلاحيتك" }); }
+    req.session.user.level = r.level;
+    next();
+});
+const full = wrap(async (req, res, next) => {
+    if (req.session.user.level !== "full") return res.status(403).json({ error: "هذا الإجراء يحتاج صلاحية القائد أو النائب" });
     next();
 });
 
@@ -544,14 +543,15 @@ app.get("/auth/discord/callback", wrap(async (req, res) => {
     if (!ur.ok) return res.redirect("/?err=1");
     const u = await ur.json();
     roleCheck.delete(u.id);
-    const allowed = await stillAuthorized(u.id);
+    const r0 = await stillAuthorized(u.id);
+    const allowed = r0.ok;
     if (!allowed) {
         await LOGCAT({ cat: "panel", severity: "medium", title: "محاولة دخول مرفوضة للوحة", details: "ما معه رتبة الأمن السيبراني", actorId: u.id, actorTag: u.username, data: { act: "panel_denied" } });
         req.session.denied = true;
         return req.session.save(() => res.redirect("/?denied=1"));
     }
     req.session.user = {
-        id: u.id, tag: u.global_name || u.username,
+        id: u.id, tag: u.global_name || u.username, level: r0.level,
         avatar: u.avatar ? "https://cdn.discordapp.com/avatars/" + u.id + "/" + u.avatar + ".png?size=64" : "https://cdn.discordapp.com/embed/avatars/0.png",
     };
     delete req.session.denied;
@@ -651,7 +651,7 @@ async function runRemedy(g, r, who) {
     }
     throw new Error("إجراء غير معروف");
 }
-app.post("/api/events/:id/remedy", auth, wrap(async (req, res) => {
+app.post("/api/events/:id/remedy", auth, full, wrap(async (req, res) => {
     const e = await Event.findById(req.params.id);
     if (!e || !e.remedy) return res.status(404).json({ error: "ما فيه إجراء لهذي العملية" });
     if (e.resolved) return res.status(400).json({ error: "العملية محلولة من قبل" });
@@ -661,7 +661,7 @@ app.post("/api/events/:id/remedy", auth, wrap(async (req, res) => {
     await panelLog(req, "تنفيذ إجراء: " + e.remedy.label.replace(/^\S+\s/, ""), "العملية: " + e.title + " — " + msg);
     res.json({ ok: true, msg });
 }));
-app.post("/api/events/:id/resolve", auth, wrap(async (req, res) => {
+app.post("/api/events/:id/resolve", auth, full, wrap(async (req, res) => {
     const e = await Event.findById(req.params.id);
     if (!e) return res.status(404).json({ error: "غير موجودة" });
     e.resolved = true; e.resolvedBy = req.session.user.tag; e.resolvedAt = new Date(); e.updatedAt = new Date(); await e.save();
@@ -714,7 +714,7 @@ async function botList() {
     }).sort((a, b) => (b.dang.length - a.dang.length));
 }
 app.get("/api/bots", auth, wrap(async (req, res) => res.json({ bots: await botList(), presence: PRESENCE_OK })));
-app.post("/api/bots/:id/kick", auth, wrap(async (req, res) => {
+app.post("/api/bots/:id/kick", auth, full, wrap(async (req, res) => {
     const g = await getGuild();
     const m = await g.members.fetch(req.params.id).catch(() => null);
     if (!m || !m.user.bot) return res.status(404).json({ error: "البوت مو موجود" });
@@ -757,7 +757,7 @@ app.get("/api/perms/roles", auth, wrap(async (req, res) => {
     });
     res.json({ roles });
 }));
-app.put("/api/perms/roles/:id", auth, wrap(async (req, res) => {
+app.put("/api/perms/roles/:id", auth, full, wrap(async (req, res) => {
     const g = await getGuild();
     const r = g.roles.cache.get(req.params.id);
     if (!r) return res.status(404).json({ error: "الرتبة مو موجودة" });
@@ -783,7 +783,7 @@ app.get("/api/perms/channels", auth, wrap(async (req, res) => {
     });
     res.json({ channels: chans });
 }));
-app.put("/api/perms/channels/:id/:tid", auth, wrap(async (req, res) => {
+app.put("/api/perms/channels/:id/:tid", auth, full, wrap(async (req, res) => {
     const g = await getGuild();
     const c = g.channels.cache.get(req.params.id);
     if (!c || !c.permissionOverwrites) return res.status(404).json({ error: "القناة مو موجودة" });
@@ -959,7 +959,7 @@ function loginPage(mode) {
 
 const CLIENT = String.raw`
 var PAGES=[['logs','📜 اللوق'],['stats','📊 الإحصائيات'],['bots','🤖 البوتات'],['perms','🔐 صلاحيات السيرفر']];
-var S={page:'logs',q:'',cat:'',unres:false,events:[],sig:'',timer:null,permsTab:'roles',permsView:'danger',permsQ:'',meta:null,presence:true};
+var S={page:'logs',q:'',cat:'',unres:false,events:[],sig:'',timer:null,permsTab:'roles',permsView:'danger',permsQ:'',meta:null,presence:true,level:'view'};
 var CATS=[['','الكل'],['sus','⚠️ العمليات المشبوهة'],['newacc','🆕 حسابات جديدة'],['join','دخول'],['leave','خروج'],['kick','طرد'],['ban','حظر'],['role','الرتب'],['channel','القنوات'],['voice','🎙️ الرومات الصوتية'],['message','الرسائل المحذوفة'],['probot','🧹 حذف عبر ProBot'],['bot','البوتات'],['webhook','ويبهوكس'],['everyone','منشن everyone'],['server','إعدادات السيرفر'],['panel','عمليات اللوحة']];
 var RULE_AR={new_account:'حساب جديد',mass_roles_created:'رتب جماعية',mass_role_delete:'حذف رتب',mass_channel_create:'إنشاء قنوات',mass_channel_delete:'حذف قنوات',mass_ban:'حظر جماعي',mass_kick:'طرد جماعي',dangerous_perm_grant:'صلاحيات خطيرة',dangerous_role_assigned:'رتبة خطيرة',bot_added:'بوت جديد',webhook_created:'ويبهوك',everyone_spam:'منشن everyone',mass_join:'غارة دخول',mass_msg_delete:'مسح ضخم',server_changed:'إعدادات السيرفر'};
 function $(id){return document.getElementById(id);}
@@ -1030,7 +1030,7 @@ function evRow(e){
   if(e.resolved&&e.resolvedBy)meta+=' &nbsp;•&nbsp; حلّها: '+esc(e.resolvedBy);
   var acts='';
   if(e.hasMsgs)acts+='<button class="btn sm gray" onclick="showMsgs(\''+e._id+'\')">📄 عرض الرسائل</button>';
-  if(sus&&!e.resolved){
+  if(sus&&!e.resolved&&S.level==='full'){
     if(e.remedy)acts+='<button class="btn sm danger" onclick="doRemedy(\''+e._id+'\',this)">'+esc(e.remedy.label)+'</button>';
     acts+='<button class="btn sm ok" onclick="doResolve(\''+e._id+'\',this)">✅ حل العملية</button>';
   }
@@ -1097,7 +1097,7 @@ async function pgBots(){
        +(b.dang.length?'<div style="margin-top:6px">'+b.dang.map(function(d){return '<span class="chip '+d.level+'">'+esc(d.ar)+'</span>';}).join('')+'</div>':'')
        +(b.activity.length?'<div class="log-meta">⚙️ نشاطه آخر 24 ساعة: '+esc(b.activity.slice(0,4).join(' • '))+'</div>':'<div class="log-meta">⚙️ لا يوجد نشاط مسجّل آخر 24 ساعة</div>')
        +'<div class="log-meta">📥 دخل: '+(b.joinedAt?fmt(b.joinedAt):'-')+(b.addedBy?' • أضافه: '+esc(b.addedBy):'')+'</div></div>'
-       +'<button class="btn sm danger" onclick="kickBot(\''+b.id+'\',\''+esc(b.name).replace(/'/g,'')+'\')">👢 طرد</button></div></div>';
+       +(S.level==='full'?'<button class="btn sm danger" onclick="kickBot(\''+b.id+'\',\''+esc(b.name).replace(/'/g,'')+'\')">👢 طرد</button>':'')+'</div></div>';
     }).join('')||'<div class="card center muted">ما فيه بوتات</div>';
     $('main').innerHTML=html;
   }catch(e){toast(e.message);}
@@ -1132,21 +1132,22 @@ async function drawRoles(nf){
     var shown=view==='danger'?r.dang:r.perms;
     return '<div class="card"><div class="row"><div><div class="log-title"><span><i class="dot" style="background:'+(r.color&&r.color!=='#000000'?r.color:'#64748b')+'"></i>'+esc(r.name)+'</span>'
      +(r.dang.length?'<span class="badge high">'+r.dang.length+' خطيرة</span>':'<span class="badge done">آمنة</span>')+'</div><div class="log-meta">👥 '+r.members+' عضو</div></div>'
-     +'<button class="btn sm '+(r.editable?'':'gray')+'" onclick="editRole(\''+r.id+'\')">'+(r.editable?'✏️ عرض وتعديل':'👁️ عرض فقط')+'</button></div>'
+     +'<button class="btn sm '+((r.editable&&S.level==='full')?'':'gray')+'" onclick="editRole(\''+r.id+'\')">'+((r.editable&&S.level==='full')?'✏️ عرض وتعديل':'👁️ عرض فقط')+'</button></div>'
      +'<div style="margin-top:8px">'+(shown.length?permChips(shown,S.meta.role):'<span class="muted" style="font-size:12px">لا صلاحيات</span>')+'</div></div>';
   }).join('')||(q?'<div class="card center muted">ما لقيت رتبة بهذا الاسم</div>':'<div class="card center muted">ما فيه رتب بصلاحيات خطيرة 👌</div>');
   if($('pbox'))$('pbox').innerHTML=html;
 }
 function editRole(id){
   var r=S.roles.find(function(x){return x.id===id;});
+  var canEdit=r.editable&&S.level==='full';
   var rows=S.meta.role.map(function(p){
     return '<div class="prow '+(p.danger==='critical'?'crit':p.danger==='high'?'hi':'')+'"><span>'+(p.danger?'<span class="chip '+p.danger+'">'+(p.danger==='critical'?'خطيرة جداً':'خطيرة')+'</span>':'')+esc(p.ar)+'</span>'
-     +'<label class="sw"><input type="checkbox" data-k="'+p.k+'"'+(r.perms.indexOf(p.k)>-1?' checked':'')+(r.editable?'':' disabled')+'><span></span></label></div>';
+     +'<label class="sw"><input type="checkbox" data-k="'+p.k+'"'+(r.perms.indexOf(p.k)>-1?' checked':'')+(canEdit?'':' disabled')+'><span></span></label></div>';
   }).join('');
-  modal('<h3>صلاحيات الرتبة: '+esc(r.name)+'</h3>'+(r.editable?'':'<div class="warn">هذي الرتبة أعلى من رتبة البوت (أو رتبة بوت) — للعرض فقط.</div>')
+  modal('<h3>صلاحيات الرتبة: '+esc(r.name)+'</h3>'+(canEdit?'':(r.editable?'<div class="warn">ماعندك صلاحية التعديل — عرض فقط.</div>':'<div class="warn">هذي الرتبة أعلى من رتبة البوت (أو رتبة بوت) — للعرض فقط.</div>'))
    +'<div style="max-height:60vh;overflow-y:auto">'+rows+'</div><div class="row" style="justify-content:flex-start;margin-top:14px">'
-   +(r.editable?'<button class="btn" id="rs">💾 حفظ</button>':'')+'<button class="btn gray" onclick="closeModal()">إغلاق</button></div>');
-  if(r.editable)$('rs').onclick=async function(){
+   +(canEdit?'<button class="btn" id="rs">💾 حفظ</button>':'')+'<button class="btn gray" onclick="closeModal()">إغلاق</button></div>');
+  if(canEdit)$('rs').onclick=async function(){
     var perms=[].slice.call(document.querySelectorAll('.modal input[data-k]')).filter(function(i){return i.checked;}).map(function(i){return i.getAttribute('data-k');});
     if(perms.indexOf('Administrator')>-1&&r.perms.indexOf('Administrator')<0&&!(await ask('تفعيل صلاحية المدير (Administrator) يعطي الرتبة كل الصلاحيات. متأكد؟')))return;
     this.disabled=true;
@@ -1162,7 +1163,7 @@ async function drawChannels(nf){
   var html=list.map(function(c){
     var ovs=(view==='danger'?c.overwrites.filter(function(o){return o.dang.length;}):c.overwrites).map(function(o){
       return '<div class="prow"><span><b>'+(o.type==='role'?'👥 ':'👤 ')+esc(o.name)+'</b> '+(o.dang.length?permChips(o.dang,S.meta.channel):'<span class="chip safe">بدون صلاحيات خطيرة</span>')+'</span>'
-       +'<button class="btn sm" onclick="editOv(\''+c.id+'\',\''+o.id+'\')">✏️ تعديل</button></div>';
+       +'<button class="btn sm '+(S.level==='full'?'':'gray')+'" onclick="editOv(\''+c.id+'\',\''+o.id+'\')">'+(S.level==='full'?'✏️ تعديل':'👁️ عرض')+'</button></div>';
     }).join('');
     return '<div class="card"><div class="log-title"><span>'+c.icon+' '+esc(c.name)+'</span>'+(c.parent?'<span class="muted" style="font-size:12px">'+esc(c.parent)+'</span>':'')+(c.hasDanger?'<span class="badge high">صلاحيات خطيرة</span>':'')+'</div>'+ovs+'</div>';
   }).join('')||(q?'<div class="card center muted">ما لقيت شات بهذا الاسم</div>':'<div class="card center muted">ما فيه قنوات بصلاحيات خطيرة 👌</div>');
@@ -1170,14 +1171,15 @@ async function drawChannels(nf){
 }
 function editOv(cid,tid){
   var c=S.chans.find(function(x){return x.id===cid;});var o=c.overwrites.find(function(x){return x.id===tid;});
+  var canEdit=S.level==='full';
   var rows=S.meta.channel.map(function(p){
     var st=o.allow.indexOf(p.k)>-1?'a':o.deny.indexOf(p.k)>-1?'d':'n';
     return '<div class="prow '+(p.danger==='critical'?'crit':p.danger==='high'?'hi':'')+'" data-k="'+p.k+'" data-s="'+st+'"><span>'+(p.danger?'<span class="chip '+p.danger+'">'+(p.danger==='critical'?'خطيرة جداً':'خطيرة')+'</span>':'')+esc(p.ar)+'</span>'
-     +'<div class="tri"><button class="a '+(st==='a'?'on':'')+'" onclick="setTri(this,\'a\')">✓</button><button class="n '+(st==='n'?'on':'')+'" onclick="setTri(this,\'n\')">—</button><button class="d '+(st==='d'?'on':'')+'" onclick="setTri(this,\'d\')">✗</button></div></div>';
+     +'<div class="tri"><button class="a '+(st==='a'?'on':'')+'"'+(canEdit?' onclick="setTri(this,\'a\')"':' disabled')+'>✓</button><button class="n '+(st==='n'?'on':'')+'"'+(canEdit?' onclick="setTri(this,\'n\')"':' disabled')+'>—</button><button class="d '+(st==='d'?'on':'')+'"'+(canEdit?' onclick="setTri(this,\'d\')"':' disabled')+'>✗</button></div></div>';
   }).join('');
-  modal('<h3>'+esc(c.name)+' — '+esc(o.name)+'</h3><p class="muted center" style="font-size:12px;margin-bottom:8px">✓ سماح &nbsp; — افتراضي &nbsp; ✗ منع</p><div style="max-height:60vh;overflow-y:auto">'+rows+'</div>'
-   +'<div class="row" style="justify-content:flex-start;margin-top:14px"><button class="btn" id="os">💾 حفظ</button><button class="btn gray" onclick="closeModal()">إغلاق</button></div>');
-  $('os').onclick=async function(){
+  modal('<h3>'+esc(c.name)+' — '+esc(o.name)+'</h3>'+(canEdit?'<p class="muted center" style="font-size:12px;margin-bottom:8px">✓ سماح &nbsp; — افتراضي &nbsp; ✗ منع</p>':'<div class="warn">ماعندك صلاحية التعديل — عرض فقط.</div>')+'<div style="max-height:60vh;overflow-y:auto">'+rows+'</div>'
+   +'<div class="row" style="justify-content:flex-start;margin-top:14px">'+(canEdit?'<button class="btn" id="os">💾 حفظ</button>':'')+'<button class="btn gray" onclick="closeModal()">إغلاق</button></div>');
+  if(canEdit)$('os').onclick=async function(){
     var allow=[],deny=[];
     document.querySelectorAll('.modal .prow[data-k]').forEach(function(r){var s=r.getAttribute('data-s');if(s==='a')allow.push(r.getAttribute('data-k'));if(s==='d')deny.push(r.getAttribute('data-k'));});
     this.disabled=true;
@@ -1189,7 +1191,7 @@ function setTri(b,s){var row=b.closest('.prow');row.setAttribute('data-s',s);row
 /* ── تشغيل ── */
 (async function(){
   try{
-    var me=await api('/api/me');S.presence=me.presence;
+    var me=await api('/api/me');S.presence=me.presence;S.level=me.user.level||'view';
     $('uchip').innerHTML='<img src="'+esc(me.user.avatar)+'" alt=""><span>'+esc(me.user.tag)+'</span><a class="btn sm gray" href="/auth/logout">خروج</a>';
     buildNav();render();
   }catch(e){}
