@@ -18,10 +18,10 @@ const CONFIG = {
     DISCORD_CALLBACK_URL: process.env.DISCORD_CALLBACK_URL || "",   // مثال: https://xxx.onrender.com/auth/discord/callback
     BOT_TOKEN: process.env.BOT_TOKEN || "",
     // ⬇️ حط آيدي سيرفر وزارة الداخلية هنا
-    GUILD_ID: process.env.GUILD_ID || "1497233353030766662",
+    GUILD_ID: process.env.GUILD_ID || "ضع_آيدي_السيرفر_هنا",
     MONGO_URI: process.env.MONGO_URI || "",
     // ⬇️ حط آيدي رتبة الأمن السيبراني هنا بين علامتي التنصيص (شرط الدخول للموقع)
-    CYBER_ROLE_ID: "1554783236369031240",
+    CYBER_ROLE_ID: "ضع_آيدي_الرتبة_هنا",
     SESSION_SECRET: process.env.SESSION_SECRET || "غيّر_هذا_السر_2026",
     PORT: process.env.PORT || 7800,
     SITE_NAME: "الأمن السيبراني",
@@ -535,7 +535,6 @@ app.get("/auth/discord/callback", wrap(async (req, res) => {
     if (!allowed) {
         await LOGCAT({ cat: "panel", severity: "medium", title: "محاولة دخول مرفوضة للوحة", details: "ما معه رتبة الأمن السيبراني", actorId: u.id, actorTag: u.username, data: { act: "panel_denied" } });
         req.session.denied = true;
-        req.session.denyReason = lastReason.get(u.id) || "";
         return req.session.save(() => res.redirect("/?denied=1"));
     }
     req.session.user = {
@@ -899,11 +898,10 @@ const HEAD = (title) => `<!DOCTYPE html>
 <link href="https://fonts.googleapis.com/css2?family=Tajawal:wght@400;500;700;800&display=swap" rel="stylesheet">
 <style>${CSS}</style></head>`;
 
-function loginPage(mode, reason) {
+function loginPage(mode) {
     let body;
     if (mode === "denied") body = `<div class="auth-card deny"><div class="ico">⛔</div><h1>غير مصرّح</h1>
         <p>هذا الموقع فقط لمنسوبي الأمن السيبراني.<br>حسابك لا يملك الرتبة المطلوبة.</p>
-        ${reason ? '<div class="warn" style="text-align:right;white-space:pre-line;direction:rtl;word-break:break-all">🔎 السبب: ' + String(reason).replace(/&/g, "&amp;").replace(/</g, "&lt;") + '</div>' : ""}
         <a class="btn gray" href="/auth/discord">تسجيل الدخول بحساب آخر</a></div>`;
     else body = `<div class="auth-card"><div class="ico">🛡️</div><h1>${CONFIG.SITE_NAME}</h1>
         <p>${CONFIG.SITE_SUB}<br>الدخول مخصّص لمنسوبي الأمن السيبراني فقط، سجّل دخولك بحساب ديسكورد ليتم التحقق من رتبتك.</p>
@@ -1161,7 +1159,7 @@ function appPage() {
 app.get("/", (req, res) => {
     if (req.session.user) return res.send(appPage());
     const mode = req.query.denied ? "denied" : req.query.err ? "err" : "login";
-    res.send(loginPage(mode, mode === "denied" ? req.session.denyReason : ""));
+    res.send(loginPage(mode));
 });
 app.get("/healthz", (req, res) => res.send("ok"));
 
