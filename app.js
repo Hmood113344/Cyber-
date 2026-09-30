@@ -18,10 +18,10 @@ const CONFIG = {
     DISCORD_CALLBACK_URL: process.env.DISCORD_CALLBACK_URL || "",   // مثال: https://xxx.onrender.com/auth/discord/callback
     BOT_TOKEN: process.env.BOT_TOKEN || "",
     // ⬇️ حط آيدي سيرفر وزارة الداخلية هنا
-    GUILD_ID: process.env.GUILD_ID || "1497233353030766662",
+    GUILD_ID: process.env.GUILD_ID || "ضع_آيدي_السيرفر_هنا",
     MONGO_URI: process.env.MONGO_URI || "",
     // ⬇️ حط آيدي رتبة الأمن السيبراني هنا بين علامتي التنصيص (شرط الدخول للموقع)
-    CYBER_ROLE_ID: "1554783236369031240",
+    CYBER_ROLE_ID: "ضع_آيدي_الرتبة_هنا",
     SESSION_SECRET: process.env.SESSION_SECRET || "غيّر_هذا_السر_2026",
     PORT: process.env.PORT || 7800,
     SITE_NAME: "الأمن السيبراني",
@@ -479,16 +479,28 @@ app.use(session({
 const wrap = fn => (req, res, next) => Promise.resolve(fn(req, res, next)).catch(e => { console.error("❌", req.method, req.path, e); if (!res.headersSent) res.status(500).json({ error: e.message || "صار خطأ بالسيرفر" }); });
 
 const roleCheck = new Map();
+const lastReason = new Map();
 async function stillAuthorized(uid) {
     const c = roleCheck.get(uid);
     if (c && Date.now() - c.t < 30000) return c.ok;
-    let ok = false;
+    let ok = false, reason = "";
     try {
-        const g = await getGuild();
-        const m = await g.members.fetch({ user: uid });
-        ok = !!CONFIG.CYBER_ROLE_ID && m.roles.cache.has(CONFIG.CYBER_ROLE_ID);
-    } catch { ok = false; }
+        if (!CONFIG.CYBER_ROLE_ID || /[^0-9]/.test(CONFIG.CYBER_ROLE_ID)) reason = "آيدي الرتبة CYBER_ROLE_ID ما انحط بالكود (لازم أرقام فقط). القيمة الحالية: " + CONFIG.CYBER_ROLE_ID;
+        else if (!client || !client.isReady()) reason = "البوت مو شغال (تأكد من BOT_TOKEN وشوف Logs في Render).";
+        else {
+            let g = null;
+            try { g = await getGuild(); } catch {}
+            if (!g) reason = "البوت ما لقى السيرفر — GUILD_ID غلط أو البوت مو داخل السيرفر. القيمة الحالية: " + CONFIG.GUILD_ID;
+            else {
+                const m = await g.members.fetch({ user: uid }).catch(() => null);
+                if (!m) reason = "ما لقيت حسابك داخل السيرفر «" + g.name + "» — تأكد إنك داخل نفس السيرفر اللي فيه البوت، ومن تفعيل Server Members Intent.";
+                else if (!m.roles.cache.has(CONFIG.CYBER_ROLE_ID)) reason = "حسابك موجود بالسيرفر «" + g.name + "» لكن ما عنده الرتبة المطلوبة (" + CONFIG.CYBER_ROLE_ID + ").\nرتبك الحالية:\n" + m.roles.cache.filter(r => r.id !== g.id).map(r => r.name + " = " + r.id).join("\n");
+                else ok = true;
+            }
+        }
+    } catch (e) { reason = "خطأ: " + e.message; }
     roleCheck.set(uid, { ok, t: Date.now() });
+    lastReason.set(uid, reason);
     return ok;
 }
 const auth = wrap(async (req, res, next) => {
@@ -523,6 +535,7 @@ app.get("/auth/discord/callback", wrap(async (req, res) => {
     if (!allowed) {
         await LOGCAT({ cat: "panel", severity: "medium", title: "محاولة دخول مرفوضة للوحة", details: "ما معه رتبة الأمن السيبراني", actorId: u.id, actorTag: u.username, data: { act: "panel_denied" } });
         req.session.denied = true;
+        req.session.denyReason = lastReason.get(u.id) || "";
         return req.session.save(() => res.redirect("/?denied=1"));
     }
     req.session.user = {
@@ -886,10 +899,11 @@ const HEAD = (title) => `<!DOCTYPE html>
 <link href="https://fonts.googleapis.com/css2?family=Tajawal:wght@400;500;700;800&display=swap" rel="stylesheet">
 <style>${CSS}</style></head>`;
 
-function loginPage(mode) {
+function loginPage(mode, reason) {
     let body;
     if (mode === "denied") body = `<div class="auth-card deny"><div class="ico">⛔</div><h1>غير مصرّح</h1>
         <p>هذا الموقع فقط لمنسوبي الأمن السيبراني.<br>حسابك لا يملك الرتبة المطلوبة.</p>
+        ${reason ? '<div class="warn" style="text-align:right;white-space:pre-line;direction:rtl;word-break:break-all">🔎 السبب: ' + String(reason).replace(/&/g, "&amp;").replace(/</g, "&lt;") + '</div>' : ""}
         <a class="btn gray" href="/auth/discord">تسجيل الدخول بحساب آخر</a></div>`;
     else body = `<div class="auth-card"><div class="ico">🛡️</div><h1>${CONFIG.SITE_NAME}</h1>
         <p>${CONFIG.SITE_SUB}<br>الدخول مخصّص لمنسوبي الأمن السيبراني فقط، سجّل دخولك بحساب ديسكورد ليتم التحقق من رتبتك.</p>
@@ -1147,7 +1161,7 @@ function appPage() {
 app.get("/", (req, res) => {
     if (req.session.user) return res.send(appPage());
     const mode = req.query.denied ? "denied" : req.query.err ? "err" : "login";
-    res.send(loginPage(mode));
+    res.send(loginPage(mode, mode === "denied" ? req.session.denyReason : ""));
 });
 app.get("/healthz", (req, res) => res.send("ok"));
 
