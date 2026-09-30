@@ -64,6 +64,23 @@ const EventSchema = new mongoose.Schema({
 });
 const Event = mongoose.model("CyberEvent", EventSchema);
 
+const ImageSchema = new mongoose.Schema({
+    eventId: { type: mongoose.Schema.Types.ObjectId, index: true },
+    name: String,
+    contentType: String,
+    size: Number,
+    data: Buffer,
+    createdAt: { type: Date, default: Date.now, expires: 60 * 60 * 24 * 60 },
+});
+const EventImage = mongoose.model("CyberEventImage", ImageSchema);
+
+// ── بث فوري للوحة (Server-Sent Events) — بدون أي تحديث كامل للصفحة ──
+const sseClients = new Set();
+function broadcastChanged() {
+    const line = "event: changed\ndata: {}\n\n";
+    for (const res of sseClients) { try { res.write(line); } catch { sseClients.delete(res); } }
+}
+
 // ══════════════════════════════════════════════════════════════════════════
 // 3) الصلاحيات (أسماء عربية + تصنيف الخطورة)
 // ══════════════════════════════════════════════════════════════════════════
@@ -107,16 +124,51 @@ const inviteCache = new Map();  // code -> uses
 const msgCache = new Map();     // آخر الرسائل (لعرض المحذوف)
 const everyoneHits = new Map();
 
+// ── كاش الصور: نحمّل صورة المرفق فور إرسالها، عشان تضل متوفرة حتى بعد حذفها من ديسكورد ──
+const imgCache = new Map(); // attachmentId -> { buf, type, name, size }
+function evictImgCache() { while (imgCache.size > 400) imgCache.delete(imgCache.keys().next().value); }
+function attMeta(m) {
+    return [...(m.attachments?.values() || [])].map(a => ({ id: a.id, name: a.name, contentType: a.contentType || null, size: a.size || 0, url: a.url }));
+}
+async function cacheImages(atts) {
+    for (const a of atts || []) {
+        const isImg = (a.contentType && a.contentType.startsWith("image/")) || /\.(png|jpe?g|webp|gif)(\?|$)/i.test(a.url || a.name || "");
+        if (!isImg || !a.url) continue;
+        if (a.size && a.size > 8 * 1024 * 1024) continue;
+        try {
+            const ctrl = new AbortController(); const t = setTimeout(() => ctrl.abort(), 6000);
+            const r = await fetch(a.url, { signal: ctrl.signal }); clearTimeout(t);
+            if (!r.ok) continue;
+            const buf = Buffer.from(await r.arrayBuffer());
+            imgCache.set(a.id, { buf, type: a.contentType || "image/png", name: a.name || "image", size: buf.length });
+            evictImgCache();
+        } catch { }
+    }
+}
+// ينقل الصور المحفوظة بالذاكرة إلى قاعدة البيانات مرتبطة بحدث معيّن، ويرجع بيانات وصفية فقط (بدون base64)
+async function persistImages(eventId, atts) {
+    const out = [];
+    for (const a of atts || []) {
+        const cached = imgCache.get(a.id);
+        if (!cached) continue;
+        try {
+            const doc = await EventImage.create({ eventId, name: cached.name, contentType: cached.type, size: cached.size, data: cached.buf });
+            out.push({ id: String(doc._id), name: cached.name, contentType: cached.type, size: cached.size });
+        } catch { }
+    }
+    return out;
+}
+
 function cacheMsg(m) {
     msgCache.set(m.id, {
         id: m.id, authorId: m.author?.id, authorTag: tagOf(m.author), bot: !!m.author?.bot, channelId: m.channelId,
-        content: String(m.content || "").slice(0, 500), att: m.attachments?.size || 0, at: m.createdTimestamp,
+        content: String(m.content || "").slice(0, 500), att: m.attachments?.size || 0, atts: attMeta(m), at: m.createdTimestamp,
     });
     if (msgCache.size > 20000) msgCache.delete(msgCache.keys().next().value);
 }
 
 async function logEvent(o) {
-    try { return await Event.create({ ...o, updatedAt: new Date() }); }
+    try { const ev = await Event.create({ ...o, updatedAt: new Date() }); broadcastChanged(); return ev; }
     catch (e) { console.error("logEvent:", e.message); }
 }
 
@@ -128,10 +180,11 @@ async function raise(o) {
             if (ev) {
                 ev.details = o.details; ev.remedy = o.remedy || ev.remedy; ev.count = o.count || (ev.count + 1);
                 ev.data = o.data || ev.data; ev.markModified("data"); ev.markModified("remedy"); ev.updatedAt = new Date();
-                await ev.save(); return ev;
+                await ev.save(); broadcastChanged(); return ev;
             }
         }
-        return await Event.create({ severity: "high", ...o, kind: "suspicious", updatedAt: new Date() });
+        const ev = await Event.create({ severity: "high", ...o, kind: "suspicious", updatedAt: new Date() });
+        broadcastChanged(); return ev;
     } catch (e) { console.error("raise:", e.message); }
 }
 
@@ -402,6 +455,7 @@ function attachHandlers() {
     client.on("messageCreate", async m => {
         if (m.guildId !== G() || !m.author) return;
         cacheMsg(m);
+        if (m.attachments && m.attachments.size) cacheImages(attMeta(m)).catch(() => {});
         if (!m.author.bot && m.mentions.everyone) {
             const arr = (everyoneHits.get(m.author.id) || []).filter(t => Date.now() - t < 600000); arr.push(Date.now()); everyoneHits.set(m.author.id, arr);
             if (arr.length >= 3) await raise({
@@ -422,12 +476,17 @@ function attachHandlers() {
         if (isSelf(exId)) return;
         const probot = exId === CONFIG.PROBOT_ID;
         const content = String(msg.content || c?.content || "").slice(0, 500);
-        await LOGCAT({
+        const attsMeta = (msg.attachments && msg.attachments.size) ? attMeta(msg) : (c?.atts || []);
+        const ev = await LOGCAT({
             cat: "message", title: probot ? "حذف رسالة عبر ProBot" : "حذف رسالة",
             details: "الروم: #" + (msg.channel?.name || msg.channelId) + "\nصاحب الرسالة: " + (tagOf(msg.author) || c?.authorTag || "غير معروف") + "\nالمحتوى: " + (content || "(غير متوفر)"),
             actorId: exId || authorId, actorTag: a ? tagOf(a.executor) : (tagOf(msg.author) || c?.authorTag),
             targetId: authorId, targetTag: tagOf(msg.author) || c?.authorTag, data: { act: "msg_delete", probot },
         });
+        if (ev && attsMeta.length) {
+            const imgs = await persistImages(ev._id, attsMeta);
+            if (imgs.length) { ev.data.images = imgs; ev.markModified("data"); await ev.save(); broadcastChanged(); }
+        }
     });
 
     client.on("messageDeleteBulk", async (msgs, channel) => {
@@ -438,6 +497,7 @@ function attachHandlers() {
             list.push({
                 id: m.id, authorId: m.author?.id || c.authorId, authorTag: tagOf(m.author) || c.authorTag || "غير معروف",
                 content: String(m.content || c.content || "").slice(0, 300), att: m.attachments?.size || c.att || 0, at: m.createdTimestamp || c.at,
+                _atts: (m.attachments && m.attachments.size) ? attMeta(m) : (c.atts || []),
             });
         });
         list.sort((x, y) => (x.at || 0) - (y.at || 0));
@@ -449,16 +509,32 @@ function attachHandlers() {
         const invokerId = cmd?.authorId || a?.executor?.id || null;
         const invokerTag = cmd?.authorTag || tagOf(a?.executor);
         const count = msgs.size;
+        const trimmed = list.slice(0, 200).map(({ _atts, ...rest }) => rest); // نحفظ الميتاداتا بدون الصور مؤقتاً
         const ev = await LOGCAT({
             cat: "message", title: (probot ? "مسح رسائل عبر ProBot" : "حذف جماعي للرسائل") + " (" + count + " رسالة)",
             details: "الروم: #" + channel.name + (probot && cmd ? "\nنفّذ أمر المسح: " + invokerTag : "") + (probot ? "\nالمنفّذ الفعلي: ProBot" : ""),
-            actorId: invokerId, actorTag: invokerTag, count, data: { act: "bulk_delete", probot, channel: channel.name, messages: list.slice(0, 200) },
+            actorId: invokerId, actorTag: invokerTag, count, data: { act: "bulk_delete", probot, channel: channel.name, messages: trimmed },
         });
-        if (count >= 30) await raise({
-            cat: "message", rule: "mass_msg_delete", key: "mmd:" + (invokerId || "x"), severity: "medium", title: "مسح رسائل ضخم (" + count + " رسالة)",
-            details: "الروم: #" + channel.name + "\nالمنفّذ: " + (invokerTag || "غير معروف") + (probot ? " (عبر ProBot)" : ""), actorId: invokerId, actorTag: invokerTag,
-            count, data: { act: "mass_msg_delete", probot, messages: list.slice(0, 200), channel: channel.name },
-        });
+        const imgsByMsgId = {};
+        const withAtts = list.slice(0, 200).filter(x => x._atts && x._atts.length);
+        if (ev && withAtts.length) {
+            for (const item of withAtts) {
+                const imgs = await persistImages(ev._id, item._atts);
+                if (imgs.length) { imgsByMsgId[item.id] = imgs; const t = ev.data.messages.find(x => x.id === item.id); if (t) t.images = imgs; }
+            }
+            ev.markModified("data"); await ev.save(); broadcastChanged();
+        }
+        if (count >= 30) {
+            const susEv = await raise({
+                cat: "message", rule: "mass_msg_delete", key: "mmd:" + (invokerId || "x"), severity: "medium", title: "مسح رسائل ضخم (" + count + " رسالة)",
+                details: "الروم: #" + channel.name + "\nالمنفّذ: " + (invokerTag || "غير معروف") + (probot ? " (عبر ProBot)" : ""), actorId: invokerId, actorTag: invokerTag,
+                count, data: { act: "mass_msg_delete", probot, messages: trimmed, channel: channel.name },
+            });
+            if (susEv && Object.keys(imgsByMsgId).length) {
+                susEv.data.messages.forEach(m => { if (imgsByMsgId[m.id]) m.images = imgsByMsgId[m.id]; });
+                susEv.markModified("data"); await susEv.save(); broadcastChanged();
+            }
+        }
         return ev;
     });
 
@@ -562,6 +638,29 @@ app.get("/auth/logout", (req, res) => req.session.destroy(() => res.redirect("/"
 
 // ── API: من أنا ──
 app.get("/api/me", auth, (req, res) => res.json({ user: req.session.user, presence: PRESENCE_OK }));
+
+// ── بث فوري (SSE): يخبر الموقع إنه فيه تحديث جديد باللوق، بدون أي ريفرش للصفحة ──
+app.get("/api/events/stream", wrap(async (req, res) => {
+    const u = req.session.user;
+    if (!u) return res.status(401).end();
+    const r = await stillAuthorized(u.id);
+    if (!r.ok) return res.status(401).end();
+    res.set({ "Content-Type": "text/event-stream; charset=utf-8", "Cache-Control": "no-cache, no-transform", Connection: "keep-alive", "X-Accel-Buffering": "no" });
+    res.flushHeaders?.();
+    res.write("retry: 3000\n\n");
+    sseClients.add(res);
+    const hb = setInterval(() => { try { res.write(": ping\n\n"); } catch { } }, 25000);
+    req.on("close", () => { clearInterval(hb); sseClients.delete(res); });
+}));
+
+// ── API: صورة مرفق محذوف (بيانات ثنائية حقيقية — بدون base64) ──
+app.get("/api/images/:id", auth, wrap(async (req, res) => {
+    const img = await EventImage.findById(req.params.id).lean();
+    if (!img) return res.status(404).end();
+    res.set({ "Content-Type": img.contentType || "image/png", "Cache-Control": "private, max-age=86400" });
+    const bin = Buffer.isBuffer(img.data) ? img.data : Buffer.from(img.data?.buffer || img.data || []);
+    res.send(bin);
+}));
 
 // ── API: اللوق ──
 const escRe = s => s.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
@@ -893,6 +992,8 @@ input:focus, select:focus { outline:none; border-color:var(--gold-soft); }
 .tri button.d.on { background:#dc2626; color:#fff; border-color:#ef4444; }
 .msg { border-bottom:1px solid var(--border); padding:8px 2px; font-size:13px; line-height:1.7; }
 .msg b { color:var(--gold-soft); }
+.imgrow { display:flex; flex-wrap:wrap; gap:8px; margin-top:8px; }
+.imgrow img { width:110px; height:110px; object-fit:cover; border-radius:8px; border:1px solid var(--border); cursor:pointer; }
 #toast { position:fixed; bottom:20px; left:50%; transform:translateX(-50%); background:#0d1f3c; padding:10px 20px; border-radius:10px; border:1px solid var(--gold); z-index:6000; display:none; max-width:90vw; text-align:center; }
 .center { text-align:center; } .muted { color:var(--muted); }
 .warn { background:rgba(234,179,8,0.1); border:1px solid #eab308; color:#fde68a; border-radius:10px; padding:10px 14px; font-size:13px; margin-bottom:14px; }
@@ -1034,9 +1135,11 @@ function evRow(e){
     if(e.remedy)acts+='<button class="btn sm danger" onclick="doRemedy(\''+e._id+'\',this)">'+esc(e.remedy.label)+'</button>';
     acts+='<button class="btn sm ok" onclick="doResolve(\''+e._id+'\',this)">✅ حل العملية</button>';
   }
+  var imgs=(e.data&&e.data.images&&e.data.images.length)?'<div class="imgrow">'+e.data.images.map(function(im){return '<img src="/api/images/'+im.id+'" alt="" loading="lazy" onclick="showImg(\''+im.id+'\')">';}).join('')+'</div>':'';
   return '<div class="'+cls+'"><div class="log-body"><div class="log-title">'+badge+'<span>'+esc(e.title)+'</span>'+(e.count>1&&sus?'<span class="badge low">×'+e.count+'</span>':'')+'</div>'
-    +(e.details?'<div class="log-det">'+esc(e.details)+'</div>':'')+'<div class="log-meta">'+meta+'</div></div><div class="log-act">'+acts+'</div></div>';
+    +(e.details?'<div class="log-det">'+esc(e.details)+'</div>':'')+imgs+'<div class="log-meta">'+meta+'</div></div><div class="log-act">'+acts+'</div></div>';
 }
+function showImg(id){modal('<div class="center"><img src="/api/images/'+id+'" alt="" style="max-width:100%;max-height:75vh;border-radius:10px"></div><div style="margin-top:14px" class="center"><button class="btn gray" onclick="closeModal()">إغلاق</button></div>');}
 async function doRemedy(id,b){
   var ev=S.events.find(function(x){return x._id===id;});
   if(!(await ask('تنفيذ الإجراء: '+ev.remedy.label+'\n\n'+ev.title)))return;
@@ -1051,7 +1154,10 @@ async function showMsgs(id){
   try{
     var j=await api('/api/events/'+id+'/messages');
     var html='<h3>🗑️ '+esc(j.title||'الرسائل المحذوفة')+'</h3>'+(j.channel?'<p class="muted center" style="margin-bottom:10px">الروم: #'+esc(j.channel)+(j.probot?' — عبر ProBot':'')+'</p>':'');
-    html+=j.messages.length?j.messages.map(function(m){return '<div class="msg"><b>'+esc(m.authorTag)+'</b> <span class="muted" style="font-size:11px">'+(m.at?fmt(m.at):'')+'</span><br>'+(m.content?esc(m.content):'<span class="muted">(بدون نص)</span>')+(m.att?' <span class="chip safe">📎 '+m.att+' مرفق</span>':'')+'</div>';}).join(''):'<p class="center muted">الرسائل ما انحفظت (كانت قبل تشغيل البوت)</p>';
+    html+=j.messages.length?j.messages.map(function(m){
+      var mi=(m.images&&m.images.length)?'<div class="imgrow">'+m.images.map(function(im){return '<img src="/api/images/'+im.id+'" alt="" loading="lazy" onclick="showImg(\''+im.id+'\')">';}).join('')+'</div>':'';
+      return '<div class="msg"><b>'+esc(m.authorTag)+'</b> <span class="muted" style="font-size:11px">'+(m.at?fmt(m.at):'')+'</span><br>'+(m.content?esc(m.content):'<span class="muted">(بدون نص)</span>')+(m.att?' <span class="chip safe">📎 '+m.att+' مرفق</span>':'')+mi+'</div>';
+    }).join(''):'<p class="center muted">الرسائل ما انحفظت (كانت قبل تشغيل البوت)</p>';
     html+='<div style="margin-top:14px"><button class="btn gray" onclick="closeModal()">إغلاق</button></div>';
     modal(html);
   }catch(e){toast(e.message);}
@@ -1194,6 +1300,10 @@ function setTri(b,s){var row=b.closest('.prow');row.setAttribute('data-s',s);row
     var me=await api('/api/me');S.presence=me.presence;S.level=me.user.level||'view';
     $('uchip').innerHTML='<img src="'+esc(me.user.avatar)+'" alt=""><span>'+esc(me.user.tag)+'</span><a class="btn sm gray" href="/auth/logout">خروج</a>';
     buildNav();render();
+    try{
+      var es=new EventSource('/api/events/stream');
+      es.addEventListener('changed',function(){ if(S.page==='logs')loadEvents(true); });
+    }catch(e){}
   }catch(e){}
 })();
 `;
