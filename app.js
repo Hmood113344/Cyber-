@@ -18,10 +18,10 @@ const CONFIG = {
     DISCORD_CALLBACK_URL: process.env.DISCORD_CALLBACK_URL || "",   // مثال: https://xxx.onrender.com/auth/discord/callback
     BOT_TOKEN: process.env.BOT_TOKEN || "",
     // ⬇️ حط آيدي سيرفر وزارة الداخلية هنا
-    GUILD_ID: process.env.GUILD_ID || "1497233353030766662",
+    GUILD_ID: process.env.GUILD_ID || "ضع_آيدي_السيرفر_هنا",
     MONGO_URI: process.env.MONGO_URI || "",
     // ⬇️ حط آيدي رتبة الأمن السيبراني هنا بين علامتي التنصيص (شرط الدخول للموقع)
-    CYBER_ROLE_ID: "1554783236369031240",
+    CYBER_ROLE_ID: "ضع_آيدي_الرتبة_هنا",
     SESSION_SECRET: process.env.SESSION_SECRET || "غيّر_هذا_السر_2026",
     PORT: process.env.PORT || 7800,
     SITE_NAME: "الأمن السيبراني",
@@ -912,7 +912,7 @@ function loginPage(mode) {
 
 const CLIENT = String.raw`
 var PAGES=[['logs','📜 اللوق'],['stats','📊 الإحصائيات'],['bots','🤖 البوتات'],['perms','🔐 صلاحيات السيرفر']];
-var S={page:'logs',q:'',cat:'',unres:false,events:[],sig:'',timer:null,permsTab:'roles',permsView:'danger',meta:null,presence:true};
+var S={page:'logs',q:'',cat:'',unres:false,events:[],sig:'',timer:null,permsTab:'roles',permsView:'danger',permsQ:'',meta:null,presence:true};
 var CATS=[['','الكل'],['sus','⚠️ العمليات المشبوهة'],['newacc','🆕 حسابات جديدة'],['join','دخول'],['leave','خروج'],['kick','طرد'],['ban','حظر'],['role','الرتب'],['channel','القنوات'],['message','الرسائل المحذوفة'],['probot','🧹 حذف عبر ProBot'],['bot','البوتات'],['webhook','ويبهوكس'],['everyone','منشن everyone'],['server','إعدادات السيرفر'],['panel','عمليات اللوحة']];
 var RULE_AR={new_account:'حساب جديد',mass_roles_created:'رتب جماعية',mass_role_delete:'حذف رتب',mass_channel_create:'إنشاء قنوات',mass_channel_delete:'حذف قنوات',mass_ban:'حظر جماعي',mass_kick:'طرد جماعي',dangerous_perm_grant:'صلاحيات خطيرة',dangerous_role_assigned:'رتبة خطيرة',bot_added:'بوت جديد',webhook_created:'ويبهوك',everyone_spam:'منشن everyone',mass_join:'غارة دخول',mass_msg_delete:'مسح ضخم',server_changed:'إعدادات السيرفر'};
 function $(id){return document.getElementById(id);}
@@ -1067,23 +1067,28 @@ async function pgPerms(){
    +'<div class="tabs"><button class="tab '+(S.permsTab==='roles'?'active':'')+'" onclick="S.permsTab=\'roles\';pgPerms()">👥 قسم الرتب</button>'
    +'<button class="tab '+(S.permsTab==='channels'?'active':'')+'" onclick="S.permsTab=\'channels\';pgPerms()">💬 قسم الشاتات</button></div>'
    +'<div class="tabs"><button class="tab '+(S.permsView==='danger'?'active':'')+'" onclick="S.permsView=\'danger\';pgPerms()">⚠️ الخطرة فقط</button>'
-   +'<button class="tab '+(S.permsView==='all'?'active':'')+'" onclick="S.permsView=\'all\';pgPerms()">📋 الكل</button></div><div id="pbox"><div class="card center muted">جاري التحميل...</div></div>';
+   +'<button class="tab '+(S.permsView==='all'?'active':'')+'" onclick="S.permsView=\'all\';pgPerms()">📋 الكل</button></div>'
+   +'<input id="pq" placeholder="'+(S.permsTab==='roles'?'🔎 ابحث عن رتبة':'🔎 ابحث عن شات')+'" value="'+esc(S.permsQ)+'" style="margin-bottom:14px"><div id="pbox"><div class="card center muted">جاري التحميل...</div></div>';
+  $('pq').oninput=function(){S.permsQ=this.value;if(S.permsTab==='roles')drawRoles(true);else drawChannels(true);};
   try{ if(S.permsTab==='roles')await drawRoles();else await drawChannels(); }catch(e){toast(e.message);}
 }
 function permChips(list,metaList){
   return list.map(function(k){var m=metaList.find(function(x){return x.k===k;})||{ar:k};return '<span class="chip '+(m.danger||'safe')+'">'+esc(m.ar)+'</span>';}).join('');
 }
-async function drawRoles(){
-  var j=await api('/api/perms/roles');S.roles=j.roles;
-  var list=S.permsView==='danger'?j.roles.filter(function(r){return r.dang.length;}):j.roles;
+async function drawRoles(nf){
+  if(!nf){var j=await api('/api/perms/roles');S.roles=j.roles;}
+  var q=(S.permsQ||'').trim().toLowerCase();
+  var view=q?'all':S.permsView;
+  var list=view==='danger'?S.roles.filter(function(r){return r.dang.length;}):S.roles;
+  if(q)list=list.filter(function(r){return r.name.toLowerCase().indexOf(q)>-1;});
   var html=list.map(function(r){
-    var shown=S.permsView==='danger'?r.dang:r.perms;
+    var shown=view==='danger'?r.dang:r.perms;
     return '<div class="card"><div class="row"><div><div class="log-title"><span><i class="dot" style="background:'+(r.color&&r.color!=='#000000'?r.color:'#64748b')+'"></i>'+esc(r.name)+'</span>'
      +(r.dang.length?'<span class="badge high">'+r.dang.length+' خطيرة</span>':'<span class="badge done">آمنة</span>')+'</div><div class="log-meta">👥 '+r.members+' عضو</div></div>'
      +'<button class="btn sm '+(r.editable?'':'gray')+'" onclick="editRole(\''+r.id+'\')">'+(r.editable?'✏️ عرض وتعديل':'👁️ عرض فقط')+'</button></div>'
      +'<div style="margin-top:8px">'+(shown.length?permChips(shown,S.meta.role):'<span class="muted" style="font-size:12px">لا صلاحيات</span>')+'</div></div>';
-  }).join('')||'<div class="card center muted">ما فيه رتب بصلاحيات خطيرة 👌</div>';
-  $('pbox').innerHTML=html;
+  }).join('')||(q?'<div class="card center muted">ما لقيت رتبة بهذا الاسم</div>':'<div class="card center muted">ما فيه رتب بصلاحيات خطيرة 👌</div>');
+  if($('pbox'))$('pbox').innerHTML=html;
 }
 function editRole(id){
   var r=S.roles.find(function(x){return x.id===id;});
@@ -1101,17 +1106,20 @@ function editRole(id){
     try{await api('/api/perms/roles/'+id,{method:'PUT',body:JSON.stringify({perms:perms})});toast('تم حفظ الصلاحيات');closeModal();drawRoles();}catch(e){toast(e.message);this.disabled=false;}
   };
 }
-async function drawChannels(){
-  var j=await api('/api/perms/channels');S.chans=j.channels;
-  var list=S.permsView==='danger'?j.channels.filter(function(c){return c.hasDanger;}):j.channels.filter(function(c){return c.overwrites.length;});
+async function drawChannels(nf){
+  if(!nf){var j=await api('/api/perms/channels');S.chans=j.channels;}
+  var q=(S.permsQ||'').trim().toLowerCase();
+  var view=q?'all':S.permsView;
+  var list=view==='danger'?S.chans.filter(function(c){return c.hasDanger;}):S.chans.filter(function(c){return c.overwrites.length;});
+  if(q)list=S.chans.filter(function(c){return c.name.toLowerCase().indexOf(q)>-1||(c.parent||'').toLowerCase().indexOf(q)>-1||c.overwrites.some(function(o){return o.name.toLowerCase().indexOf(q)>-1;});});
   var html=list.map(function(c){
-    var ovs=(S.permsView==='danger'?c.overwrites.filter(function(o){return o.dang.length;}):c.overwrites).map(function(o){
+    var ovs=(view==='danger'?c.overwrites.filter(function(o){return o.dang.length;}):c.overwrites).map(function(o){
       return '<div class="prow"><span><b>'+(o.type==='role'?'👥 ':'👤 ')+esc(o.name)+'</b> '+(o.dang.length?permChips(o.dang,S.meta.channel):'<span class="chip safe">بدون صلاحيات خطيرة</span>')+'</span>'
        +'<button class="btn sm" onclick="editOv(\''+c.id+'\',\''+o.id+'\')">✏️ تعديل</button></div>';
     }).join('');
     return '<div class="card"><div class="log-title"><span>'+c.icon+' '+esc(c.name)+'</span>'+(c.parent?'<span class="muted" style="font-size:12px">'+esc(c.parent)+'</span>':'')+(c.hasDanger?'<span class="badge high">صلاحيات خطيرة</span>':'')+'</div>'+ovs+'</div>';
-  }).join('')||'<div class="card center muted">ما فيه قنوات بصلاحيات خطيرة 👌</div>';
-  $('pbox').innerHTML=html;
+  }).join('')||(q?'<div class="card center muted">ما لقيت شات بهذا الاسم</div>':'<div class="card center muted">ما فيه قنوات بصلاحيات خطيرة 👌</div>');
+  if($('pbox'))$('pbox').innerHTML=html;
 }
 function editOv(cid,tid){
   var c=S.chans.find(function(x){return x.id===cid;});var o=c.overwrites.find(function(x){return x.id===tid;});
