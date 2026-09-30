@@ -18,10 +18,10 @@ const CONFIG = {
     DISCORD_CALLBACK_URL: process.env.DISCORD_CALLBACK_URL || "",   // مثال: https://xxx.onrender.com/auth/discord/callback
     BOT_TOKEN: process.env.BOT_TOKEN || "",
     // ⬇️ حط آيدي سيرفر وزارة الداخلية هنا
-    GUILD_ID: process.env.GUILD_ID || "1497233353030766662",
+    GUILD_ID: process.env.GUILD_ID || "ضع_آيدي_السيرفر_هنا",
     MONGO_URI: process.env.MONGO_URI || "",
     // ⬇️ حط آيدي رتبة الأمن السيبراني هنا بين علامتي التنصيص (شرط الدخول للموقع)
-    CYBER_ROLE_ID: "1554783236369031240",
+    CYBER_ROLE_ID: "ضع_آيدي_الرتبة_هنا",
     SESSION_SECRET: process.env.SESSION_SECRET || "غيّر_هذا_السر_2026",
     PORT: process.env.PORT || 7800,
     SITE_NAME: "الأمن السيبراني",
@@ -179,7 +179,7 @@ const LOGCAT = (o) => logEvent({ kind: "normal", severity: "low", ...o });
 function startBot() {
     const intents = [
         GatewayIntentBits.Guilds, GatewayIntentBits.GuildMembers, GatewayIntentBits.GuildMessages, GatewayIntentBits.MessageContent,
-        GatewayIntentBits.GuildModeration, GatewayIntentBits.GuildInvites, GatewayIntentBits.GuildWebhooks,
+        GatewayIntentBits.GuildModeration, GatewayIntentBits.GuildInvites, GatewayIntentBits.GuildWebhooks, GatewayIntentBits.GuildVoiceStates,
     ];
     if (PRESENCE_OK) intents.push(GatewayIntentBits.GuildPresences);
     client = new Client({ intents, partials: [Partials.Message, Partials.Channel, Partials.GuildMember] });
@@ -458,6 +458,19 @@ function attachHandlers() {
             count, data: { act: "mass_msg_delete", probot, messages: list.slice(0, 200), channel: channel.name },
         });
         return ev;
+    });
+
+    // ── الرومات الصوتية: دخول / خروج / انتقال ──
+    client.on("voiceStateUpdate", async (o, n) => {
+        const m = n.member || o.member;
+        if (!m || m.guild.id !== G() || m.user.bot) return;
+        const oc = o.channelId, nc = n.channelId;
+        if (oc === nc) return;
+        let title, details;
+        if (!oc && nc) { title = "دخول روم صوتي"; details = "🎙️ الروم: " + n.channel.name + "\n👥 الموجودين الآن: " + n.channel.members.size; }
+        else if (oc && !nc) { title = "خروج من روم صوتي"; details = "🎙️ الروم: " + o.channel.name + "\n👥 الموجودين الآن: " + o.channel.members.size; }
+        else { title = "انتقال بين رومات صوتية"; details = "من: " + o.channel.name + "\nإلى: " + n.channel.name; }
+        await LOGCAT({ cat: "voice", title, details, actorId: m.id, actorTag: tagOf(m.user), targetId: m.id, targetTag: tagOf(m.user), data: { act: "voice" } });
     });
 
     client.on("error", e => console.log("client error:", e.message));
@@ -947,7 +960,7 @@ function loginPage(mode) {
 const CLIENT = String.raw`
 var PAGES=[['logs','📜 اللوق'],['stats','📊 الإحصائيات'],['bots','🤖 البوتات'],['perms','🔐 صلاحيات السيرفر']];
 var S={page:'logs',q:'',cat:'',unres:false,events:[],sig:'',timer:null,permsTab:'roles',permsView:'danger',permsQ:'',meta:null,presence:true};
-var CATS=[['','الكل'],['sus','⚠️ العمليات المشبوهة'],['newacc','🆕 حسابات جديدة'],['join','دخول'],['leave','خروج'],['kick','طرد'],['ban','حظر'],['role','الرتب'],['channel','القنوات'],['message','الرسائل المحذوفة'],['probot','🧹 حذف عبر ProBot'],['bot','البوتات'],['webhook','ويبهوكس'],['everyone','منشن everyone'],['server','إعدادات السيرفر'],['panel','عمليات اللوحة']];
+var CATS=[['','الكل'],['sus','⚠️ العمليات المشبوهة'],['newacc','🆕 حسابات جديدة'],['join','دخول'],['leave','خروج'],['kick','طرد'],['ban','حظر'],['role','الرتب'],['channel','القنوات'],['voice','🎙️ الرومات الصوتية'],['message','الرسائل المحذوفة'],['probot','🧹 حذف عبر ProBot'],['bot','البوتات'],['webhook','ويبهوكس'],['everyone','منشن everyone'],['server','إعدادات السيرفر'],['panel','عمليات اللوحة']];
 var RULE_AR={new_account:'حساب جديد',mass_roles_created:'رتب جماعية',mass_role_delete:'حذف رتب',mass_channel_create:'إنشاء قنوات',mass_channel_delete:'حذف قنوات',mass_ban:'حظر جماعي',mass_kick:'طرد جماعي',dangerous_perm_grant:'صلاحيات خطيرة',dangerous_role_assigned:'رتبة خطيرة',bot_added:'بوت جديد',webhook_created:'ويبهوك',everyone_spam:'منشن everyone',mass_join:'غارة دخول',mass_msg_delete:'مسح ضخم',server_changed:'إعدادات السيرفر'};
 function $(id){return document.getElementById(id);}
 function esc(s){return String(s==null?'':s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;');}
