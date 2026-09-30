@@ -18,10 +18,10 @@ const CONFIG = {
     DISCORD_CALLBACK_URL: process.env.DISCORD_CALLBACK_URL || "",   // مثال: https://xxx.onrender.com/auth/discord/callback
     BOT_TOKEN: process.env.BOT_TOKEN || "",
     // ⬇️ حط آيدي سيرفر وزارة الداخلية هنا
-    GUILD_ID: process.env.GUILD_ID || "ضع_آيدي_السيرفر_هنا",
+    GUILD_ID: process.env.GUILD_ID || "1497233353030766662",
     MONGO_URI: process.env.MONGO_URI || "",
     // ⬇️ حط آيدي رتبة الأمن السيبراني هنا بين علامتي التنصيص (شرط الدخول للموقع)
-    CYBER_ROLE_ID: "ضع_آيدي_الرتبة_هنا",
+    CYBER_ROLE_ID: "1554783236369031240",
     SESSION_SECRET: process.env.SESSION_SECRET || "غيّر_هذا_السر_2026",
     PORT: process.env.PORT || 7800,
     SITE_NAME: "الأمن السيبراني",
