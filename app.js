@@ -74,6 +74,16 @@ const ImageSchema = new mongoose.Schema({
 });
 const EventImage = mongoose.model("CyberEventImage", ImageSchema);
 
+// تتبّع آخر دخول للوحة (وقت الدخول وآخر نشاط، لحساب مدة الجلسة)
+const MemberSchema = new mongoose.Schema({
+    _id: String, // آيدي ديسكورد
+    tag: String,
+    avatar: String,
+    lastLoginAt: Date,
+    lastSeenAt: Date,
+});
+const PanelMember = mongoose.model("CyberPanelMember", MemberSchema);
+
 // ── بث فوري للوحة (Server-Sent Events) — بدون أي تحديث كامل للصفحة ──
 const sseClients = new Set();
 function broadcastChanged() {
@@ -585,12 +595,18 @@ async function stillAuthorized(uid) {
     roleCheck.set(uid, { ...res, t: Date.now() });
     return res;
 }
+const seenThrottle = new Map();
 const auth = wrap(async (req, res, next) => {
     const u = req.session.user;
     if (!u) return res.status(401).json({ error: "سجّل دخولك" });
     const r = await stillAuthorized(u.id);
     if (!r.ok) { req.session.destroy(() => {}); return res.status(401).json({ error: "تم سحب صلاحيتك" }); }
     req.session.user.level = r.level;
+    const last = seenThrottle.get(u.id) || 0;
+    if (Date.now() - last > 30000) {
+        seenThrottle.set(u.id, Date.now());
+        PanelMember.updateOne({ _id: u.id }, { $set: { lastSeenAt: new Date() } }).catch(() => {});
+    }
     next();
 });
 const full = wrap(async (req, res, next) => {
@@ -626,11 +642,11 @@ app.get("/auth/discord/callback", wrap(async (req, res) => {
         req.session.denied = true;
         return req.session.save(() => res.redirect("/?denied=1"));
     }
-    req.session.user = {
-        id: u.id, tag: u.global_name || u.username, level: r0.level,
-        avatar: u.avatar ? "https://cdn.discordapp.com/avatars/" + u.id + "/" + u.avatar + ".png?size=64" : "https://cdn.discordapp.com/embed/avatars/0.png",
-    };
+    const avatar = u.avatar ? "https://cdn.discordapp.com/avatars/" + u.id + "/" + u.avatar + ".png?size=64" : "https://cdn.discordapp.com/embed/avatars/0.png";
+    req.session.user = { id: u.id, tag: u.global_name || u.username, level: r0.level, avatar };
     delete req.session.denied;
+    const now = new Date();
+    await PanelMember.findByIdAndUpdate(u.id, { _id: u.id, tag: u.global_name || u.username, avatar, lastLoginAt: now, lastSeenAt: now }, { upsert: true }).catch(() => {});
     await LOGCAT({ cat: "panel", title: "تسجيل دخول للوحة", details: "", actorId: u.id, actorTag: u.username, data: { act: "panel_login" } });
     req.session.save(() => res.redirect("/"));
 }));
@@ -894,6 +910,42 @@ app.put("/api/perms/channels/:id/:tid", auth, full, wrap(async (req, res) => {
     res.json({ ok: true });
 }));
 
+// ── API: أعضاء الأمن السيبراني (للقائد والنائب فقط) ──
+app.get("/api/members", auth, full, wrap(async (req, res) => {
+    const g = await getGuild();
+    await g.members.fetch().catch(() => {});
+    const roleIds = [CONFIG.LEADER_ROLE_ID, CONFIG.DEPUTY_ROLE_ID, CONFIG.CYBER_ROLE_ID].filter(Boolean);
+    const list = g.members.cache.filter(m => !m.user.bot && roleIds.some(r => m.roles.cache.has(r)));
+    const panelDocs = await PanelMember.find({ _id: { $in: [...list.keys()] } }).lean();
+    const panelMap = {}; panelDocs.forEach(d => panelMap[d._id] = d);
+    const rankOf = m => (CONFIG.LEADER_ROLE_ID && m.roles.cache.has(CONFIG.LEADER_ROLE_ID)) ? "leader"
+        : (CONFIG.DEPUTY_ROLE_ID && m.roles.cache.has(CONFIG.DEPUTY_ROLE_ID)) ? "deputy" : "member";
+    const out = [...list.values()].map(m => {
+        const p = panelMap[m.id];
+        const durationMin = (p && p.lastLoginAt && p.lastSeenAt) ? Math.max(1, Math.round((new Date(p.lastSeenAt) - new Date(p.lastLoginAt)) / 60000)) : null;
+        return {
+            id: m.id, tag: tagOf(m.user), avatar: m.user.displayAvatarURL({ size: 64 }), rank: rankOf(m),
+            lastLoginAt: p?.lastLoginAt || null, lastSeenAt: p?.lastSeenAt || null, durationMin,
+        };
+    }).sort((a, b) => {
+        const w = r => r === "leader" ? 0 : r === "deputy" ? 1 : 2;
+        return w(a.rank) - w(b.rank) || (b.lastLoginAt ? new Date(b.lastLoginAt).getTime() : 0) - (a.lastLoginAt ? new Date(a.lastLoginAt).getTime() : 0);
+    });
+    res.json({ members: out });
+}));
+app.post("/api/members/:id/dismiss", auth, full, wrap(async (req, res) => {
+    if (req.params.id === req.session.user.id) return res.status(400).json({ error: "ما تقدر تفصل نفسك" });
+    const g = await getGuild();
+    const m = await g.members.fetch(req.params.id).catch(() => null);
+    if (!m) return res.status(404).json({ error: "العضو مو موجود بالسيرفر" });
+    const toRemove = [CONFIG.CYBER_ROLE_ID, CONFIG.LEADER_ROLE_ID, CONFIG.DEPUTY_ROLE_ID].filter(id => id && m.roles.cache.has(id));
+    if (!toRemove.length) return res.status(400).json({ error: "ما عنده رتب الأمن السيبراني أصلاً" });
+    await m.roles.remove(toRemove, "فصل من الأمن السيبراني — لوحة الأمن السيبراني — " + req.session.user.tag);
+    roleCheck.delete(m.id);
+    await panelLog(req, "فصل من الأمن السيبراني", "العضو: " + tagOf(m.user), { targetId: m.id, targetTag: tagOf(m.user) });
+    res.json({ ok: true });
+}));
+
 // ══════════════════════════════════════════════════════════════════════════
 // 6) الواجهة (نفس تصميم موقع فلاش: نفس الألوان والأزرار والخط)
 // ══════════════════════════════════════════════════════════════════════════
@@ -1060,7 +1112,7 @@ function loginPage(mode) {
 
 const CLIENT = String.raw`
 var PAGES=[['logs','📜 اللوق'],['stats','📊 الإحصائيات'],['bots','🤖 البوتات'],['perms','🔐 صلاحيات السيرفر']];
-var S={page:'logs',q:'',cat:'',unres:false,events:[],sig:'',timer:null,permsTab:'roles',permsView:'danger',permsQ:'',meta:null,presence:true,level:'view'};
+var S={page:'logs',q:'',cat:'',unres:false,events:[],sig:'',timer:null,permsTab:'roles',permsView:'danger',permsQ:'',meta:null,presence:true,level:'view',meId:null};
 var CATS=[['','الكل'],['sus','⚠️ العمليات المشبوهة'],['newacc','🆕 حسابات جديدة'],['join','دخول'],['leave','خروج'],['kick','طرد'],['ban','حظر'],['role','الرتب'],['channel','القنوات'],['voice','🎙️ الرومات الصوتية'],['message','الرسائل المحذوفة'],['probot','🧹 حذف عبر ProBot'],['bot','البوتات'],['webhook','ويبهوكس'],['everyone','منشن everyone'],['server','إعدادات السيرفر'],['panel','عمليات اللوحة']];
 var RULE_AR={new_account:'حساب جديد',mass_roles_created:'رتب جماعية',mass_role_delete:'حذف رتب',mass_channel_create:'إنشاء قنوات',mass_channel_delete:'حذف قنوات',mass_ban:'حظر جماعي',mass_kick:'طرد جماعي',dangerous_perm_grant:'صلاحيات خطيرة',dangerous_role_assigned:'رتبة خطيرة',bot_added:'بوت جديد',webhook_created:'ويبهوك',everyone_spam:'منشن everyone',mass_join:'غارة دخول',mass_msg_delete:'مسح ضخم',server_changed:'إعدادات السيرفر'};
 function $(id){return document.getElementById(id);}
@@ -1080,14 +1132,16 @@ function closeModal(){var o=$('ov');if(o)o.remove();}
 function ask(msg){return new Promise(function(res){modal('<h3>تأكيد</h3><p style="line-height:1.8;margin-bottom:16px;white-space:pre-line">'+esc(msg)+'</p><div class="row" style="justify-content:flex-start"><button class="btn danger" id="ask-y">تأكيد</button><button class="btn gray" id="ask-n">إلغاء</button></div>');$('ask-y').onclick=function(){closeModal();res(true);};$('ask-n').onclick=function(){closeModal();res(false);};});}
 
 /* ── التنقل ── */
+function pagesList(){var p=PAGES.slice();if(S.level==='full')p.push(['members','👥 الأعضاء']);return p;}
 function buildNav(){
-  $('navlinks').innerHTML=PAGES.map(function(p){return '<button class="'+(S.page===p[0]?'on':'')+'" onclick="go(\''+p[0]+'\')">'+p[1]+'</button>';}).join('');
-  $('drawer-items').innerHTML=PAGES.map(function(p){return '<button class="item '+(S.page===p[0]?'on':'')+'" onclick="go(\''+p[0]+'\')">'+p[1]+'</button>';}).join('');
+  var list=pagesList();
+  $('navlinks').innerHTML=list.map(function(p){return '<button class="'+(S.page===p[0]?'on':'')+'" onclick="go(\''+p[0]+'\')">'+p[1]+'</button>';}).join('');
+  $('drawer-items').innerHTML=list.map(function(p){return '<button class="item '+(S.page===p[0]?'on':'')+'" onclick="go(\''+p[0]+'\')">'+p[1]+'</button>';}).join('');
 }
 function openDrawer(){$('drawer').classList.add('open');$('dov').classList.add('open');}
 function closeDrawer(){$('drawer').classList.remove('open');$('dov').classList.remove('open');}
 function go(p){S.page=p;closeDrawer();clearInterval(S.timer);buildNav();render();}
-function render(){var f={logs:pgLogs,stats:pgStats,bots:pgBots,perms:pgPerms}[S.page];f();}
+function render(){var f={logs:pgLogs,stats:pgStats,bots:pgBots,perms:pgPerms,members:pgMembers}[S.page];f();}
 
 /* ══ اللوق ══ */
 function pgLogs(){
@@ -1294,10 +1348,35 @@ function editOv(cid,tid){
 }
 function setTri(b,s){var row=b.closest('.prow');row.setAttribute('data-s',s);row.querySelectorAll('.tri button').forEach(function(x){x.classList.remove('on');});b.classList.add('on');}
 
+/* ══ أعضاء الأمن السيبراني (للقائد والنائب) ══ */
+var RANK_AR={leader:'👑 قائد',deputy:'🥈 نائب',member:'عضو'};
+async function pgMembers(){
+  $('main').innerHTML='<h2>👥 أعضاء الأمن السيبراني</h2><div class="card center muted">جاري التحميل...</div>';
+  try{
+    var j=await api('/api/members');if(S.page!=='members')return;
+    var html='<h2>👥 أعضاء الأمن السيبراني ('+j.members.length+')</h2>';
+    html+=j.members.map(function(m){
+      var last=m.lastLoginAt?fmt(m.lastLoginAt):'لم يسجّل الدخول للوحة بعد';
+      var dur=(m.durationMin!=null)?'⏱️ قعد آخر مرة: '+m.durationMin+' دقيقة':'';
+      var canDismiss=m.id!==S.meId;
+      return '<div class="card"><div class="bot"><img src="'+esc(m.avatar)+'" alt=""><div style="flex:1;min-width:200px">'
+        +'<div class="log-title">'+esc(m.tag)+' <span class="badge '+(m.rank==='leader'?'high':m.rank==='deputy'?'medium':'low')+'">'+RANK_AR[m.rank]+'</span></div>'
+        +'<div class="log-meta">🕒 آخر دخول للوحة: '+last+'</div>'
+        +(dur?'<div class="log-meta">'+dur+'</div>':'')+'</div>'
+        +(canDismiss?'<button class="btn sm danger" onclick="dismissMember(\''+m.id+'\',\''+esc(m.tag).replace(/'/g,'')+'\')">🚫 فصل</button>':'<span class="muted" style="font-size:12px">أنت</span>')+'</div></div>';
+    }).join('')||'<div class="card center muted">ما فيه أعضاء بعد</div>';
+    $('main').innerHTML=html;
+  }catch(e){toast(e.message);}
+}
+async function dismissMember(id,name){
+  if(!(await ask('متأكد تبي تفصل '+name+' من الأمن السيبراني؟\nراح تنسحب رتبته من ديسكورد وما يقدر يدخل اللوحة إلا إذا ترجعت له الرتبة.')))return;
+  try{await api('/api/members/'+id+'/dismiss',{method:'POST'});toast('تم الفصل');pgMembers();}catch(e){toast(e.message);}
+}
+
 /* ── تشغيل ── */
 (async function(){
   try{
-    var me=await api('/api/me');S.presence=me.presence;S.level=me.user.level||'view';
+    var me=await api('/api/me');S.presence=me.presence;S.level=me.user.level||'view';S.meId=me.user.id;
     $('uchip').innerHTML='<img src="'+esc(me.user.avatar)+'" alt=""><span>'+esc(me.user.tag)+'</span><a class="btn sm gray" href="/auth/logout">خروج</a>';
     buildNav();render();
     try{
