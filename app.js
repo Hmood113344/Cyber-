@@ -890,10 +890,44 @@ input:focus, select:focus { outline:none; border-color:var(--gold-soft); }
 .auth-card p { color:#94a3b8; line-height:1.9; margin-bottom:22px; }
 .auth-card .btn { width:100%; padding:15px; font-size:1.05rem; border-radius:999px; }
 .auth-card.deny { border-color:rgba(239,68,68,0.5); } .auth-card.deny h1 { color:#f87171; text-shadow:none; }
+
+/* ══ إصلاحات الجوال والايباد ══ */
+html { -webkit-text-size-adjust:100%; overflow-x:hidden; max-width:100%; }
+body { overflow-x:hidden; max-width:100vw; min-height:100dvh; }
+nav { height:auto; min-height:62px; padding-top:env(safe-area-inset-top,0px); }
+.nav-start { min-width:0; flex:1; }
+.logo { overflow:hidden; text-overflow:ellipsis; min-width:0; }
+.userchip { flex-shrink:0; }
+.wrap, .card, .log-body, .log-det, .log-meta, .prow span, .log-title { min-width:0; }
+.wrap { width:100%; }
+.log-det, .log-meta, .log-title, .msg, .prow span { overflow-wrap:anywhere; word-break:break-word; }
+.filters > * { min-width:0; }
+.drawer { visibility:hidden; pointer-events:none; padding-top:calc(14px + env(safe-area-inset-top,0px)); }
+.drawer.open { visibility:visible; pointer-events:auto; }
+.ov { padding:calc(14px + env(safe-area-inset-top,0px)) 10px 20px; }
+@media (max-width:640px) {
+  .hide-sm { display:none; }
+  .logo { font-size:1.05rem; }
+  nav { padding-left:.7rem; padding-right:.7rem; }
+  .wrap { padding:14px 10px 50px; }
+  .card { padding:14px; border-radius:12px; }
+  h2 { font-size:1.1rem; }
+  .log-item { padding:11px 12px; }
+  .log-body { min-width:0; flex:1 1 100%; }
+  .log-act { width:100%; }
+  .log-act .btn { flex:1 1 auto; text-align:center; }
+  .modal { padding:16px; }
+  .tabs .tab { flex:1 1 auto; text-align:center; padding:9px 10px; }
+  .bot { flex-direction:row; }
+  .bot > div { min-width:0; flex:1 1 60%; }
+  .bot > .btn { width:100%; }
+  .stat .num { font-size:22px; }
+  .auth-card { padding:28px 20px; border-radius:20px; }
+}
 `;
 
 const HEAD = (title) => `<!DOCTYPE html>
-<html lang="ar" dir="rtl"><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width, initial-scale=1.0">
+<html lang="ar" dir="rtl"><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
 <title>${title}</title>
 <link href="https://fonts.googleapis.com/css2?family=Tajawal:wght@400;500;700;800&display=swap" rel="stylesheet">
 <style>${CSS}</style></head>`;
@@ -1152,7 +1186,7 @@ function setTri(b,s){var row=b.closest('.prow');row.setAttribute('data-s',s);row
 function appPage() {
     return HEAD(CONFIG.SITE_NAME + " — " + CONFIG.SITE_SUB) + `<body>
 <nav>
-  <div class="nav-start"><button class="hamburger-btn" onclick="openDrawer()" aria-label="القائمة">☰</button><div class="logo">🛡️ ${CONFIG.SITE_NAME} — ${CONFIG.SITE_SUB}</div></div>
+  <div class="nav-start"><button class="hamburger-btn" onclick="openDrawer()" aria-label="القائمة">☰</button><div class="logo">🛡️ ${CONFIG.SITE_NAME}<span class="hide-sm"> — ${CONFIG.SITE_SUB}</span></div></div>
   <ul class="nav-links" id="navlinks"></ul>
   <div class="userchip" id="uchip"></div>
 </nav>
