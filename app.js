@@ -330,8 +330,117 @@ app.get("/api/images/:id", auth, wrap(async (req, res) => {
 
 // ── API: اللوق ──
 const escRe = s => s.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+
+// ── بحث اللوق بالوقت والتاريخ (عربي / إنجليزي) ──
+const TZ_OFF = "+03:00";   // توقيت الرياض
+const FILL = "\u0001";
+const normQ = s => String(s || "")
+    .replace(/[\u200e\u200f\u202a-\u202e\u2066-\u2069]/g, " ")
+    .replace(/[٠-٩]/g, d => String(d.charCodeAt(0) - 0x0660))
+    .replace(/[۰-۹]/g, d => String(d.charCodeAt(0) - 0x06F0))
+    .replace(/[أإآٱ]/g, "ا").replace(/ى/g, "ي").replace(/ة/g, "ه").replace(/،/g, " ")
+    .toLowerCase();
+const MONTHS_Q = {
+    يناير: 1, فبراير: 2, مارس: 3, ابريل: 4, مايو: 5, يونيو: 6, يونيه: 6, يوليو: 7, يوليه: 7, اغسطس: 8, سبتمبر: 9, اكتوبر: 10, نوفمبر: 11, ديسمبر: 12,
+    شباط: 2, اذار: 3, نيسان: 4, ايار: 5, حزيران: 6, تموز: 7, ايلول: 9,
+    january: 1, february: 2, march: 3, april: 4, may: 5, june: 6, july: 7, august: 8, september: 9, october: 10, november: 11, december: 12,
+    jan: 1, feb: 2, apr: 4, jun: 6, jul: 7, aug: 8, sept: 9, sep: 9, oct: 10, nov: 11, dec: 12,
+};
+const DOW_Q = {   // 1 = الأحد (نفس ترقيم MongoDB)
+    احد: 1, اثنين: 2, اتنين: 2, ثلاثاء: 3, ثلاثا: 3, اربعاء: 4, اربعا: 4, خميس: 5, جمعه: 6, سبت: 7,
+    sunday: 1, monday: 2, tuesday: 3, wednesday: 4, thursday: 5, friday: 6, saturday: 7,
+};
+const altOf = o => Object.keys(o).sort((a, b) => b.length - a.length).join("|");
+const PER = "am|pm|ص|م|صباحا|صباح|مساء|ظهرا|ظهر|عصرا|عصر|ليلا|ليل|فجرا|فجر";
+const PFX = "(?:(?:الساعه|ساعه|at)\\s*)?";
+const NB = "(?<![\\p{L}\\d:.\\/-])", NA = "(?![\\d:.\\/-])";
+const SEP = "\\s*[-\\/.]\\s*";
+const RE_ISO = new RegExp(NB + "(\\d{4})" + SEP + "(\\d{1,2})" + SEP + "(\\d{1,2})" + NA, "gu");
+const RE_DMY = new RegExp(NB + "(\\d{1,2})" + SEP + "(\\d{1,2})" + SEP + "(\\d{4})" + NA, "gu");
+const RE_YM = new RegExp(NB + "(\\d{4})\\s*[-\\/]\\s*(\\d{1,2})" + NA, "gu");
+const RE_DM = new RegExp(NB + "(\\d{1,2})\\s*[-\\/]\\s*(\\d{1,2})" + NA, "gu");
+const RE_TCOL = new RegExp(PFX + NB + "(\\d{1,2}):(\\d{2})(?::\\d{2})?(?:\\s*(" + PER + ")[\\u064B-\\u065F]*(?![\\p{L}]))?", "gu");
+const RE_THOUR = new RegExp(PFX + NB + "(\\d{1,2})\\s*(" + PER + ")[\\u064B-\\u065F]*(?![\\p{L}])", "gu");
+const RE_THPFX = new RegExp("(?:الساعه|ساعه|at)\\s*(\\d{1,2})(?![\\d:.\\/-])", "gu");
+const RE_MONTH = new RegExp("(?:(?<![\\d:.\\/-])(\\d{1,2})\\s*)?(?<![\\p{L}])(" + altOf(MONTHS_Q) + ")(?![\\p{L}])(?:\\s*(\\d{1,2})(?![\\d:.\\/-]))?(?:\\s*(20\\d{2})(?!\\d))?", "gu");
+const RE_DOW = new RegExp("(?<![\\p{L}\\d])(?:ال)?(" + altOf(DOW_Q) + ")(?![\\p{L}])", "gu");
+const RE_YEAR = new RegExp(NB + "(20\\d{2})" + NA, "gu");
+const REL_Q = [
+    [/(?<![\p{L}\d])(?:اول\s+امس|قبل\s+امس|day\s+before\s+yesterday)(?![\p{L}])/gu, -2],
+    [/(?<![\p{L}\d])(?:امس|البارحه|yesterday)(?![\p{L}])/gu, -1],
+    [/(?<![\p{L}\d])(?:اليوم|today)(?![\p{L}])/gu, 0],
+];
+const STOP_Q = /^(في|شهر|يوم|بتاريخ|تاريخ|وقت|الوقت|ساعه|الساعه|ميلادي|عام|سنه|at|on|in|of|the|date|time|day|month|year)$/;
+const perOf = p => (p[0] === "a" || p[0] === "ص" || p.startsWith("فجر")) ? "am" : (p[0] === "p" || p[0] === "م" || p[0] === "ع") ? "pm" : p[0] === "ظ" ? "noon" : "night";
+function hoursFor(h, per) {
+    if (h > 23) return null;
+    if (per === "am") return [h === 12 ? 0 : h];
+    if (per === "pm") return [h < 12 ? h + 12 : h];
+    if (per === "noon") return [h >= 1 && h <= 5 ? h + 12 : h];
+    if (per === "night") return [h === 12 ? 0 : (h >= 6 && h < 12 ? h + 12 : h)];
+    if (h === 0 || h > 12) return [h];
+    return [h, (h + 12) % 24];
+}
+// يحلّل نص البحث: يطلّع شروط الوقت/التاريخ، والباقي يبقى بحث بالاسم
+function parseWhen(q) {
+    const raw = String(q || "").trim();
+    const none = { conds: [], rest: raw };
+    if (!raw || /^\d{12,}$/.test(raw)) return none;
+    const s = normQ(raw);
+    if (s.length !== raw.length) return none;
+    const G = {}; let any = false, w = s;
+    const eat = (re, fn) => { w = w.replace(re, (m, ...g) => { if (!fn(g)) return m; any = true; return FILL.repeat(m.length); }); };
+    const okD = v => v >= 1 && v <= 31, okM = v => v >= 1 && v <= 12, okY = v => v >= 2020 && v <= new Date().getFullYear() + 1;
+    eat(RE_ISO, g => { const y = +g[0], m = +g[1], d = +g[2]; if (!okY(y) || !okM(m) || !okD(d)) return false; G.y = y; G.m = m; G.day = d; return true; });
+    eat(RE_DMY, g => { const d = +g[0], m = +g[1], y = +g[2]; if (!okY(y) || !okM(m) || !okD(d)) return false; G.y = y; G.m = m; G.day = d; return true; });
+    eat(RE_YM, g => { const y = +g[0], m = +g[1]; if (!okY(y) || !okM(m)) return false; G.y = y; G.m = m; return true; });
+    eat(RE_DM, g => { let d = +g[0], m = +g[1]; if (m > 12 && d <= 12) [d, m] = [m, d]; if (!okM(m) || !okD(d)) return false; G.m = m; G.day = d; return true; });
+    const setTime = (h, min, per) => { const hs = hoursFor(h, per ? perOf(per) : null); if (!hs || (min != null && min > 59)) return false; G.hours = hs; if (min != null) G.min = min; return true; };
+    eat(RE_TCOL, g => setTime(+g[0], +g[1], g[2]));
+    eat(RE_THOUR, g => setTime(+g[0], null, g[1]));
+    eat(RE_THPFX, g => setTime(+g[0], null, null));
+    for (const [re, back] of REL_Q) eat(re, () => {
+        const k = dayKeyOf(Date.now() + back * DAY); G.y = +k.slice(0, 4); G.m = +k.slice(5, 7); G.day = +k.slice(8, 10); return true;
+    });
+    eat(RE_MONTH, g => {
+        const m = MONTHS_Q[g[1].replace(/\s+/g, " ")]; const d = g[0] || g[2];
+        if (!m || (d && !okD(+d))) return false;
+        G.m = m; if (d) G.day = +d; if (g[3]) G.y = +g[3]; return true;
+    });
+    eat(RE_DOW, g => { G.dow = DOW_Q[g[0]]; return !!G.dow; });
+    eat(RE_YEAR, g => { if (!okY(+g[0])) return false; G.y = +g[0]; return true; });
+    if (!any) return none;
+    let rest = "";
+    for (let i = 0; i < raw.length; i++) rest += w[i] === FILL ? " " : raw[i];
+    rest = rest.split(/\s+/).filter(t => t && !STOP_Q.test(normQ(t)) && !/^[\s،,.:;\-\/\\|]+$/.test(t)).join(" ");
+    const part = op => ({ [op]: { date: "$createdAt", timezone: TZ_OFF } });
+    const conds = [];
+    if (G.y != null) conds.push({ $eq: [part("$year"), G.y] });
+    if (G.m != null) conds.push({ $eq: [part("$month"), G.m] });
+    if (G.day != null) conds.push({ $eq: [part("$dayOfMonth"), G.day] });
+    if (G.dow != null) conds.push({ $eq: [part("$dayOfWeek"), G.dow] });
+    if (G.hours) conds.push({ $in: [part("$hour"), G.hours] });
+    if (G.min != null) conds.push({ $eq: [part("$minute"), G.min] });
+    return { conds, rest };
+}
+
+// كاش لقائمة أعضاء السيرفر (من البوت) — لعرض اسم الشخص بالسيرفر ويوزره في تفاصيل العملية
+let memCache = { t: 0, map: null }, memInflight = null;
+async function getMemberMap() {
+    if (memCache.map && Date.now() - memCache.t < 120000) return memCache.map;
+    if (!memInflight) memInflight = (async () => {
+        try {
+            const r = await callBot("perm_members", {}, 60000);
+            const map = new Map(); (r.members || []).forEach(m => map.set(String(m.id), m));
+            memCache = { t: Date.now(), map };
+            return map;
+        } catch (e) { if (memCache.map) return memCache.map; throw e; }
+        finally { memInflight = null; }
+    })();
+    return memInflight;
+}
 app.get("/api/events", auth, wrap(async (req, res) => {
-    const { q, cat, unres, before, cu } = req.query;
+    const { q, cat, unres, before, cu, rs } = req.query;
     const f = {};
     if (cu === "1") f["data.catchup"] = true;
     if (cat === "sus") f.kind = "suspicious";
@@ -339,10 +448,13 @@ app.get("/api/events", auth, wrap(async (req, res) => {
     else if (cat === "probot") f["data.probot"] = true;
     else if (cat) f.cat = cat;
     if (unres === "1") { f.kind = "suspicious"; f.resolved = false; }
+    if (rs === "1") { f.kind = "suspicious"; f.resolved = true; }
     if (before) f.createdAt = { $lt: new Date(Number(before)) };
     if (q && String(q).trim()) {
-        const t = String(q).trim(), re = new RegExp(escRe(t), "i");
-        f.$or = [{ actorId: t }, { targetId: t }, { actorTag: re }, { targetTag: re }];
+        const t = String(q).trim(), w = parseWhen(t);
+        if (w.conds.length) f.$expr = { $and: w.conds };          // بحث بالوقت / التاريخ
+        const nm = w.conds.length ? w.rest : t;                    // الباقي بحث بالاسم / الآيدي
+        if (nm) { const re = new RegExp(escRe(nm), "i"); f.$or = [{ actorId: nm }, { targetId: nm }, { actorTag: re }, { targetTag: re }]; }
     }
     const list = await Event.find(f).sort({ createdAt: -1 }).limit(50).select("-data.messages").lean();
     const evIds = list.map(e => e._id);
@@ -350,10 +462,44 @@ app.get("/api/events", auth, wrap(async (req, res) => {
     const inqs = evIds.length ? await Inquiry.find({ $or: [{ eventId: { $in: evIds } }, { _id: { $in: inqIds } }] }).select("eventId dmTag status reason").lean() : [];
     const byEv = {}, byId = {};
     inqs.forEach(i => { if (i.eventId) byEv[String(i.eventId)] = i; byId[String(i._id)] = i; });
-    res.json({ events: list.map(e => {
+    let counts = null;
+    if (!before) {
+        const SUS = { kind: "suspicious" }, t0 = dayStart(dayKeyOf(Date.now())), td = { createdAt: { $gte: t0 } };
+        const [a, u, r, ta, tu, tr] = await Promise.all([
+            Event.countDocuments(SUS), Event.countDocuments({ ...SUS, resolved: false }), Event.countDocuments({ ...SUS, resolved: true }),
+            Event.countDocuments({ ...SUS, ...td }), Event.countDocuments({ ...SUS, ...td, resolved: false }), Event.countDocuments({ ...SUS, ...td, resolved: true }),
+        ]);
+        counts = { total: a, unresolved: u, resolved: r, today: { total: ta, unresolved: tu, resolved: tr } };
+    }
+    res.json({ counts, events: list.map(e => {
         const i = (e.data && e.data.inqId && byId[String(e.data.inqId)]) || byEv[String(e._id)];
         return { ...e, hasMsgs: !!(e.data && (e.data.act === "bulk_delete" || e.data.act === "mass_msg_delete")), inq: i ? { id: String(i._id), status: i.status, dmTag: i.dmTag } : null };
     }) });
+}));
+// ── تفاصيل عملية وحدة (للفورم اللي يطلع لما تضغط على العملية) ──
+app.get("/api/events/:id/info", auth, wrap(async (req, res) => {
+    if (!mongoose.isValidObjectId(req.params.id)) return res.status(400).json({ error: "عملية غير صحيحة" });
+    const e = await Event.findById(req.params.id).select("-data.messages").lean();
+    if (!e) return res.status(404).json({ error: "العملية غير موجودة" });
+    const d = e.data || {};
+    res.json({ event: {
+        _id: String(e._id), title: e.title, details: e.details, cat: e.cat, rule: e.rule, kind: e.kind, severity: e.severity, count: e.count || 1,
+        resolved: !!e.resolved, resolvedBy: e.resolvedBy || null, resolvedAt: e.resolvedAt || null, createdAt: e.createdAt,
+        actorId: e.actorId || null, actorTag: e.actorTag || null, targetId: e.targetId || null, targetTag: e.targetTag || null,
+        channel: d.channel || null, probot: !!d.probot, catchup: !!d.catchup,
+        images: (Array.isArray(d.images) ? d.images : []).filter(i => i && i.id).map(i => ({ id: String(i.id) })),
+        hasMsgs: d.act === "bulk_delete" || d.act === "mass_msg_delete",
+    } });
+}));
+// اسم الشخص بالسيرفر + يوزره (من قائمة أعضاء البوت)
+app.get("/api/people/lookup", auth, wrap(async (req, res) => {
+    const ids = [...new Set(String(req.query.ids || "").split(",").map(x => x.trim()).filter(x => /^\d{5,25}$/.test(x)))].slice(0, 6);
+    if (!ids.length) return res.json({ ok: true, people: {} });
+    const map = await getMemberMap().catch(() => null);
+    if (!map) return res.json({ ok: false, people: {} });
+    const people = {};
+    ids.forEach(id => { const m = map.get(id); if (m) people[id] = { server: m.server || null, global: m.global || null, username: m.username || null, avatar: m.avatar || null, bot: !!m.bot }; });
+    res.json({ ok: true, people });
 }));
 app.get("/api/events/:id/messages", auth, wrap(async (req, res) => {
     const e = await Event.findById(req.params.id).lean();
@@ -368,10 +514,9 @@ async function panelLog(req, title, details, extra = {}) {
 app.post("/api/events/:id/remedy", auth, full, wrap(async (req, res) => {
     const e = await Event.findById(req.params.id);
     if (!e || !e.remedy) return res.status(404).json({ error: "ما فيه إجراء لهذي العملية" });
-    if (e.resolved) return res.status(400).json({ error: "العملية محلولة من قبل" });
     const out = await callBot("remedy", { remedy: JSON.parse(JSON.stringify(e.remedy)), who: req.session.user.tag }, 90000);
     const msg = out.msg;
-    e.resolved = true; e.resolvedBy = req.session.user.tag; e.resolvedAt = new Date(); e.updatedAt = new Date(); await e.save();
+    if (!e.resolved) { e.resolved = true; e.resolvedBy = req.session.user.tag; e.resolvedAt = new Date(); e.updatedAt = new Date(); await e.save(); }   // لو كانت محلولة قبل نخلّي اللي حلّها كما هو
     await panelLog(req, "تنفيذ إجراء: " + e.remedy.label.replace(/^\S+\s/, ""), "العملية: " + e.title + " — " + msg);
     res.json({ ok: true, msg });
 }));
@@ -777,6 +922,8 @@ input:focus, select:focus { outline:none; border-color:var(--gold-soft); }
 .msg b { color:var(--gold-soft); }
 .imgrow { display:flex; flex-wrap:wrap; gap:8px; margin-top:8px; }
 .imgrow img { width:110px; height:110px; object-fit:cover; border-radius:8px; border:1px solid var(--border); cursor:pointer; }
+.log-item[data-id] { cursor:pointer; transition:border-color .15s; }
+.log-item[data-id]:hover { border-color:rgba(96,165,250,0.75); }
 #toast { position:fixed; bottom:20px; left:50%; transform:translateX(-50%); background:#0d1f3c; padding:10px 20px; border-radius:10px; border:1px solid var(--gold); z-index:6000; display:none; max-width:90vw; text-align:center; }
 .center { text-align:center; } .muted { color:var(--muted); }
 .warn { background:rgba(234,179,8,0.1); border:1px solid #eab308; color:#fde68a; border-radius:10px; padding:10px 14px; font-size:13px; margin-bottom:14px; }
@@ -843,7 +990,7 @@ function loginPage(mode) {
 
 const CLIENT = String.raw`
 var PAGES=[['logs','📜 اللوق'],['stats','📊 الإحصائيات'],['bots','🤖 البوتات'],['perms','🔐 صلاحيات السيرفر']];
-var S={page:'logs',q:'',cat:'',unres:false,cu:false,events:[],sig:'',timer:null,permsTab:'roles',permsView:'danger',permsQ:'',meta:null,presence:true,level:'view',meId:null};
+var S={page:'logs',q:'',cat:'',unres:false,res:false,counts:null,cu:false,events:[],sig:'',timer:null,permsTab:'roles',permsView:'danger',permsQ:'',meta:null,presence:true,level:'view',meId:null};
 var CATS=[['','الكل'],['sus','⚠️ العمليات المشبوهة'],['newacc','🆕 حسابات جديدة'],['join','دخول'],['leave','خروج'],['kick','طرد'],['ban','حظر'],['role','الرتب'],['inquiry','📩 استفسارات الرتب'],['channel','القنوات'],['voice','🎙️ الرومات الصوتية'],['message','الرسائل المحذوفة'],['probot','🧹 حذف عبر ProBot'],['bot','البوتات'],['webhook','ويبهوكس'],['everyone','منشن everyone'],['server','إعدادات السيرفر'],['panel','عمليات اللوحة']];
 var RULE_AR={new_account:'حساب جديد',mass_roles_created:'رتب جماعية',mass_role_delete:'حذف رتب',mass_channel_create:'إنشاء قنوات',mass_channel_delete:'حذف قنوات',mass_ban:'حظر جماعي',mass_kick:'طرد جماعي',dangerous_perm_grant:'صلاحيات خطيرة',dangerous_role_assigned:'رتبة خطيرة',bot_added:'بوت جديد',webhook_created:'ويبهوك',everyone_spam:'منشن everyone',mass_join:'غارة دخول',mass_msg_delete:'مسح ضخم',server_changed:'إعدادات السيرفر'};
 function $(id){return document.getElementById(id);}
@@ -903,12 +1050,12 @@ async function runBackfill(h){
       +pb.byChannel.map(function(c){return '<div class="prow"><span>#'+esc(c.channel)+'</span><b>'+c.messages+' رسالة ('+c.ops+' مسح)</b></div>';}).join('')+'</div>':'';
     var evs=j.events.slice().sort(function(a,b){return (b.probot?1:0)-(a.probot?1:0);});
     var list=evs.map(function(e){
-      return '<div class="card" style="margin:8px 0;padding:12px'+(e.probot?';border-color:#f59e0b':'')+'"><div class="log-title"><span>'+esc(e.title)+'</span>'
+      return '<div class="card" onclick="openEv(\''+e.id+'\')" style="cursor:pointer;margin:8px 0;padding:12px'+(e.probot?';border-color:#f59e0b':'')+'"><div class="log-title"><span>'+esc(e.title)+'</span>'
        +(e.probot?'<span class="badge medium">🧹 ProBot</span>':'')
        +(e.kind==='suspicious'?'<span class="badge '+esc(e.severity)+'">⚠️ مشبوهة — '+(sevAr[e.severity]||esc(e.severity))+'</span>':'')+'</div>'
        +(e.details?'<div class="log-det">'+esc(e.details)+'</div>':'')
        +'<div class="log-meta">🕒 '+fmt(e.createdAt)+(e.actor?' &nbsp;•&nbsp; 👤 '+esc(e.actor):'')+(e.target?' &nbsp;•&nbsp; 🎯 '+esc(e.target):'')+'</div>'
-       +(e.hasMsgs?'<div style="margin-top:8px"><button class="btn sm gray" onclick="showMsgs(\''+e.id+'\')">📄 عرض الرسائل</button></div>':'')+'</div>';
+       +(e.hasMsgs?'<div style="margin-top:8px"><button class="btn sm gray" onclick="event.stopPropagation();showMsgs(\''+e.id+'\')">📄 عرض الرسائل</button></div>':'')+'</div>';
     }).join('')||'<div class="card center muted">ما فيه شي ناقص — كل اللي في سجل ديسكورد مسجّل أصلاً.<br>اللي استرجعته قبل تقدر تشوفه من اللوق (فلتر 🔄 المسترجعة فقط).</div>';
     modal('<h3>🔄 العمليات المسترجعة ('+j.n+')</h3><p class="muted" style="font-size:12px;margin-bottom:6px">المدة: آخر '+j.hours+' ساعة'+(j.n>=300?' — معروض أحدث 300':'')+'</p>'
      +'<div style="max-height:58vh;overflow-y:auto">'+pbCard+list+'</div>'
@@ -924,24 +1071,31 @@ function showRecovered(){
 }
 function pgLogs(){
   var opts=CATS.map(function(c){return '<option value="'+c[0]+'"'+(S.cat===c[0]?' selected':'')+'>'+c[1]+'</option>';}).join('');
-  $('main').innerHTML='<h2>📜 اللوق الشامل</h2><div class="card"><div class="filters">'
-   +'<input id="f-q" placeholder="🔎 فرز حسب الشخص (اسم أو آيدي)" value="'+esc(S.q)+'">'
+  $('main').innerHTML='<h2>📜 اللوق الشامل</h2><div id="logstats"></div><div class="card"><div class="filters">'
+   +'<input id="f-q" placeholder="🔎 شخص (اسم/آيدي) أو وقت وتاريخ" value="'+esc(S.q)+'">'
    +'<select id="f-cat">'+opts+'</select>'
    +'<label class="chk"><input type="checkbox" id="f-un"'+(S.unres?' checked':'')+'> غير المحلولة فقط</label>'
    +'<label class="chk"><input type="checkbox" id="f-cu"'+(S.cu?' checked':'')+'> 🔄 المسترجعة فقط</label>'
-   +(S.level==='full'?'<button class="btn sm gray" onclick="openBackfill()">🔄 استرجاع الفائت</button>':'')+'</div></div>'
+   +(S.level==='full'?'<button class="btn sm gray" onclick="openBackfill()">🔄 استرجاع الفائت</button>':'')+'</div><div class="muted" style="font-size:11px;margin-top:8px;line-height:1.8">💡 تقدر تبحث بالوقت والتاريخ بالعربي أو الإنجليزي، وتدمجه مع الاسم: <b>اليوم</b> • <b>أمس</b> • <b>10:30 م</b> • <b>3 مساء</b> • <b>5 أكتوبر</b> • <b>2026-10-01</b> • <b>الخميس</b> • <b>today</b> • <b>yesterday</b> • <b>9pm</b> • <b>ahmed أمس</b></div></div>'
    +'<div id="evlist"><div class="card center muted">جاري التحميل...</div></div><div class="center"><button class="btn gray" id="more" style="display:none" onclick="moreEvents()">تحميل المزيد</button></div>';
   var t;$('f-q').oninput=function(){S.q=this.value;clearTimeout(t);t=setTimeout(loadEvents,350);};
-  $('f-cat').onchange=function(){S.cat=this.value;loadEvents();};
-  $('f-un').onchange=function(){S.unres=this.checked;loadEvents();};
+  $('f-cat').onchange=function(){S.cat=this.value;drawCounts();loadEvents();};
+  $('f-un').onchange=function(){S.unres=this.checked;if(this.checked)S.res=false;drawCounts();loadEvents();};
   $('f-cu').onchange=function(){S.cu=this.checked;loadEvents();};
+  $('evlist').onclick=function(ev){
+    if(ev.target.closest('button,a,img,input,select,.log-act'))return;
+    if(window.getSelection&&String(window.getSelection()))return;
+    var it=ev.target.closest('.log-item');if(it&&it.getAttribute('data-id'))openEv(it.getAttribute('data-id'));
+  };
+  drawCounts();
   loadEvents();
   S.timer=setInterval(function(){if(!$('ov'))loadEvents(true);},6000);
 }
-function qs(before){return '/api/events?q='+encodeURIComponent(S.q)+'&cat='+encodeURIComponent(S.cat)+'&unres='+(S.unres?1:0)+'&cu='+(S.cu?1:0)+(before?'&before='+before:'');}
+function qs(before){return '/api/events?q='+encodeURIComponent(S.q)+'&cat='+encodeURIComponent(S.cat)+'&unres='+(S.unres?1:0)+'&cu='+(S.cu?1:0)+'&rs='+(S.res?1:0)+(before?'&before='+before:'');}
 async function loadEvents(silent){
   try{
     var j=await api(qs());
+    if(j.counts){S.counts=j.counts;drawCounts();}
     var sig=j.events.map(function(e){return e._id+e.updatedAt+e.resolved+(e.inq?e.inq.status:'');}).join('|');
     if(silent&&sig===S.sig)return;
     S.sig=sig;S.events=j.events;drawEvents(j.events.length>=50);
@@ -966,9 +1120,9 @@ function evRow(e){
   if(e.resolved&&e.resolvedBy)meta+=' &nbsp;•&nbsp; حلّها: '+esc(e.resolvedBy);
   var acts='';
   if(e.hasMsgs)acts+='<button class="btn sm gray" onclick="showMsgs(\''+e._id+'\')">📄 عرض الرسائل</button>';
-  if(sus&&!e.resolved&&S.level==='full'){
+  if(sus&&S.level==='full'){
     if(e.remedy)acts+='<button class="btn sm danger" onclick="doRemedy(\''+e._id+'\',this)">'+esc(e.remedy.label)+'</button>';
-    acts+='<button class="btn sm ok" onclick="doResolve(\''+e._id+'\',this)">✅ حل العملية</button>';
+    if(!e.resolved)acts+='<button class="btn sm ok" onclick="doResolve(\''+e._id+'\',this)">✅ حل العملية</button>';
   }
   var isReply=!!(e.data&&e.data.act==='inq_reply');
   if(e.cat==='role'&&e.actorId&&e.data&&e.data.act==='member_roles'&&String(e.details||'').indexOf('أُعطي')>-1){
@@ -982,7 +1136,7 @@ function evRow(e){
     }else acts+='<span class="badge '+(e.inq.status==='investigation'?'high':'done')+'">'+(INQ_AR[e.inq.status]||'')+'</span>';
   }
   var imgs=(e.data&&e.data.images&&e.data.images.length)?'<div class="imgrow">'+e.data.images.map(function(im){return '<img src="/api/images/'+im.id+'" alt="" loading="lazy" onclick="showImg(\''+im.id+'\')">';}).join('')+'</div>':'';
-  return '<div class="'+cls+'"><div class="log-body"><div class="log-title">'+badge+'<span>'+esc(e.title)+'</span>'+(e.count>1&&sus?'<span class="badge low">×'+e.count+'</span>':'')+'</div>'
+  return '<div class="'+cls+'" data-id="'+e._id+'"><div class="log-body"><div class="log-title">'+badge+'<span>'+esc(e.title)+'</span>'+(e.count>1&&sus?'<span class="badge low">×'+e.count+'</span>':'')+'</div>'
     +(e.details?'<div class="log-det">'+esc(e.details)+'</div>':'')+imgs+'<div class="log-meta">'+meta+'</div></div><div class="log-act">'+acts+'</div></div>';
 }
 function showImg(id){modal('<div class="center"><img src="/api/images/'+id+'" alt="" style="max-width:100%;max-height:75vh;border-radius:10px"></div><div style="margin-top:14px" class="center"><button class="btn gray" onclick="closeModal()">إغلاق</button></div>');}
@@ -1020,6 +1174,107 @@ async function showMsgs(id){
     html+='<div style="margin-top:14px"><button class="btn gray" onclick="closeModal()">إغلاق</button></div>';
     modal(html);
   }catch(e){toast(e.message);}
+}
+
+/* ══ إحصائيات اللوق (أزرار تصفية: العمليات / غير محلولة / محلولة) ══ */
+function drawCounts(){
+  var box=$('logstats');if(!box)return;
+  var c=S.counts;if(!c){box.innerHTML='';return;}
+  var all=(S.cat==='sus'&&!S.unres&&!S.res);
+  function card(cls,key,num,lbl,today,on){
+    return '<div class="stat '+cls+' click" style="padding:10px 4px;'+(on?'border-color:#60a5fa;box-shadow:0 0 0 1px #60a5fa;background:rgba(59,130,246,0.12)':'')+'" onclick="logStat(\''+key+'\')"><div class="num">'+num+'</div><div class="lbl">'+lbl+'</div><div class="lbl" style="font-size:11px">اليوم: '+today+'</div></div>';
+  }
+  box.innerHTML='<div style="display:grid;grid-template-columns:repeat(3,1fr);gap:8px;margin-bottom:14px">'
+    +card('red','all',c.total,'عمليات مشبوهة',c.today.total,all)
+    +card('amber','unres',c.unresolved,'غير محلولة',c.today.unresolved,S.unres)
+    +card('green','res',c.resolved,'محلولة',c.today.resolved,S.res)+'</div>';
+}
+function logStat(k){
+  if(k==='all'){if(S.cat==='sus'&&!S.unres&&!S.res)S.cat='';else{S.cat='sus';S.unres=false;S.res=false;}}
+  else if(k==='unres'){S.unres=!S.unres;if(S.unres)S.res=false;}
+  else{S.res=!S.res;if(S.res)S.unres=false;}
+  var u=$('f-un');if(u)u.checked=S.unres;var fc=$('f-cat');if(fc)fc.value=S.cat;
+  drawCounts();loadEvents();
+}
+
+/* ══ نسخ ══ */
+function copyText(t,msg){
+  function ok(){toast(msg||'تم النسخ');}
+  function fb(){try{var a=document.createElement('textarea');a.value=t;a.style.cssText='position:fixed;opacity:0;top:0;left:0';document.body.appendChild(a);a.focus();a.select();document.execCommand('copy');a.remove();ok();}catch(e){toast('ما قدرت أنسخ');}}
+  if(navigator.clipboard&&window.isSecureContext){navigator.clipboard.writeText(t).then(ok,fb);}else fb();
+}
+function copyBtn(b){copyText(b.getAttribute('data-copy'),b.getAttribute('data-msg'));}
+function cpb(val,msg,lbl){return val?' <button class="btn sm gray" style="padding:2px 9px;font-size:11px;margin-inline-start:4px" data-copy="'+esc(val)+'" data-msg="'+esc(msg)+'" onclick="copyBtn(this)">📋 '+lbl+'</button>':'';}
+
+/* ══ فورم تفاصيل العملية (يطلع لما تضغط على أي عملية بأي مكان بالموقع) ══ */
+function evBackBtn(){return S.evBack?'<button class="btn" onclick="evBack()">⬅️ رجوع</button>':'';}
+function evBack(){
+  var b=S.evBack;S.evBack=null;S.evId=null;
+  if(!b){closeModal();return;}
+  modal(b.html);
+  var mm=$('ov')&&$('ov').querySelector('.modal'),sc=mm&&mm.querySelector('div[style*="overflow-y:auto"]');
+  if(sc)sc.scrollTop=b.st;
+}
+async function openEv(id){
+  var ov=$('ov'),mm=ov?ov.querySelector('.modal'):null;
+  if(mm&&!$('evinfo')){var sc=mm.querySelector('div[style*="overflow-y:auto"]');S.evBack={html:mm.innerHTML,st:sc?sc.scrollTop:0};}
+  else if(!mm)S.evBack=null;
+  S.evId=id;S.evj=null;S.evp=null;
+  modal('<div id="evinfo" style="max-height:70vh;overflow-y:auto"><h3>📋 تفاصيل العملية</h3><div class="card center muted">جاري التحميل...</div></div><div class="row" style="justify-content:flex-start;margin-top:14px">'+evBackBtn()+'<button class="btn gray" onclick="closeModal()">إغلاق</button></div>');
+  try{
+    var j=await api('/api/events/'+id+'/info');
+    if(S.evId!==id||!$('evinfo'))return;
+    S.evj=j.event;drawEv();
+    var ids=[];if(j.event.actorId)ids.push(j.event.actorId);if(j.event.targetId&&ids.indexOf(j.event.targetId)<0)ids.push(j.event.targetId);
+    if(ids.length){
+      try{var r=await api('/api/people/lookup?ids='+ids.join(','));S.evp={ok:r.ok,people:r.people||{}};}
+      catch(x){S.evp={ok:false,people:{}};}
+      if(S.evId!==id||!$('evinfo'))return;
+      drawEv();
+    }
+  }catch(e){if(S.evId===id&&$('evinfo'))$('evinfo').innerHTML='<h3>📋 تفاصيل العملية</h3><div class="card center muted">'+esc(e.message)+'</div>';}
+}
+function personHtml(label,id,tag,p,state){
+  if(!id&&!tag)return '<div class="card" style="margin:8px 0;padding:12px"><div class="muted" style="font-size:12px;margin-bottom:4px">'+label+'</div><span class="muted">غير معروف (ما انسجّل مين سوّاها)</span></div>';
+  var h='<div class="card" style="margin:8px 0;padding:12px"><div class="muted" style="font-size:12px;margin-bottom:6px">'+label+'</div><div class="mlist" style="border:none;padding:0;align-items:flex-start">';
+  if(p&&p.avatar)h+='<img src="'+esc(p.avatar)+'" alt="">';
+  h+='<div style="flex:1;min-width:0">';
+  if(p){
+    h+='<b>'+esc(p.server||p.global||p.username||tag||id)+'</b>'+(p.bot?' <span class="badge low">بوت</span>':'');
+    h+='<div class="log-meta">🏷️ اسمه في السيرفر: '+esc(p.server||'-')+'</div>';
+    h+='<div class="log-meta">👤 اسم البروفايل: '+esc(p.global||'-')+'</div>';
+    h+='<div class="log-meta">🔖 اليوزر: @'+esc(p.username||'-')+cpb(p.username,'تم نسخ اليوزر','نسخ اليوزر')+'</div>';
+  }else{
+    h+='<b>'+esc(tag||id)+'</b>';
+    var m=state==='wait'?'⏳ جاري جلب اسمه في السيرفر ويوزره...':state==='off'?'⚠️ تعذّر جلب اسمه ويوزره من السيرفر (البوت غير متصل) — المعروض هو المسجّل بالعملية':state==='gone'?'⚠️ ما لقيته بقائمة السيرفر الحالية (ممكن خرج أو مو عضو) — المعروض هو المسجّل بالعملية':'';
+    if(m)h+='<div class="log-meta">'+m+'</div>';
+  }
+  if(id)h+='<div class="log-meta">🆔 '+esc(id)+cpb(id,'تم نسخ الآيدي','نسخ الآيدي')+'</div>';
+  return h+'</div></div></div>';
+}
+function drawEv(){
+  var e=S.evj,box=$('evinfo');if(!e||!box)return;
+  var sus=e.kind==='suspicious',sevAr={high:'خطير',medium:'متوسط',low:'منخفض'};
+  var st=S.evp;
+  function stOf(id){return !st?'wait':!st.ok?'off':(st.people[id]?'ok':'gone');}
+  function pOf(id){return (id&&st&&st.ok)?(st.people[id]||null):null;}
+  var tm=new Date(e.createdAt);
+  var timeStr='';try{timeStr=tm.toLocaleTimeString('ar-SA-u-nu-latn',{timeZone:'Asia/Riyadh',hour12:true,hour:'numeric',minute:'2-digit',second:'2-digit'});}catch(x){timeStr=tm.toLocaleTimeString();}
+  var head='<div class="card" style="margin:8px 0;padding:12px"><div class="log-title"><span>'+esc(e.title)+'</span>'
+    +(sus?'<span class="badge '+(e.severity==='high'?'high':'medium')+'">⚠️ '+esc(RULE_AR[e.rule]||'مشبوهة')+' — '+(sevAr[e.severity]||esc(e.severity))+'</span>':'')
+    +(sus?(e.resolved?'<span class="badge done">✅ محلولة</span>':'<span class="badge medium">⏳ غير محلولة</span>'):'')
+    +(e.count>1&&sus?'<span class="badge low">×'+e.count+'</span>':'')+'</div>'
+    +'<div class="log-meta">🗂️ '+esc(CAT_AR[e.cat]||e.cat||'أخرى')+(e.probot?' • 🧹 ProBot':'')+(e.catchup?' • 🔄 مسترجعة':'')+(e.channel?' • 💬 #'+esc(e.channel):'')+'</div>'
+    +(sus&&e.resolved?'<div class="log-meta">✔️ حلّها: '+esc(e.resolvedBy||'-')+(e.resolvedAt?' — '+fmt(e.resolvedAt):'')+'</div>':'')+'</div>';
+  var actor=personHtml('👤 من الي سوّاها',e.actorId,e.actorTag,pOf(e.actorId),stOf(e.actorId));
+  var target=(e.targetId||e.targetTag)?personHtml('🎯 على مين',e.targetId,e.targetTag,pOf(e.targetId),e.targetId?stOf(e.targetId):'none'):'';
+  var when='<div class="card" style="margin:8px 0;padding:6px 12px">'
+    +'<div class="prow"><span class="muted">📅 التاريخ</span><b>'+esc(dayFull(dayKeyClient(e.createdAt)))+'</b></div>'
+    +'<div class="prow" style="border:none"><span class="muted">🕒 الوقت</span><span><b>'+esc(timeStr)+'</b> <span class="muted" style="font-size:11px">('+ago(e.createdAt)+')</span></span></div></div>';
+  var det=e.details?'<div class="card" style="margin:8px 0;padding:12px"><div class="muted" style="font-size:12px;margin-bottom:4px">📝 التفاصيل</div><div class="log-det">'+esc(e.details)+'</div></div>':'';
+  var imgs=(e.images&&e.images.length)?'<div class="imgrow">'+e.images.map(function(im){return '<img src="/api/images/'+im.id+'" alt="" loading="lazy" onclick="showImg(\''+im.id+'\')">';}).join('')+'</div>':'';
+  var msgs=e.hasMsgs?'<div style="margin-top:8px"><button class="btn sm gray" onclick="showMsgs(\''+e._id+'\')">📄 عرض الرسائل</button></div>':'';
+  box.innerHTML='<h3>📋 تفاصيل العملية</h3>'+head+actor+target+when+det+imgs+msgs;
 }
 
 /* ══ تفاصيل العمليات المشبوهة (يوم / أسبوع) ══ */
@@ -1069,7 +1324,7 @@ function drawRange(){
   var sevAr={high:'خطير',medium:'متوسط',low:'منخفض'};
   var list=j.ops.filter(function(e){return r.f==='all'||(r.f==='resolved'?e.resolved:!e.resolved);});
   var ops=list.map(function(e){
-    return '<div class="card" style="margin:8px 0;padding:12px"><div class="log-title"><span>'+esc(e.title)+'</span><span class="badge '+esc(e.severity)+'">'+(sevAr[e.severity]||esc(e.severity))+'</span>'
+    return '<div class="card" onclick="openEv(\''+e.id+'\')" style="cursor:pointer;margin:8px 0;padding:12px"><div class="log-title"><span>'+esc(e.title)+'</span><span class="badge '+esc(e.severity)+'">'+(sevAr[e.severity]||esc(e.severity))+'</span>'
      +(e.resolved?'<span class="badge done">✅ محلولة</span>':'<span class="badge medium">⏳ غير محلولة</span>')+'</div>'
      +(e.details?'<div class="log-det">'+esc(e.details)+'</div>':'')
      +'<div class="log-meta">🕒 '+fmt(e.createdAt)+(RULE_AR[e.rule]?' &nbsp;•&nbsp; '+esc(RULE_AR[e.rule]):'')+(e.actor?' &nbsp;•&nbsp; 👤 '+esc(e.actor):'')+(e.target?' &nbsp;•&nbsp; 🎯 '+esc(e.target):'')+(e.resolved&&e.resolvedBy?' &nbsp;•&nbsp; ✔️ '+esc(e.resolvedBy):'')+'</div></div>';
@@ -1122,7 +1377,7 @@ function drawBotAct(){
     return true;
   });
   var ops=list.map(function(e){
-    return '<div class="card" style="margin:8px 0;padding:12px"><div class="log-title"><span>'+esc(e.title)+'</span>'
+    return '<div class="card" onclick="openEv(\''+e.id+'\')" style="cursor:pointer;margin:8px 0;padding:12px"><div class="log-title"><span>'+esc(e.title)+'</span>'
      +(e.sus?'<span class="badge '+esc(e.severity)+'">⚠️ '+(sevAr[e.severity]||esc(e.severity))+'</span>':'')
      +(e.sus?(e.resolved?'<span class="badge done">✅ محلولة</span>':'<span class="badge medium">⏳ غير محلولة</span>'):'')+'</div>'
      +(e.details?'<div class="log-det">'+esc(e.details)+'</div>':'')
@@ -1247,7 +1502,7 @@ async function roleMembers(id){
         return '<div class="mlist"><img src="'+esc(m.avatar)+'" alt=""><div style="flex:1;min-width:0"><b>'+esc(m.server)+'</b>'+(m.bot?' <span class="badge low">بوت</span>':'')
           +'<div class="log-meta">🏷️ اسمه في السيرفر: '+esc(m.server)+'</div>'
           +'<div class="log-meta">👤 اسم البروفايل: '+esc(m.global)+'</div>'
-          +'<div class="log-meta">🔖 اليوزر: @'+esc(m.username)+'</div></div></div>';
+          +'<div class="log-meta">🔖 اليوزر: @'+esc(m.username)+cpb(m.username,'تم نسخ اليوزر','نسخ اليوزر')+'</div></div></div>';
       }).join('')||'<div class="card center muted">'+(q?'ما لقيت أحد بهذا الاسم':'ما فيه أحد معه هذي الرتبة')+'</div>';
     }
     $('rmq').oninput=draw;draw();$('rmq').focus();
@@ -1286,7 +1541,7 @@ async function drawMembers(nf){
     var canEdit=S.level==='full'&&m.editable;
     return '<div class="card"><div class="bot"><img src="'+esc(m.avatar)+'" alt=""><div style="flex:1;min-width:200px">'
      +'<div class="log-title"><b>'+esc(m.server)+'</b>'+(m.bot?' <span class="badge low">بوت</span>':'')+'</div>'
-     +'<div class="log-meta">🏷️ اسمه في السيرفر: '+esc(m.server)+' &nbsp;•&nbsp; 👤 البروفايل: '+esc(m.global)+' &nbsp;•&nbsp; 🔖 @'+esc(m.username)+'</div>'
+     +'<div class="log-meta">🏷️ اسمه في السيرفر: '+esc(m.server)+' &nbsp;•&nbsp; 👤 البروفايل: '+esc(m.global)+' &nbsp;•&nbsp; 🔖 @'+esc(m.username)+cpb(m.username,'تم نسخ اليوزر','نسخ اليوزر')+'</div>'
      +'<div style="margin-top:8px">'+chips+'</div></div>'
      +'<button class="btn sm '+(canEdit?'':'gray')+'" onclick="editMember(\''+m.id+'\')">'+(canEdit?'✏️ عرض وتعديل':'👁️ عرض فقط')+'</button></div></div>';
   }).join('')||'<div class="card center muted">'+(q?'ما لقيت أحد بهذا الاسم':'ما فيه أعضاء')+'</div>';
