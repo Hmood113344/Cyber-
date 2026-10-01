@@ -109,6 +109,30 @@ const PERM_AR = {
     UseEmbeddedActivities: "الأنشطة", UseSoundboard: "لوحة الأصوات", RequestToSpeak: "طلب التحدث", ChangeNickname: "تغيير اللقب",
     ViewGuildInsights: "إحصائيات السيرفر", CreateGuildExpressions: "إنشاء إيموجي", CreateEvents: "إنشاء فعاليات",
 };
+// أسماء ناقصة كانت تطلع بالإنجليزي — الحين كلها عربي
+Object.assign(PERM_AR, {
+    UseExternalSounds: "أصوات خارجية", UseExternalApps: "تطبيقات خارجية", PinMessages: "تثبيت الرسائل", BypassSlowmode: "تجاوز الوضع البطيء",
+    SetVoiceChannelStatus: "تعيين حالة الروم الصوتي", ViewCreatorMonetizationAnalytics: "تحليلات أرباح المنشئ",
+});
+// الاسم الأصلي في ديسكورد (يظهر جنب العربي كملاحظة رمادية)
+const PERM_EN = {
+    CreateInstantInvite: "Create Invite", KickMembers: "Kick Members", BanMembers: "Ban Members", Administrator: "Administrator",
+    ManageChannels: "Manage Channels", ManageGuild: "Manage Server", AddReactions: "Add Reactions", ViewAuditLog: "View Audit Log",
+    PrioritySpeaker: "Priority Speaker", Stream: "Video", ViewChannel: "View Channels", SendMessages: "Send Messages",
+    SendTTSMessages: "Send Text-to-Speech Messages", ManageMessages: "Manage Messages", EmbedLinks: "Embed Links", AttachFiles: "Attach Files",
+    ReadMessageHistory: "Read Message History", MentionEveryone: "Mention @everyone, @here, and All Roles", UseExternalEmojis: "Use External Emoji",
+    ViewGuildInsights: "View Server Insights", Connect: "Connect", Speak: "Speak", MuteMembers: "Mute Members", DeafenMembers: "Deafen Members",
+    MoveMembers: "Move Members", UseVAD: "Use Voice Activity", ChangeNickname: "Change Nickname", ManageNicknames: "Manage Nicknames",
+    ManageRoles: "Manage Roles", ManageWebhooks: "Manage Webhooks", ManageGuildExpressions: "Manage Expressions",
+    UseApplicationCommands: "Use Application Commands", RequestToSpeak: "Request to Speak", ManageEvents: "Manage Events",
+    ManageThreads: "Manage Threads", CreatePublicThreads: "Create Public Threads", CreatePrivateThreads: "Create Private Threads",
+    UseExternalStickers: "Use External Stickers", SendMessagesInThreads: "Send Messages in Threads", UseEmbeddedActivities: "Use Activities",
+    ModerateMembers: "Timeout Members", ViewCreatorMonetizationAnalytics: "View Creator Monetization Analytics", UseSoundboard: "Use Soundboard",
+    CreateGuildExpressions: "Create Expressions", CreateEvents: "Create Events", UseExternalSounds: "Use External Sounds",
+    SendVoiceMessages: "Send Voice Messages", SendPolls: "Create Polls", UseExternalApps: "Use External Apps", PinMessages: "Pin Messages",
+    BypassSlowmode: "Bypass Slowmode", SetVoiceChannelStatus: "Set Voice Channel Status",
+};
+const enOf = k => PERM_EN[k] || k.replace(/([a-z])([A-Z])/g, "$1 $2");
 const CRITICAL = ["Administrator", "ManageGuild", "ManageRoles", "ManageChannels", "ManageWebhooks", "BanMembers", "KickMembers"].filter(n => P[n]);
 const HIGH = ["MentionEveryone", "ManageMessages", "ModerateMembers", "ViewAuditLog", "ManageNicknames", "MuteMembers", "DeafenMembers", "MoveMembers", "ManageGuildExpressions", "ManageThreads", "ManageEvents"].filter(n => P[n]);
 const DANGER_LEVEL = {}; CRITICAL.forEach(n => DANGER_LEVEL[n] = "critical"); HIGH.forEach(n => DANGER_LEVEL[n] = "high");
@@ -118,7 +142,7 @@ const CHANNEL_PERMS = ["CreateInstantInvite", "ManageChannels", "ManageRoles", "
     "CreatePublicThreads", "CreatePrivateThreads", "EmbedLinks", "AttachFiles", "AddReactions", "UseExternalEmojis", "UseExternalStickers", "MentionEveryone",
     "ManageMessages", "ManageThreads", "ReadMessageHistory", "SendTTSMessages", "UseApplicationCommands", "SendPolls", "SendVoiceMessages", "Connect", "Speak",
     "Stream", "UseVAD", "PrioritySpeaker", "MuteMembers", "DeafenMembers", "MoveMembers", "UseEmbeddedActivities", "UseSoundboard", "RequestToSpeak", "ManageEvents"].filter(n => P[n]);
-const permMeta = list => list.map(k => ({ k, ar: PERM_AR[k] || k, danger: DANGER_LEVEL[k] || null }))
+const permMeta = list => list.map(k => ({ k, ar: PERM_AR[k] || enOf(k), en: enOf(k), danger: DANGER_LEVEL[k] || null }))
     .sort((a, b) => (b.danger ? 1 : 0) - (a.danger ? 1 : 0));
 
 // ══════════════════════════════════════════════════════════════════════════
@@ -872,6 +896,17 @@ app.get("/api/perms/roles", auth, wrap(async (req, res) => {
     });
     res.json({ roles });
 }));
+app.get("/api/perms/roles/:id/members", auth, wrap(async (req, res) => {
+    const g = await getGuild();
+    const r = g.roles.cache.get(req.params.id);
+    if (!r) return res.status(404).json({ error: "الرتبة مو موجودة" });
+    await g.members.fetch().catch(() => {});
+    const all = r.id === g.id ? [...g.members.cache.values()] : [...g.members.cache.filter(m => m.roles.cache.has(r.id)).values()];
+    const LIMIT = 300;
+    const members = all.sort((a, b) => (a.user.bot - b.user.bot) || (a.displayName || "").localeCompare(b.displayName || ""))
+        .slice(0, LIMIT).map(m => ({ id: m.id, name: m.displayName, tag: tagOf(m.user), avatar: m.user.displayAvatarURL({ size: 64 }), bot: m.user.bot }));
+    res.json({ role: { id: r.id, name: r.name }, total: all.length, members, truncated: all.length > LIMIT });
+}));
 app.put("/api/perms/roles/:id", auth, full, wrap(async (req, res) => {
     const g = await getGuild();
     const r = g.roles.cache.get(req.params.id);
@@ -1020,6 +1055,9 @@ input:focus, select:focus { outline:none; border-color:var(--gold-soft); }
 .chip { display:inline-block; padding:2px 9px; border-radius:20px; font-size:11px; font-weight:bold; margin:2px 0 2px 4px; }
 .chip.critical { background:rgba(239,68,68,0.18); color:#fca5a5; border:1px solid #ef4444; }
 .chip.high { background:rgba(234,179,8,0.15); color:#fbbf24; border:1px solid #eab308; }
+.en { color:#94a3b8; font-weight:400; font-size:0.85em; margin-inline-start:4px; direction:ltr; unicode-bidi:isolate; display:inline-block; }
+.mlist { display:flex; align-items:center; gap:10px; padding:8px 4px; border-bottom:1px dashed rgba(255,255,255,0.07); }
+.mlist img { width:36px; height:36px; border-radius:50%; flex:none; }
 .chip.safe { background:rgba(59,130,246,0.12); color:#93c5fd; border:1px solid rgba(59,130,246,0.4); }
 .dot { display:inline-block; width:11px; height:11px; border-radius:50%; margin-inline-end:6px; vertical-align:middle; }
 .st { display:inline-block; width:10px; height:10px; border-radius:50%; margin-inline-end:6px; }
@@ -1279,8 +1317,9 @@ async function pgPerms(){
   $('pq').oninput=function(){S.permsQ=this.value;if(S.permsTab==='roles')drawRoles(true);else drawChannels(true);};
   try{ if(S.permsTab==='roles')await drawRoles();else await drawChannels(); }catch(e){toast(e.message);}
 }
+function pn(m){return esc(m.ar)+(m.en?' <span class="en">('+esc(m.en)+')</span>':'');}
 function permChips(list,metaList){
-  return list.map(function(k){var m=metaList.find(function(x){return x.k===k;})||{ar:k};return '<span class="chip '+(m.danger||'safe')+'">'+esc(m.ar)+'</span>';}).join('');
+  return list.map(function(k){var m=metaList.find(function(x){return x.k===k;})||{ar:k};return '<span class="chip '+(m.danger||'safe')+'">'+pn(m)+'</span>';}).join('');
 }
 async function drawRoles(nf){
   if(!nf){var j=await api('/api/perms/roles');S.roles=j.roles;}
@@ -1292,16 +1331,30 @@ async function drawRoles(nf){
     var shown=view==='danger'?r.dang:r.perms;
     return '<div class="card"><div class="row"><div><div class="log-title"><span><i class="dot" style="background:'+(r.color&&r.color!=='#000000'?r.color:'#64748b')+'"></i>'+esc(r.name)+'</span>'
      +(r.dang.length?'<span class="badge high">'+r.dang.length+' خطيرة</span>':'<span class="badge done">آمنة</span>')+'</div><div class="log-meta">👥 '+r.members+' عضو</div></div>'
-     +'<button class="btn sm '+((r.editable&&S.level==='full')?'':'gray')+'" onclick="editRole(\''+r.id+'\')">'+((r.editable&&S.level==='full')?'✏️ عرض وتعديل':'👁️ عرض فقط')+'</button></div>'
+     +'<div style="display:flex;gap:6px;flex-wrap:wrap"><button class="btn sm gray" onclick="roleMembers(\''+r.id+'\')">👥 عرض الأشخاص</button>'
+     +'<button class="btn sm '+((r.editable&&S.level==='full')?'':'gray')+'" onclick="editRole(\''+r.id+'\')">'+((r.editable&&S.level==='full')?'✏️ عرض وتعديل':'👁️ عرض فقط')+'</button></div></div>'
      +'<div style="margin-top:8px">'+(shown.length?permChips(shown,S.meta.role):'<span class="muted" style="font-size:12px">لا صلاحيات</span>')+'</div></div>';
   }).join('')||(q?'<div class="card center muted">ما لقيت رتبة بهذا الاسم</div>':'<div class="card center muted">ما فيه رتب بصلاحيات خطيرة 👌</div>');
   if($('pbox'))$('pbox').innerHTML=html;
+}
+async function roleMembers(id){
+  var r=S.roles.find(function(x){return x.id===id;});
+  modal('<h3>👥 الأشخاص اللي معهم رتبة: '+esc(r.name)+'</h3><div class="card center muted">جاري التحميل...</div><div class="row" style="justify-content:flex-start;margin-top:14px"><button class="btn gray" onclick="closeModal()">إغلاق</button></div>');
+  try{
+    var j=await api('/api/perms/roles/'+id+'/members');
+    var list=j.members.map(function(m){
+      return '<div class="mlist"><img src="'+esc(m.avatar)+'" alt=""><div style="flex:1;min-width:0"><b>'+esc(m.name)+'</b>'+(m.bot?' <span class="badge low">بوت</span>':'')+'<div class="log-meta">'+esc(m.tag)+'</div></div></div>';
+    }).join('')||'<div class="card center muted">ما فيه أحد معه هذي الرتبة</div>';
+    modal('<h3>👥 الأشخاص اللي معهم رتبة: '+esc(j.role.name)+' ('+j.total+')</h3><div style="max-height:60vh;overflow-y:auto">'+list+'</div>'
+      +(j.truncated?'<p class="muted center" style="font-size:12px;margin-top:8px">معروض أول '+j.members.length+' فقط من '+j.total+'</p>':'')
+      +'<div class="row" style="justify-content:flex-start;margin-top:14px"><button class="btn gray" onclick="closeModal()">إغلاق</button></div>');
+  }catch(e){closeModal();toast(e.message);}
 }
 function editRole(id){
   var r=S.roles.find(function(x){return x.id===id;});
   var canEdit=r.editable&&S.level==='full';
   var rows=S.meta.role.map(function(p){
-    return '<div class="prow '+(p.danger==='critical'?'crit':p.danger==='high'?'hi':'')+'"><span>'+(p.danger?'<span class="chip '+p.danger+'">'+(p.danger==='critical'?'خطيرة جداً':'خطيرة')+'</span>':'')+esc(p.ar)+'</span>'
+    return '<div class="prow '+(p.danger==='critical'?'crit':p.danger==='high'?'hi':'')+'"><span>'+(p.danger?'<span class="chip '+p.danger+'">'+(p.danger==='critical'?'خطيرة جداً':'خطيرة')+'</span>':'')+pn(p)+'</span>'
      +'<label class="sw"><input type="checkbox" data-k="'+p.k+'"'+(r.perms.indexOf(p.k)>-1?' checked':'')+(canEdit?'':' disabled')+'><span></span></label></div>';
   }).join('');
   modal('<h3>صلاحيات الرتبة: '+esc(r.name)+'</h3>'+(canEdit?'':(r.editable?'<div class="warn">ماعندك صلاحية التعديل — عرض فقط.</div>':'<div class="warn">هذي الرتبة أعلى من رتبة البوت (أو رتبة بوت) — للعرض فقط.</div>'))
@@ -1334,7 +1387,7 @@ function editOv(cid,tid){
   var canEdit=S.level==='full';
   var rows=S.meta.channel.map(function(p){
     var st=o.allow.indexOf(p.k)>-1?'a':o.deny.indexOf(p.k)>-1?'d':'n';
-    return '<div class="prow '+(p.danger==='critical'?'crit':p.danger==='high'?'hi':'')+'" data-k="'+p.k+'" data-s="'+st+'"><span>'+(p.danger?'<span class="chip '+p.danger+'">'+(p.danger==='critical'?'خطيرة جداً':'خطيرة')+'</span>':'')+esc(p.ar)+'</span>'
+    return '<div class="prow '+(p.danger==='critical'?'crit':p.danger==='high'?'hi':'')+'" data-k="'+p.k+'" data-s="'+st+'"><span>'+(p.danger?'<span class="chip '+p.danger+'">'+(p.danger==='critical'?'خطيرة جداً':'خطيرة')+'</span>':'')+pn(p)+'</span>'
      +'<div class="tri"><button class="a '+(st==='a'?'on':'')+'"'+(canEdit?' onclick="setTri(this,\'a\')"':' disabled')+'>✓</button><button class="n '+(st==='n'?'on':'')+'"'+(canEdit?' onclick="setTri(this,\'n\')"':' disabled')+'>—</button><button class="d '+(st==='d'?'on':'')+'"'+(canEdit?' onclick="setTri(this,\'d\')"':' disabled')+'>✗</button></div></div>';
   }).join('');
   modal('<h3>'+esc(c.name)+' — '+esc(o.name)+'</h3>'+(canEdit?'<p class="muted center" style="font-size:12px;margin-bottom:8px">✓ سماح &nbsp; — افتراضي &nbsp; ✗ منع</p>':'<div class="warn">ماعندك صلاحية التعديل — عرض فقط.</div>')+'<div style="max-height:60vh;overflow-y:auto">'+rows+'</div>'
