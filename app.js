@@ -902,10 +902,12 @@ app.get("/api/perms/roles/:id/members", auth, wrap(async (req, res) => {
     if (!r) return res.status(404).json({ error: "الرتبة مو موجودة" });
     await g.members.fetch().catch(() => {});
     const all = r.id === g.id ? [...g.members.cache.values()] : [...g.members.cache.filter(m => m.roles.cache.has(r.id)).values()];
-    const LIMIT = 300;
     const members = all.sort((a, b) => (a.user.bot - b.user.bot) || (a.displayName || "").localeCompare(b.displayName || ""))
-        .slice(0, LIMIT).map(m => ({ id: m.id, name: m.displayName, tag: tagOf(m.user), avatar: m.user.displayAvatarURL({ size: 64 }), bot: m.user.bot }));
-    res.json({ role: { id: r.id, name: r.name }, total: all.length, members, truncated: all.length > LIMIT });
+        .slice(0, 5000).map(m => ({
+            id: m.id, name: m.displayName, tag: tagOf(m.user), avatar: m.user.displayAvatarURL({ size: 64 }), bot: m.user.bot,
+            username: m.user.username, global: m.user.globalName || "", nick: m.nickname || "",
+        }));
+    res.json({ role: { id: r.id, name: r.name }, total: all.length, members });
 }));
 app.put("/api/perms/roles/:id", auth, full, wrap(async (req, res) => {
     const g = await getGuild();
@@ -1342,12 +1344,25 @@ async function roleMembers(id){
   modal('<h3>👥 الأشخاص اللي معهم رتبة: '+esc(r.name)+'</h3><div class="card center muted">جاري التحميل...</div><div class="row" style="justify-content:flex-start;margin-top:14px"><button class="btn gray" onclick="closeModal()">إغلاق</button></div>');
   try{
     var j=await api('/api/perms/roles/'+id+'/members');
-    var list=j.members.map(function(m){
-      return '<div class="mlist"><img src="'+esc(m.avatar)+'" alt=""><div style="flex:1;min-width:0"><b>'+esc(m.name)+'</b>'+(m.bot?' <span class="badge low">بوت</span>':'')+'<div class="log-meta">'+esc(m.tag)+'</div></div></div>';
-    }).join('')||'<div class="card center muted">ما فيه أحد معه هذي الرتبة</div>';
-    modal('<h3>👥 الأشخاص اللي معهم رتبة: '+esc(j.role.name)+' ('+j.total+')</h3><div style="max-height:60vh;overflow-y:auto">'+list+'</div>'
-      +(j.truncated?'<p class="muted center" style="font-size:12px;margin-top:8px">معروض أول '+j.members.length+' فقط من '+j.total+'</p>':'')
+    var all=j.members,SHOW=300;
+    modal('<h3>👥 الأشخاص اللي معهم رتبة: '+esc(j.role.name)+' ('+j.total+')</h3>'
+      +'<input id="rmq" placeholder="🔎 ابحث بيوزر، اسم البروفايل، اسم السيرفر، أو الآيدي" style="margin-bottom:10px">'
+      +'<div id="rmcount" class="muted" style="font-size:12px;margin-bottom:6px"></div>'
+      +'<div id="rmlist" style="max-height:55vh;overflow-y:auto"></div>'
       +'<div class="row" style="justify-content:flex-start;margin-top:14px"><button class="btn gray" onclick="closeModal()">إغلاق</button></div>');
+    function draw(){
+      var q=($('rmq').value||'').trim().toLowerCase();
+      var f=q?all.filter(function(m){return [m.username,m.global,m.nick,m.name,m.tag,m.id].some(function(v){return (v||'').toLowerCase().indexOf(q)>-1;});}):all;
+      $('rmcount').textContent=q?('النتائج: '+f.length+' من '+all.length):(all.length>SHOW?'معروض أول '+SHOW+' من '+all.length+' — استخدم البحث للباقي':'');
+      $('rmlist').innerHTML=f.slice(0,SHOW).map(function(m){
+        var extra=[];
+        if(m.nick)extra.push('🏷️ السيرفر: '+esc(m.nick));
+        if(m.global&&m.global!==m.nick)extra.push('👤 البروفايل: '+esc(m.global));
+        return '<div class="mlist"><img src="'+esc(m.avatar)+'" alt=""><div style="flex:1;min-width:0"><b>'+esc(m.name)+'</b>'+(m.bot?' <span class="badge low">بوت</span>':'')
+          +'<div class="log-meta">@'+esc(m.username)+(extra.length?' &nbsp;•&nbsp; '+extra.join(' &nbsp;•&nbsp; '):'')+'</div></div></div>';
+      }).join('')||'<div class="card center muted">'+(q?'ما لقيت أحد بهذا الاسم':'ما فيه أحد معه هذي الرتبة')+'</div>';
+    }
+    $('rmq').oninput=draw;draw();$('rmq').focus();
   }catch(e){closeModal();toast(e.message);}
 }
 function editRole(id){
