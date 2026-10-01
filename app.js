@@ -905,7 +905,7 @@ app.get("/api/perms/roles/:id/members", auth, wrap(async (req, res) => {
     const members = all.sort((a, b) => (a.user.bot - b.user.bot) || (a.displayName || "").localeCompare(b.displayName || ""))
         .slice(0, 5000).map(m => ({
             id: m.id, name: m.displayName, tag: tagOf(m.user), avatar: m.user.displayAvatarURL({ size: 64 }), bot: m.user.bot,
-            username: m.user.username, global: m.user.globalName || "", nick: m.nickname || "",
+            username: m.user.username, global: m.user.globalName || m.user.username, nick: m.nickname || "", server: m.displayName || m.user.username,
         }));
     res.json({ role: { id: r.id, name: r.name }, total: all.length, members });
 }));
@@ -919,6 +919,34 @@ app.put("/api/perms/roles/:id", auth, full, wrap(async (req, res) => {
     await r.setPermissions(new PermissionsBitField(perms.map(n => P[n])), "لوحة الأمن السيبراني — " + req.session.user.tag);
     const add = perms.filter(n => !before.includes(n)), rem = before.filter(n => !perms.includes(n));
     await panelLog(req, "تعديل صلاحيات رتبة", "الرتبة: " + r.name + (add.length ? "\n➕ " + add.map(n => PERM_AR[n] || n).join("، ") : "") + (rem.length ? "\n➖ " + rem.map(n => PERM_AR[n] || n).join("، ") : ""), { targetId: r.id, targetTag: r.name });
+    res.json({ ok: true });
+}));
+app.get("/api/perms/members", auth, wrap(async (req, res) => {
+    const g = await getGuild();
+    await g.members.fetch().catch(() => {});
+    const all = [...g.members.cache.values()].sort((a, b) => (b.roles.highest.position - a.roles.highest.position) || (a.displayName || "").localeCompare(b.displayName || ""));
+    const members = all.slice(0, 5000).map(m => ({
+        id: m.id, avatar: m.user.displayAvatarURL({ size: 64 }), bot: m.user.bot, tag: tagOf(m.user),
+        username: m.user.username, global: m.user.globalName || m.user.username, nick: m.nickname || "", server: m.displayName || m.user.username,
+        roles: [...m.roles.cache.keys()].filter(id => id !== g.id), editable: m.manageable,
+    }));
+    res.json({ members, total: all.length });
+}));
+app.put("/api/perms/members/:id/roles", auth, full, wrap(async (req, res) => {
+    const g = await getGuild();
+    const m = await g.members.fetch(req.params.id).catch(() => null);
+    if (!m) return res.status(404).json({ error: "العضو مو موجود بالسيرفر" });
+    if (!m.manageable) return res.status(400).json({ error: "ما أقدر أعدّل رتب هذا الشخص — رتبته أعلى من رتبة البوت أو هو مالك السيرفر" });
+    const ok = r => r && r.id !== g.id && r.editable && !r.managed;
+    const pick = ids => (Array.isArray(ids) ? ids : []).map(id => g.roles.cache.get(String(id))).filter(ok);
+    const add = pick(req.body.add).filter(r => !m.roles.cache.has(r.id));
+    const rem = pick(req.body.remove).filter(r => m.roles.cache.has(r.id));
+    if (!add.length && !rem.length) return res.status(400).json({ error: "ما فيه تغيير أو الرتب أعلى من رتبة البوت" });
+    const reason = "لوحة الأمن السيبراني — " + req.session.user.tag;
+    if (add.length) await m.roles.add(add, reason);
+    if (rem.length) await m.roles.remove(rem, reason);
+    roleCheck.delete(m.id);
+    await panelLog(req, "تعديل رتب عضو", "العضو: " + tagOf(m.user) + (add.length ? "\n➕ " + add.map(r => r.name).join("، ") : "") + (rem.length ? "\n➖ " + rem.map(r => r.name).join("، ") : ""), { targetId: m.id, targetTag: tagOf(m.user) });
     res.json({ ok: true });
 }));
 const chIcon = t => ({ 0: "💬", 2: "🔊", 4: "📁", 5: "📢", 13: "🎙️", 15: "🗂️" }[t] || "#");
@@ -1310,14 +1338,16 @@ async function kickBot(id,name){
 /* ══ صلاحيات السيرفر ══ */
 async function pgPerms(){
   if(!S.meta)S.meta=await api('/api/perms/meta');
+  var t=S.permsTab;
   $('main').innerHTML='<h2>🔐 صلاحيات السيرفر</h2>'
-   +'<div class="tabs"><button class="tab '+(S.permsTab==='roles'?'active':'')+'" onclick="S.permsTab=\'roles\';pgPerms()">👥 قسم الرتب</button>'
-   +'<button class="tab '+(S.permsTab==='channels'?'active':'')+'" onclick="S.permsTab=\'channels\';pgPerms()">💬 قسم الشاتات</button></div>'
-   +'<div class="tabs"><button class="tab '+(S.permsView==='danger'?'active':'')+'" onclick="S.permsView=\'danger\';pgPerms()">⚠️ الخطرة فقط</button>'
-   +'<button class="tab '+(S.permsView==='all'?'active':'')+'" onclick="S.permsView=\'all\';pgPerms()">📋 الكل</button></div>'
-   +'<input id="pq" placeholder="'+(S.permsTab==='roles'?'🔎 ابحث عن رتبة':'🔎 ابحث عن شات')+'" value="'+esc(S.permsQ)+'" style="margin-bottom:14px"><div id="pbox"><div class="card center muted">جاري التحميل...</div></div>';
-  $('pq').oninput=function(){S.permsQ=this.value;if(S.permsTab==='roles')drawRoles(true);else drawChannels(true);};
-  try{ if(S.permsTab==='roles')await drawRoles();else await drawChannels(); }catch(e){toast(e.message);}
+   +'<div class="tabs"><button class="tab '+(t==='roles'?'active':'')+'" onclick="S.permsTab=\'roles\';S.permsQ=\'\';pgPerms()">👥 قسم الرتب</button>'
+   +'<button class="tab '+(t==='channels'?'active':'')+'" onclick="S.permsTab=\'channels\';S.permsQ=\'\';pgPerms()">💬 قسم الشاتات</button>'
+   +'<button class="tab '+(t==='members'?'active':'')+'" onclick="S.permsTab=\'members\';S.permsQ=\'\';pgPerms()">👤 قسم الأعضاء</button></div>'
+   +(t==='members'?'':'<div class="tabs"><button class="tab '+(S.permsView==='danger'?'active':'')+'" onclick="S.permsView=\'danger\';pgPerms()">⚠️ الخطرة فقط</button>'
+   +'<button class="tab '+(S.permsView==='all'?'active':'')+'" onclick="S.permsView=\'all\';pgPerms()">📋 الكل</button></div>')
+   +'<input id="pq" placeholder="'+(t==='roles'?'🔎 ابحث عن رتبة':t==='channels'?'🔎 ابحث عن شات':'🔎 ابحث بيوزر، اسم البروفايل، اسم السيرفر، أو الآيدي')+'" value="'+esc(S.permsQ)+'" style="margin-bottom:14px"><div id="pbox"><div class="card center muted">جاري التحميل...</div></div>';
+  $('pq').oninput=function(){S.permsQ=this.value;if(S.permsTab==='roles')drawRoles(true);else if(S.permsTab==='channels')drawChannels(true);else drawMembers(true);};
+  try{ if(t==='roles')await drawRoles();else if(t==='channels')await drawChannels();else await drawMembers(); }catch(e){toast(e.message);}
 }
 function pn(m){return esc(m.ar)+(m.en?' <span class="en">('+esc(m.en)+')</span>':'');}
 function permChips(list,metaList){
@@ -1352,14 +1382,13 @@ async function roleMembers(id){
       +'<div class="row" style="justify-content:flex-start;margin-top:14px"><button class="btn gray" onclick="closeModal()">إغلاق</button></div>');
     function draw(){
       var q=($('rmq').value||'').trim().toLowerCase();
-      var f=q?all.filter(function(m){return [m.username,m.global,m.nick,m.name,m.tag,m.id].some(function(v){return (v||'').toLowerCase().indexOf(q)>-1;});}):all;
+      var f=q?all.filter(function(m){return [m.username,m.global,m.nick,m.server,m.name,m.tag,m.id].some(function(v){return (v||'').toLowerCase().indexOf(q)>-1;});}):all;
       $('rmcount').textContent=q?('النتائج: '+f.length+' من '+all.length):(all.length>SHOW?'معروض أول '+SHOW+' من '+all.length+' — استخدم البحث للباقي':'');
       $('rmlist').innerHTML=f.slice(0,SHOW).map(function(m){
-        var extra=[];
-        if(m.nick)extra.push('🏷️ السيرفر: '+esc(m.nick));
-        if(m.global&&m.global!==m.nick)extra.push('👤 البروفايل: '+esc(m.global));
-        return '<div class="mlist"><img src="'+esc(m.avatar)+'" alt=""><div style="flex:1;min-width:0"><b>'+esc(m.name)+'</b>'+(m.bot?' <span class="badge low">بوت</span>':'')
-          +'<div class="log-meta">@'+esc(m.username)+(extra.length?' &nbsp;•&nbsp; '+extra.join(' &nbsp;•&nbsp; '):'')+'</div></div></div>';
+        return '<div class="mlist"><img src="'+esc(m.avatar)+'" alt=""><div style="flex:1;min-width:0"><b>'+esc(m.server)+'</b>'+(m.bot?' <span class="badge low">بوت</span>':'')
+          +'<div class="log-meta">🏷️ اسمه في السيرفر: '+esc(m.server)+'</div>'
+          +'<div class="log-meta">👤 اسم البروفايل: '+esc(m.global)+'</div>'
+          +'<div class="log-meta">🔖 اليوزر: @'+esc(m.username)+'</div></div></div>';
       }).join('')||'<div class="card center muted">'+(q?'ما لقيت أحد بهذا الاسم':'ما فيه أحد معه هذي الرتبة')+'</div>';
     }
     $('rmq').oninput=draw;draw();$('rmq').focus();
@@ -1380,6 +1409,59 @@ function editRole(id){
     if(perms.indexOf('Administrator')>-1&&r.perms.indexOf('Administrator')<0&&!(await ask('تفعيل صلاحية المدير (Administrator) يعطي الرتبة كل الصلاحيات. متأكد؟')))return;
     this.disabled=true;
     try{await api('/api/perms/roles/'+id,{method:'PUT',body:JSON.stringify({perms:perms})});toast('تم حفظ الصلاحيات');closeModal();drawRoles();}catch(e){toast(e.message);this.disabled=false;}
+  };
+}
+async function drawMembers(nf){
+  if(!nf){
+    var j=await api('/api/perms/members');S.mem2=j.members;S.memTotal=j.total;
+    var rj=await api('/api/perms/roles');S.roles=rj.roles;
+  }
+  var q=(S.permsQ||'').trim().toLowerCase(),SHOW=100;
+  var f=q?S.mem2.filter(function(m){return [m.username,m.global,m.nick,m.server,m.tag,m.id].some(function(v){return (v||'').toLowerCase().indexOf(q)>-1;});}):S.mem2;
+  var info='<div class="muted" style="font-size:12px;margin-bottom:8px">'+(q?('النتائج: '+f.length+' من '+S.mem2.length):('👤 '+S.memTotal+' عضو'+(f.length>SHOW?' — معروض أول '+SHOW+'، استخدم البحث للباقي':'')))+'</div>';
+  var html=info+f.slice(0,SHOW).map(function(m){
+    var set={};m.roles.forEach(function(x){set[x]=1;});
+    var chips=S.roles.filter(function(r){return set[r.id];}).map(function(r){
+      return '<span class="chip '+(r.dang.length?'high':'safe')+'"><i class="dot" style="background:'+(r.color&&r.color!=='#000000'?r.color:'#64748b')+'"></i>'+esc(r.name)+'</span>';
+    }).join('')||'<span class="muted" style="font-size:12px">بدون رتب</span>';
+    var canEdit=S.level==='full'&&m.editable;
+    return '<div class="card"><div class="bot"><img src="'+esc(m.avatar)+'" alt=""><div style="flex:1;min-width:200px">'
+     +'<div class="log-title"><b>'+esc(m.server)+'</b>'+(m.bot?' <span class="badge low">بوت</span>':'')+'</div>'
+     +'<div class="log-meta">🏷️ اسمه في السيرفر: '+esc(m.server)+' &nbsp;•&nbsp; 👤 البروفايل: '+esc(m.global)+' &nbsp;•&nbsp; 🔖 @'+esc(m.username)+'</div>'
+     +'<div style="margin-top:8px">'+chips+'</div></div>'
+     +'<button class="btn sm '+(canEdit?'':'gray')+'" onclick="editMember(\''+m.id+'\')">'+(canEdit?'✏️ عرض وتعديل':'👁️ عرض فقط')+'</button></div></div>';
+  }).join('')||'<div class="card center muted">'+(q?'ما لقيت أحد بهذا الاسم':'ما فيه أعضاء')+'</div>';
+  if($('pbox'))$('pbox').innerHTML=html;
+}
+function editMember(id){
+  var m=S.mem2.find(function(x){return x.id===id;});
+  var canEdit=S.level==='full'&&m.editable;
+  var has={};m.roles.forEach(function(x){has[x]=1;});
+  var rows=S.roles.filter(function(r){return !r.everyone;}).map(function(r){
+    var dis=!(canEdit&&r.editable);
+    return '<div class="prow '+(r.dang.length?'hi':'')+'" data-n="'+esc(r.name.toLowerCase())+'"><span><i class="dot" style="background:'+(r.color&&r.color!=='#000000'?r.color:'#64748b')+'"></i>'+esc(r.name)
+     +(r.dang.length?' <span class="chip high">'+r.dang.length+' خطيرة</span>':'')+(r.managed?' <span class="muted" style="font-size:11px">(رتبة بوت)</span>':'')+'</span>'
+     +'<label class="sw"><input type="checkbox" data-r="'+r.id+'"'+(has[r.id]?' checked':'')+(dis?' disabled':'')+'><span></span></label></div>';
+  }).join('');
+  modal('<h3>رتب: '+esc(m.server)+' <span class="muted" style="font-size:12px">@'+esc(m.username)+'</span></h3>'
+   +(canEdit?'':'<div class="warn">'+(S.level!=='full'?'ماعندك صلاحية التعديل — عرض فقط.':'رتبة هذا الشخص أعلى من رتبة البوت (أو مالك السيرفر) — للعرض فقط.')+'</div>')
+   +'<input id="mrq" placeholder="🔎 ابحث عن رتبة" style="margin-bottom:8px">'
+   +'<div style="max-height:55vh;overflow-y:auto">'+rows+'</div><div class="row" style="justify-content:flex-start;margin-top:14px">'
+   +(canEdit?'<button class="btn" id="ms">💾 حفظ</button>':'')+'<button class="btn gray" onclick="closeModal()">إغلاق</button></div>');
+  $('mrq').oninput=function(){var q=this.value.trim().toLowerCase();document.querySelectorAll('.modal .prow[data-n]').forEach(function(r){r.style.display=(!q||r.getAttribute('data-n').indexOf(q)>-1)?'':'none';});};
+  if(canEdit)$('ms').onclick=async function(){
+    var add=[],remove=[];
+    document.querySelectorAll('.modal input[data-r]').forEach(function(i){
+      if(i.disabled)return;var rid=i.getAttribute('data-r');
+      if(i.checked&&!has[rid])add.push(rid);
+      if(!i.checked&&has[rid])remove.push(rid);
+    });
+    if(!add.length&&!remove.length){toast('ما غيّرت شي');return;}
+    var danger=add.filter(function(rid){var r=S.roles.find(function(x){return x.id===rid;});return r&&r.dang.length;});
+    if(danger.length&&!(await ask('راح تعطيه رتبة بصلاحيات خطيرة. متأكد؟')))return;
+    if(m.id===S.meId&&remove.length&&!(await ask('راح تسحب رتب من نفسك، وممكن تفقد صلاحياتك في اللوحة. متأكد؟')))return;
+    this.disabled=true;
+    try{await api('/api/perms/members/'+id+'/roles',{method:'PUT',body:JSON.stringify({add:add,remove:remove})});toast('تم حفظ الرتب');closeModal();drawMembers();}catch(e){toast(e.message);this.disabled=false;}
   };
 }
 async function drawChannels(nf){
