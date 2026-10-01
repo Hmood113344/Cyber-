@@ -1439,12 +1439,13 @@ function editMember(id){
   var has={};m.roles.forEach(function(x){has[x]=1;});
   var rows=S.roles.filter(function(r){return !r.everyone;}).map(function(r){
     var dis=!(canEdit&&r.editable);
-    return '<div class="prow '+(r.dang.length?'hi':'')+'" data-n="'+esc(r.name.toLowerCase())+'"><span><i class="dot" style="background:'+(r.color&&r.color!=='#000000'?r.color:'#64748b')+'"></i>'+esc(r.name)
-     +(r.dang.length?' <span class="chip high">'+r.dang.length+' خطيرة</span>':'')+(r.managed?' <span class="muted" style="font-size:11px">(رتبة بوت)</span>':'')+'</span>'
+    var why=r.managed?'🤖 رتبة بوت':(!r.editable?'🔒 أعلى من رتبة البوت':'');
+    return '<div class="prow '+(r.dang.length?'hi':'')+'" style="'+(dis?'opacity:.45':'')+'" data-n="'+esc(r.name.toLowerCase())+'"><span><i class="dot" style="background:'+(r.color&&r.color!=='#000000'?r.color:'#64748b')+'"></i>'+esc(r.name)
+     +(r.dang.length?' <span class="chip high">'+r.dang.length+' خطيرة</span>':'')+(why?' <span class="muted" style="font-size:11px">('+why+')</span>':'')+'</span>'
      +'<label class="sw"><input type="checkbox" data-r="'+r.id+'"'+(has[r.id]?' checked':'')+(dis?' disabled':'')+'><span></span></label></div>';
   }).join('');
   modal('<h3>رتب: '+esc(m.server)+' <span class="muted" style="font-size:12px">@'+esc(m.username)+'</span></h3>'
-   +(canEdit?'':'<div class="warn">'+(S.level!=='full'?'ماعندك صلاحية التعديل — عرض فقط.':'رتبة هذا الشخص أعلى من رتبة البوت (أو مالك السيرفر) — للعرض فقط.')+'</div>')
+   +(canEdit?(S.roles.some(function(r){return r.editable&&!r.everyone;})?'':'<div class="warn">كل رتب السيرفر أعلى من رتبة البوت، فما يقدر يعدّلها. ارفع رتبة البوت فوقها من إعدادات السيرفر ← الرتب.</div>'):'<div class="warn">'+(S.level!=='full'?'ماعندك صلاحية التعديل — عرض فقط.':'رتبة هذا الشخص أعلى من رتبة البوت (أو مالك السيرفر) — للعرض فقط. ارفع رتبة البوت فوق رتبه من إعدادات السيرفر ← الرتب.')+'</div>')
    +'<input id="mrq" placeholder="🔎 ابحث عن رتبة" style="margin-bottom:8px">'
    +'<div style="max-height:55vh;overflow-y:auto">'+rows+'</div><div class="row" style="justify-content:flex-start;margin-top:14px">'
    +(canEdit?'<button class="btn" id="ms">💾 حفظ</button>':'')+'<button class="btn gray" onclick="closeModal()">إغلاق</button></div>');
