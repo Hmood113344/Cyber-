@@ -86,6 +86,10 @@ const PanelMember = mongoose.model("CyberPanelMember", MemberSchema);
 
 // لقطة يومية لعدد الأعضاء (بدون انتهاء — حجمها صغير) + نقطة بداية الأسابيع + أرشيف الأسابيع المكتملة
 const DailyStat = mongoose.model("CyberDailyStat", new mongoose.Schema({ _id: String, members: Number, updatedAt: Date }));
+const MsgLog = mongoose.model("CyberMsgLog", new mongoose.Schema({
+    _id: String, channelId: { type: String, index: true }, authorId: String, authorTag: String, content: String, att: Number,
+    at: { type: Date, index: true, expires: 60 * 60 * 24 * 5 },   // نحتفظ بالنسخة 5 أيام فقط
+}));
 const StatMeta = mongoose.model("CyberStatMeta", new mongoose.Schema({ _id: String, value: String }));
 const WeekArchive = mongoose.model("CyberWeekArchive", new mongoose.Schema({
     _id: Number, start: String, end: String, total: Number, resolved: Number, unresolved: Number,
@@ -207,6 +211,22 @@ function cacheMsg(m) {
         content: String(m.content || "").slice(0, 500), att: m.attachments?.size || 0, atts: attMeta(m), at: m.createdTimestamp,
     });
     if (msgCache.size > 20000) msgCache.delete(msgCache.keys().next().value);
+    queueMsgLog(m);
+}
+const msgLogBuf = []; let msgLogTimer = null;
+function queueMsgLog(m) {
+    try {
+        if (m.guildId !== CONFIG.GUILD_ID || !m.author || isSelf(m.author.id)) return;
+        if (!m.content && !(m.attachments && m.attachments.size)) return;
+        msgLogBuf.push({ _id: m.id, channelId: m.channelId, authorId: m.author.id, authorTag: tagOf(m.author), content: String(m.content || "").slice(0, 500), att: (m.attachments && m.attachments.size) || 0, at: new Date(m.createdTimestamp) });
+        if (!msgLogTimer) msgLogTimer = setTimeout(flushMsgLog, 5000);
+    } catch {}
+}
+async function flushMsgLog() {
+    msgLogTimer = null;
+    const batch = msgLogBuf.splice(0, msgLogBuf.length);
+    if (!batch.length) return;
+    try { await MsgLog.insertMany(batch, { ordered: false }); } catch {}
 }
 
 async function logEvent(o) {
@@ -1021,8 +1041,34 @@ const fmtTime = t => new Date(t).toLocaleString("ar-SA-u-ca-gregory-nu-latn", { 
 const changeOf = (e, key) => (e.changes || []).find(c => c.key === key);
 async function alreadyLogged(f, t) {
     const q = { createdAt: { $gte: new Date(t - 180000), $lte: new Date(t + 180000) } };
-    for (const k of ["cat", "targetId", "actorId"]) if (f[k]) q[k] = f[k];
+    q["data.catchup"] = { $ne: true };   // نقارن مع اللي انسجّل لايف فقط
+    for (const k of ["cat", "targetId", "actorId", "count", "data.act"]) if (f[k]) q[k] = f[k];
     return !!(await Event.exists(q));
+}
+// يعيد بناء الرسائل اللي انمسحت بأمر مسح (clear) من النسخة المحفوظة: اللي كانت موجودة قبل المسح وما هي موجودة الحين
+async function reconstructPurge(g, chId, purgeTs, count, claimed) {
+    if (!chId || !count) return [];
+    const cands = await MsgLog.find({ channelId: chId, at: { $lte: new Date(purgeTs + 3000), $gte: new Date(purgeTs - 14 * 864e5) } })
+        .sort({ at: -1 }).limit(Math.max(count * 3, 300)).lean();
+    const fresh = cands.filter(c => !claimed.has(c._id));
+    if (!fresh.length) return [];
+    const ch = g.channels.cache.get(chId);
+    if (!ch || !ch.messages) return [];
+    const oldest = fresh[fresh.length - 1].at.getTime();
+    const exist = new Set(); let before, okFetch = false, floor = oldest;
+    for (let i = 0; i < 12; i++) {
+        const batch = await ch.messages.fetch({ limit: 100, before }).catch(() => null);
+        if (!batch) break;
+        okFetch = true;
+        if (!batch.size) { floor = 0; break; }
+        batch.forEach(m => exist.add(m.id));
+        const last = batch.last(); before = last.id; floor = last.createdTimestamp;
+        if (last.createdTimestamp <= oldest || batch.size < 100) { floor = 0; break; }
+    }
+    if (!okFetch) return [];
+    const gone = fresh.filter(c => c.at.getTime() >= floor && !exist.has(c._id)).slice(0, count).reverse();
+    gone.forEach(c => claimed.add(c._id));
+    return gone;
 }
 async function catchUpAudit(last, opts = {}) {
     const g = await getGuild(), now = Date.now();
@@ -1038,42 +1084,46 @@ async function catchUpAudit(last, opts = {}) {
         before = oldest.id;
     }
     entries.sort((a, b) => a.createdTimestamp - b.createdTimestamp);
+    const claimed = new Set();
+    (await Event.find({ "data.act": "bulk_delete", createdAt: { $gte: new Date(since - 864e5) } }).select("data.messages.id").lean())
+        .forEach(ev => ((ev.data && ev.data.messages) || []).forEach(x => claimed.add(x.id)));
     const A = AuditLogEvent;
     let n = 0;
     for (const e of entries) {
         const by = e.executor, byId = by && by.id;
         if (isSelf(byId)) continue;
+        if (await Event.exists({ "data.auditId": e.id })) continue;   // انسجّلت قبل من استرجاع سابق
         const t = e.createdTimestamp, base = { actorId: byId, actorTag: tagOf(by), createdAt: new Date(t) };
         const tid = e.targetId || (e.target && e.target.id) || null;
         try {
             switch (e.action) {
                 case A.MemberKick: {
                     if (await alreadyLogged({ cat: "kick", targetId: tid }, t)) break;
-                    await LOGCAT({ ...base, cat: "kick", title: "طرد عضو", details: "السبب: " + (e.reason || "بدون سبب") + CATCH_MARK, targetId: tid, targetTag: tagOf(e.target), data: { act: "kick", catchup: true } }); n++; break;
+                    await LOGCAT({ ...base, cat: "kick", title: "طرد عضو", details: "السبب: " + (e.reason || "بدون سبب") + CATCH_MARK, targetId: tid, targetTag: tagOf(e.target), data: { auditId: e.id, act: "kick", catchup: true } }); n++; break;
                 }
                 case A.MemberBanAdd: {
                     if (await alreadyLogged({ cat: "ban", targetId: tid }, t)) break;
-                    await LOGCAT({ ...base, cat: "ban", title: "حظر عضو", details: "السبب: " + (e.reason || "بدون سبب") + CATCH_MARK, targetId: tid, targetTag: tagOf(e.target), data: { act: "ban", catchup: true } }); n++; break;
+                    await LOGCAT({ ...base, cat: "ban", title: "حظر عضو", details: "السبب: " + (e.reason || "بدون سبب") + CATCH_MARK, targetId: tid, targetTag: tagOf(e.target), data: { auditId: e.id, act: "ban", catchup: true } }); n++; break;
                 }
                 case A.MemberBanRemove: {
                     if (await alreadyLogged({ cat: "ban", targetId: tid }, t)) break;
-                    await LOGCAT({ ...base, cat: "ban", title: "فك حظر عضو", details: CATCH_MARK.trim(), targetId: tid, targetTag: tagOf(e.target), data: { act: "unban", catchup: true } }); n++; break;
+                    await LOGCAT({ ...base, cat: "ban", title: "فك حظر عضو", details: CATCH_MARK.trim(), targetId: tid, targetTag: tagOf(e.target), data: { auditId: e.id, act: "unban", catchup: true } }); n++; break;
                 }
                 case A.BotAdd: {
                     if (await alreadyLogged({ cat: "bot", targetId: tid }, t)) break;
                     await raise({ ...base, cat: "bot", rule: "bot_added", key: "bot_added:" + tid, severity: "high", title: "إضافة بوت جديد للسيرفر",
-                        details: "البوت: " + (tagOf(e.target) || tid) + "\nأضافه: " + (tagOf(by) || "غير معروف") + CATCH_MARK, targetId: tid, targetTag: tagOf(e.target), data: { act: "bot_add", catchup: true },
+                        details: "البوت: " + (tagOf(e.target) || tid) + "\nأضافه: " + (tagOf(by) || "غير معروف") + CATCH_MARK, targetId: tid, targetTag: tagOf(e.target), data: { auditId: e.id, act: "bot_add", catchup: true },
                         remedy: { type: "kick_member", label: "👢 طرد البوت", params: { userId: tid } } }); n++; break;
                 }
                 case A.RoleCreate: {
                     if (await alreadyLogged({ cat: "role", targetId: tid }, t)) break;
                     const nm = (changeOf(e, "name") || {}).new || (e.target && e.target.name) || tid;
-                    await LOGCAT({ ...base, cat: "role", title: "إنشاء رتبة", details: "الرتبة: " + nm + CATCH_MARK, targetId: tid, targetTag: nm, data: { act: "role_create", catchup: true } }); n++; break;
+                    await LOGCAT({ ...base, cat: "role", title: "إنشاء رتبة", details: "الرتبة: " + nm + CATCH_MARK, targetId: tid, targetTag: nm, data: { auditId: e.id, act: "role_create", catchup: true } }); n++; break;
                 }
                 case A.RoleDelete: {
                     if (await alreadyLogged({ cat: "role", targetId: tid }, t)) break;
                     const nm = (changeOf(e, "name") || {}).old || (e.target && e.target.name) || tid;
-                    await LOGCAT({ ...base, cat: "role", title: "حذف رتبة", details: "الرتبة: " + nm + CATCH_MARK, targetId: tid, targetTag: nm, data: { act: "role_delete", catchup: true } }); n++; break;
+                    await LOGCAT({ ...base, cat: "role", title: "حذف رتبة", details: "الرتبة: " + nm + CATCH_MARK, targetId: tid, targetTag: nm, data: { auditId: e.id, act: "role_delete", catchup: true } }); n++; break;
                 }
                 case A.RoleUpdate: {
                     const pc = changeOf(e, "permissions"); if (!pc) break;
@@ -1083,7 +1133,7 @@ async function catchUpAudit(last, opts = {}) {
                     const r = g.roles.cache.get(tid), nm = (r && r.name) || tid;
                     await LOGCAT({ ...base, cat: "role", title: "تعديل صلاحيات رتبة",
                         details: "الرتبة: " + nm + (added.length ? "\n➕ أضاف: " + added.map(x => PERM_AR[x] || x).join("، ") : "") + (removed.length ? "\n➖ سحب: " + removed.map(x => PERM_AR[x] || x).join("، ") : "") + CATCH_MARK,
-                        targetId: tid, targetTag: nm, data: { act: "role_perms", catchup: true } }); n++;
+                        targetId: tid, targetTag: nm, data: { auditId: e.id, act: "role_perms", catchup: true } }); n++;
                     const crit = dangerOf(added);
                     if (crit.length && r) await raise({ ...base, cat: "role", rule: "dangerous_perm_grant", key: "dpg:" + tid, title: "منح صلاحيات خطيرة لرتبة",
                         details: "الرتبة: " + nm + "\nالصلاحيات: " + crit.map(x => PERM_AR[x] || x).join("، ") + CATCH_MARK, targetId: tid, targetTag: nm,
@@ -1096,7 +1146,7 @@ async function catchUpAudit(last, opts = {}) {
                     if (await alreadyLogged({ cat: "role", targetId: tid, actorId: byId }, t)) break;
                     await LOGCAT({ ...base, cat: "role", title: "تغيير رتب عضو",
                         details: (add.length ? "➕ أُعطي: " + add.map(r => r.name).join("، ") : "") + (rem.length ? (add.length ? "\n" : "") + "➖ سُحب منه: " + rem.map(r => r.name).join("، ") : "") + CATCH_MARK,
-                        targetId: tid, targetTag: tagOf(e.target), data: { act: "member_roles", catchup: true } }); n++;
+                        targetId: tid, targetTag: tagOf(e.target), data: { auditId: e.id, act: "member_roles", catchup: true } }); n++;
                     for (const ar of add) {
                         const r = g.roles.cache.get(ar.id); if (!r) continue;
                         const crit = dangerOf(r.permissions.toArray());
@@ -1109,17 +1159,17 @@ async function catchUpAudit(last, opts = {}) {
                 case A.ChannelCreate: {
                     if (await alreadyLogged({ cat: "channel", targetId: tid }, t)) break;
                     const nm = (changeOf(e, "name") || {}).new || (e.target && e.target.name) || tid;
-                    await LOGCAT({ ...base, cat: "channel", title: "إنشاء قناة", details: "القناة: " + nm + CATCH_MARK, targetId: tid, targetTag: nm, data: { act: "channel_create", catchup: true } }); n++; break;
+                    await LOGCAT({ ...base, cat: "channel", title: "إنشاء قناة", details: "القناة: " + nm + CATCH_MARK, targetId: tid, targetTag: nm, data: { auditId: e.id, act: "channel_create", catchup: true } }); n++; break;
                 }
                 case A.ChannelDelete: {
                     if (await alreadyLogged({ cat: "channel", targetId: tid }, t)) break;
                     const nm = (changeOf(e, "name") || {}).old || (e.target && e.target.name) || tid;
-                    await LOGCAT({ ...base, cat: "channel", title: "حذف قناة", details: "القناة: " + nm + CATCH_MARK, targetId: tid, targetTag: nm, data: { act: "channel_delete", catchup: true } }); n++; break;
+                    await LOGCAT({ ...base, cat: "channel", title: "حذف قناة", details: "القناة: " + nm + CATCH_MARK, targetId: tid, targetTag: nm, data: { auditId: e.id, act: "channel_delete", catchup: true } }); n++; break;
                 }
                 case A.WebhookCreate: {
                     if (await alreadyLogged({ cat: "webhook", targetId: tid }, t)) break;
                     await raise({ ...base, cat: "webhook", rule: "webhook_created", key: "wh:" + tid, title: "إنشاء ويبهوك جديد",
-                        details: "الاسم: " + ((e.target && e.target.name) || "-") + CATCH_MARK, targetId: tid, data: { catchup: true },
+                        details: "الاسم: " + ((e.target && e.target.name) || "-") + CATCH_MARK, targetId: tid, data: { auditId: e.id, catchup: true },
                         remedy: { type: "delete_webhook", label: "🗑️ حذف الويبهوك", params: { webhookId: tid } } }); n++; break;
                 }
                 case A.MessageDelete: {
@@ -1129,23 +1179,35 @@ async function catchUpAudit(last, opts = {}) {
                     const probot = byId === CONFIG.PROBOT_ID;
                     await LOGCAT({ ...base, cat: "message", title: probot ? "حذف رسالة عبر ProBot" : "حذف رسالة",
                         details: "الروم: #" + chName + "\nصاحب الرسالة: " + (tagOf(e.target) || tid || "غير معروف") + "\nعدد الرسائل: " + cnt + "\nالمحتوى: (غير متوفر — انحذفت والبوت طافي، ديسكورد ما يحتفظ بنصها)" + CATCH_MARK,
-                        targetId: tid, targetTag: tagOf(e.target), data: { act: "msg_delete", probot, catchup: true } }); n++; break;
+                        targetId: tid, targetTag: tagOf(e.target), count: cnt, data: { auditId: e.id, act: "msg_delete", probot, channel: chName, catchup: true } }); n++; break;
                 }
                 case A.MessageBulkDelete: {
-                    if (await alreadyLogged({ cat: "message", actorId: byId }, t)) break;
-                    const cnt = (e.extra && e.extra.count) || 0, chName = (g.channels.cache.get(tid) && g.channels.cache.get(tid).name) || (e.target && e.target.name) || tid;
+                    const cnt = (e.extra && e.extra.count) || 0;
+                    if (await alreadyLogged({ cat: "message", count: cnt, "data.act": "bulk_delete" }, t)) break;
+                    const chName = (g.channels.cache.get(tid) && g.channels.cache.get(tid).name) || (e.target && e.target.name) || tid;
                     const probot = byId === CONFIG.PROBOT_ID;
-                    await LOGCAT({ ...base, cat: "message", title: (probot ? "مسح رسائل عبر ProBot" : "حذف جماعي للرسائل") + " (" + cnt + " رسالة)",
-                        details: "الروم: #" + chName + (probot ? "\nالمنفّذ الفعلي: ProBot" : "") + "\nنص الرسائل غير متوفر (انحذفت والبوت طافي)" + CATCH_MARK, count: cnt, data: { act: "bulk_delete", probot, channel: chName, catchup: true } }); n++;
-                    if (cnt >= 30) await raise({ ...base, cat: "message", rule: "mass_msg_delete", key: "mmd:" + (byId || "x"), severity: "medium", title: "مسح رسائل ضخم (" + cnt + " رسالة)",
-                        details: "الروم: #" + chName + "\nالمنفّذ: " + (tagOf(by) || "غير معروف") + (probot ? " (عبر ProBot)" : "") + CATCH_MARK, count: cnt, data: { act: "mass_msg_delete", probot, channel: chName, catchup: true } });
+                    let msgs = [];
+                    try { msgs = await reconstructPurge(g, tid, t, cnt, claimed); } catch (err) { console.error("reconstruct:", err.message); }
+                    const cmd = msgs.find(x => x.authorId && x.authorId !== CONFIG.PROBOT_ID && /^[-!.\/]?(clear|purge|prune|مسح|امسح)(\s|$)/i.test(x.content || ""));
+                    const invId = (cmd && cmd.authorId) || byId, invTag = (cmd && cmd.authorTag) || tagOf(by);
+                    const lines = ["الروم: #" + chName];
+                    if (probot) lines.push("المنفّذ الفعلي: ProBot");
+                    if (cmd) lines.push("نفّذ أمر المسح: " + invTag);
+                    else if (probot) lines.push("من كتب أمر المسح: غير معروف (ديسكورد ما يسجّله ولا فيه نسخة محفوظة من أمره)");
+                    if (e.reason) lines.push("السبب: " + e.reason);
+                    lines.push(msgs.length ? "📄 تم استرجاع نص " + msgs.length + " رسالة من النسخة المحفوظة (تقديري — قد يشمل رسائل انحذفت قبل المسح)" : "نص الرسائل غير متوفر (انحذفت والبوت طافي ولا فيه نسخة محفوظة منها)");
+                    const trimmed = msgs.slice(0, 200).map(m => ({ id: m._id, authorId: m.authorId, authorTag: m.authorTag || "غير معروف", content: m.content || "", att: m.att || 0, at: m.at.getTime() }));
+                    await LOGCAT({ ...base, actorId: invId, actorTag: invTag, cat: "message", title: (probot ? "مسح رسائل عبر ProBot" : "حذف جماعي للرسائل") + " (" + cnt + " رسالة)",
+                        details: lines.join("\n") + CATCH_MARK, count: cnt, data: { auditId: e.id, act: "bulk_delete", probot, channel: chName, catchup: true, messages: trimmed } }); n++;
+                    if (cnt >= 30) await raise({ ...base, actorId: invId, actorTag: invTag, cat: "message", rule: "mass_msg_delete", key: "mmd:" + (invId || "x"), severity: "medium", title: "مسح رسائل ضخم (" + cnt + " رسالة)",
+                        details: "الروم: #" + chName + "\nالمنفّذ: " + (invTag || "غير معروف") + (probot ? " (عبر ProBot)" : "") + CATCH_MARK, count: cnt, data: { act: "mass_msg_delete", probot, channel: chName, catchup: true, messages: trimmed } });
                     break;
                 }
                 case A.GuildUpdate: {
                     if (!(e.changes || []).length) break;
                     if (await alreadyLogged({ cat: "server", actorId: byId }, t)) break;
                     await raise({ ...base, cat: "server", rule: "server_changed", key: "srv:" + (byId || "x"), severity: "medium", title: "تغيير إعدادات السيرفر",
-                        details: e.changes.map(c => "• " + c.key).join("\n") + CATCH_MARK, data: { catchup: true } }); n++; break;
+                        details: e.changes.map(c => "• " + c.key).join("\n") + CATCH_MARK, data: { auditId: e.id, catchup: true } }); n++; break;
                 }
             }
         } catch (err) { console.error("catchUp entry:", err.message); }
@@ -1205,9 +1267,12 @@ app.post("/api/catchup", auth, full, wrap(async (req, res) => {
         const runStart = new Date();
         const n = await catchUpAudit(Date.now() - hours * 3600e3, { manual: true });
         const list = await Event.find({ "data.catchup": true, updatedAt: { $gte: runStart } }).sort({ createdAt: -1 }).limit(300)
-            .select("kind cat title details severity resolved actorTag targetTag createdAt").lean();
+            .select("kind cat title details severity resolved actorTag targetTag createdAt count data.act data.probot data.channel").lean();
+        const pbl = list.filter(e => e.data && e.data.probot), pbCh = {};
+        pbl.forEach(e => { const k = e.data.channel || "؟"; (pbCh[k] = pbCh[k] || { channel: k, ops: 0, messages: 0 }); pbCh[k].ops++; pbCh[k].messages += (e.count || 1); });
+        const probotSum = { ops: pbl.length, messages: pbl.reduce((a, e) => a + (e.count || 1), 0), byChannel: Object.values(pbCh).sort((x, y) => y.messages - x.messages) };
         await panelLog(req, "استرجاع الفائت من سجل ديسكورد", "المدة: آخر " + hours + " ساعة\nالمسترجع: " + list.length + " عملية");
-        res.json({ ok: true, n: list.length, hours, events: list.map(e => ({ kind: e.kind, cat: e.cat, title: e.title, details: String(e.details || "").slice(0, 400),
+        res.json({ ok: true, n: list.length, hours, probot: probotSum, events: list.map(e => ({ id: String(e._id), probot: !!(e.data && e.data.probot), hasMsgs: !!(e.data && e.data.act === "bulk_delete"), kind: e.kind, cat: e.cat, title: e.title, details: String(e.details || "").slice(0, 400),
             severity: e.severity, resolved: !!e.resolved, actor: e.actorTag, target: e.targetTag, createdAt: e.createdAt })) });
     } finally { catchRunning = false; }
 }));
@@ -1590,14 +1655,20 @@ async function runBackfill(h){
   try{
     var j=await api('/api/catchup',{method:'POST',body:JSON.stringify({hours:h})});
     var sevAr={high:'خطير',medium:'متوسط',low:'منخفض'};
-    var list=j.events.map(function(e){
-      return '<div class="card" style="margin:8px 0;padding:12px"><div class="log-title"><span>'+esc(e.title)+'</span>'
+    var pb=j.probot;
+    var pbCard=(pb&&pb.ops)?'<div class="card" style="border-color:#f59e0b;background:rgba(245,158,11,0.08);margin:8px 0"><h3 style="margin-bottom:6px">🧹 مسح رسائل ProBot</h3><div><b>'+pb.ops+'</b> عملية مسح • <b>'+pb.messages+'</b> رسالة انمسحت</div>'
+      +pb.byChannel.map(function(c){return '<div class="prow"><span>#'+esc(c.channel)+'</span><b>'+c.messages+' رسالة ('+c.ops+' مسح)</b></div>';}).join('')+'</div>':'';
+    var evs=j.events.slice().sort(function(a,b){return (b.probot?1:0)-(a.probot?1:0);});
+    var list=evs.map(function(e){
+      return '<div class="card" style="margin:8px 0;padding:12px'+(e.probot?';border-color:#f59e0b':'')+'"><div class="log-title"><span>'+esc(e.title)+'</span>'
+       +(e.probot?'<span class="badge medium">🧹 ProBot</span>':'')
        +(e.kind==='suspicious'?'<span class="badge '+esc(e.severity)+'">⚠️ مشبوهة — '+(sevAr[e.severity]||esc(e.severity))+'</span>':'')+'</div>'
        +(e.details?'<div class="log-det">'+esc(e.details)+'</div>':'')
-       +'<div class="log-meta">🕒 '+fmt(e.createdAt)+(e.actor?' &nbsp;•&nbsp; 👤 '+esc(e.actor):'')+(e.target?' &nbsp;•&nbsp; 🎯 '+esc(e.target):'')+'</div></div>';
+       +'<div class="log-meta">🕒 '+fmt(e.createdAt)+(e.actor?' &nbsp;•&nbsp; 👤 '+esc(e.actor):'')+(e.target?' &nbsp;•&nbsp; 🎯 '+esc(e.target):'')+'</div>'
+       +(e.hasMsgs?'<div style="margin-top:8px"><button class="btn sm gray" onclick="showMsgs(\''+e.id+'\')">📄 عرض الرسائل</button></div>':'')+'</div>';
     }).join('')||'<div class="card center muted">ما فيه شي ناقص — كل اللي في سجل ديسكورد مسجّل أصلاً.<br>اللي استرجعته قبل تقدر تشوفه من اللوق (فلتر 🔄 المسترجعة فقط).</div>';
     modal('<h3>🔄 العمليات المسترجعة ('+j.n+')</h3><p class="muted" style="font-size:12px;margin-bottom:6px">المدة: آخر '+j.hours+' ساعة'+(j.n>=300?' — معروض أحدث 300':'')+'</p>'
-     +'<div style="max-height:58vh;overflow-y:auto">'+list+'</div>'
+     +'<div style="max-height:58vh;overflow-y:auto">'+pbCard+list+'</div>'
      +'<div class="row" style="justify-content:flex-start;margin-top:14px"><button class="btn" onclick="showRecovered()">📜 إظهار في اللوق</button><button class="btn gray" onclick="closeModal()">إغلاق</button></div>');
   }catch(e){closeModal();toast(e.message);}
 }
