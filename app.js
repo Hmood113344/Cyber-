@@ -1037,7 +1037,7 @@ async function runBackfill(h){
     var sevAr={high:'خطير',medium:'متوسط',low:'منخفض'};
     var pb=j.probot;
     var pbCard=(pb&&pb.ops)?'<div class="card" style="border-color:#f59e0b;background:rgba(245,158,11,0.08);margin:8px 0"><h3 style="margin-bottom:6px">🧹 مسح رسائل ProBot</h3><div><b>'+pb.ops+'</b> عملية مسح • <b>'+pb.messages+'</b> رسالة انمسحت</div>'
-      +pb.byChannel.map(function(c){return '<div class="prow"><span>#'+esc(c.channel)+'</span><b>'+c.messages+' رسالة ('+c.ops+' مسح)</b></div>';}).join('')+'</div>':'';
+      +((pb.byUser&&pb.byUser.length)?'<div class="muted" style="font-size:12px;margin:8px 0 2px">👤 من مسح:</div>'+pb.byUser.map(function(u){return '<div class="prow"><span>'+esc(u.user)+'</span><b>'+u.messages+' رسالة ('+u.ops+' مسح)</b></div>';}).join(''):'')+'<div class="muted" style="font-size:12px;margin:8px 0 2px">💬 في أي روم:</div>'+pb.byChannel.map(function(c){return '<div class="prow"><span>#'+esc(c.channel)+'</span><b>'+c.messages+' رسالة ('+c.ops+' مسح)</b></div>';}).join('')+'</div>':'';
     var evs=j.events.slice().sort(function(a,b){return (b.probot?1:0)-(a.probot?1:0);});
     var list=evs.map(function(e){
       return '<div class="card" onclick="openEv(\''+e.id+'\')" style="cursor:pointer;margin:8px 0;padding:12px'+(e.probot?';border-color:#f59e0b':'')+'"><div class="log-title"><span>'+esc(e.title)+'</span>'
