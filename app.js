@@ -95,6 +95,18 @@ const Job = mongoose.model("CyberJob", new mongoose.Schema({
     createdAt: { type: Date, default: Date.now, index: true, expires: 60 * 30 },
     startedAt: Date, doneAt: Date,
 }, { minimize: false }));
+// استفسار "ليش عطيت الرتبة": الموقع ينشئه، والبوت يرسله بالخاص ويستقبل الرد ويرسل القرار
+const Inquiry = mongoose.model("CyberInquiry", new mongoose.Schema({
+    eventId: { type: mongoose.Schema.Types.ObjectId, index: true },   // عملية الرتبة اللي انفتح عليها الاستفسار
+    dmId: { type: String, index: true }, dmTag: String,                // العضو اللي يوصله السؤال (اللي أعطى الرتبة)
+    subjectTag: String,                                                // اللي انعطى الرتبة
+    about: String,                                                     // وصف العملية (من اللوق)
+    senderId: String, senderTag: String, senderAvatar: String,         // اللي ضغط الزر من اللوحة
+    status: { type: String, default: "sent", index: true },            // sent | replied | covenant | investigation
+    reason: String, repliedAt: Date,
+    decidedBy: String, decidedById: String, decidedAvatar: String, decidedAt: Date,
+    createdAt: { type: Date, default: Date.now, expires: 60 * 60 * 24 * 60 },
+}));
 const Access = mongoose.model("CyberAccess", new mongoose.Schema({ _id: String, level: { type: String, default: null }, updatedAt: Date }));
 
 // ── بث فوري للوحة (Server-Sent Events) — بدون أي تحديث كامل للصفحة ──
@@ -333,7 +345,15 @@ app.get("/api/events", auth, wrap(async (req, res) => {
         f.$or = [{ actorId: t }, { targetId: t }, { actorTag: re }, { targetTag: re }];
     }
     const list = await Event.find(f).sort({ createdAt: -1 }).limit(50).select("-data.messages").lean();
-    res.json({ events: list.map(e => ({ ...e, hasMsgs: !!(e.data && (e.data.act === "bulk_delete" || e.data.act === "mass_msg_delete")) })) });
+    const evIds = list.map(e => e._id);
+    const inqIds = list.map(e => e.data && e.data.inqId).filter(x => x && mongoose.isValidObjectId(x));
+    const inqs = evIds.length ? await Inquiry.find({ $or: [{ eventId: { $in: evIds } }, { _id: { $in: inqIds } }] }).select("eventId dmTag status reason").lean() : [];
+    const byEv = {}, byId = {};
+    inqs.forEach(i => { if (i.eventId) byEv[String(i.eventId)] = i; byId[String(i._id)] = i; });
+    res.json({ events: list.map(e => {
+        const i = (e.data && e.data.inqId && byId[String(e.data.inqId)]) || byEv[String(e._id)];
+        return { ...e, hasMsgs: !!(e.data && (e.data.act === "bulk_delete" || e.data.act === "mass_msg_delete")), inq: i ? { id: String(i._id), status: i.status, dmTag: i.dmTag } : null };
+    }) });
 }));
 app.get("/api/events/:id/messages", auth, wrap(async (req, res) => {
     const e = await Event.findById(req.params.id).lean();
@@ -360,6 +380,43 @@ app.post("/api/events/:id/resolve", auth, full, wrap(async (req, res) => {
     if (!e) return res.status(404).json({ error: "غير موجودة" });
     e.resolved = true; e.resolvedBy = req.session.user.tag; e.resolvedAt = new Date(); e.updatedAt = new Date(); await e.save();
     await panelLog(req, "حل عملية مشبوهة", "العملية: " + e.title);
+    res.json({ ok: true });
+}));
+
+// ── استفسار الرتب: زر في اللوق يرسل للعضو بالخاص يسأله ليش عطى الرتبة ──
+app.post("/api/events/:id/inquire", auth, full, wrap(async (req, res) => {
+    if (!mongoose.isValidObjectId(req.params.id)) return res.status(400).json({ error: "عملية غير صحيحة" });
+    const e = await Event.findById(req.params.id).lean();
+    if (!e) return res.status(404).json({ error: "العملية غير موجودة" });
+    if (e.cat !== "role" || !e.actorId || !e.data || e.data.act !== "member_roles" || !String(e.details || "").includes("أُعطي")) return res.status(400).json({ error: "الزر فقط لعمليات إعطاء رتبة لعضو" });
+    if (await Inquiry.findOne({ eventId: e._id })) return res.status(409).json({ error: "انرسل استفسار على هذي العملية من قبل" });
+    if (await Inquiry.findOne({ dmId: e.actorId, status: "sent" })) return res.status(409).json({ error: "فيه استفسار مفتوح لهذا الشخص وينتظر رده" });
+    const u = req.session.user;
+    const inq = await Inquiry.create({
+        eventId: e._id, dmId: e.actorId, dmTag: e.actorTag, subjectTag: e.targetTag || null,
+        about: [e.title, e.details].filter(Boolean).join(" — ").slice(0, 500),
+        senderId: u.id, senderTag: u.tag, senderAvatar: u.avatar,
+    });
+    try { await callBot("inq_send", { id: String(inq._id) }, 30000); }
+    catch (err) { await Inquiry.deleteOne({ _id: inq._id }).catch(() => {}); throw err; }
+    await panelLog(req, "إرسال استفسار عن رتبة", "المرسل له: " + (e.actorTag || e.actorId) + (e.targetTag ? "\nعن إعطاء: " + e.targetTag : ""), { targetId: e.actorId, targetTag: e.actorTag });
+    res.json({ ok: true });
+}));
+app.post("/api/inquiries/:id/decide", auth, full, wrap(async (req, res) => {
+    const d = req.body && req.body.decision;
+    if (!["covenant", "investigation"].includes(d)) return res.status(400).json({ error: "قرار غير صحيح" });
+    if (!mongoose.isValidObjectId(req.params.id)) return res.status(400).json({ error: "استفسار غير صحيح" });
+    const u = req.session.user;
+    // قفل ذري: ما ينفّذ القرار إلا مرة وحدة
+    const inq = await Inquiry.findOneAndUpdate({ _id: req.params.id, status: "replied" },
+        { $set: { status: d, decidedBy: u.tag, decidedById: u.id, decidedAvatar: u.avatar, decidedAt: new Date() } }, { new: true }).lean();
+    if (!inq) return res.status(409).json({ error: "تم اتخاذ قرار على هذا الاستفسار من قبل (أو العضو ما رد بعد)" });
+    try { await callBot("inq_notify", { id: String(inq._id) }, 30000); }
+    catch (err) {
+        await Inquiry.updateOne({ _id: inq._id }, { $set: { status: "replied" }, $unset: { decidedBy: 1, decidedById: 1, decidedAvatar: 1, decidedAt: 1 } }).catch(() => {});
+        throw err;
+    }
+    await panelLog(req, d === "covenant" ? "تم التعاهد (استفسار رتبة)" : "تحويل للتحقيق (استفسار رتبة)", "العضو: " + (inq.dmTag || inq.dmId) + "\nالسبب اللي كتبه: " + String(inq.reason || "").slice(0, 300), { targetId: inq.dmId, targetTag: inq.dmTag });
     res.json({ ok: true });
 }));
 
@@ -787,7 +844,7 @@ function loginPage(mode) {
 const CLIENT = String.raw`
 var PAGES=[['logs','📜 اللوق'],['stats','📊 الإحصائيات'],['bots','🤖 البوتات'],['perms','🔐 صلاحيات السيرفر']];
 var S={page:'logs',q:'',cat:'',unres:false,cu:false,events:[],sig:'',timer:null,permsTab:'roles',permsView:'danger',permsQ:'',meta:null,presence:true,level:'view',meId:null};
-var CATS=[['','الكل'],['sus','⚠️ العمليات المشبوهة'],['newacc','🆕 حسابات جديدة'],['join','دخول'],['leave','خروج'],['kick','طرد'],['ban','حظر'],['role','الرتب'],['channel','القنوات'],['voice','🎙️ الرومات الصوتية'],['message','الرسائل المحذوفة'],['probot','🧹 حذف عبر ProBot'],['bot','البوتات'],['webhook','ويبهوكس'],['everyone','منشن everyone'],['server','إعدادات السيرفر'],['panel','عمليات اللوحة']];
+var CATS=[['','الكل'],['sus','⚠️ العمليات المشبوهة'],['newacc','🆕 حسابات جديدة'],['join','دخول'],['leave','خروج'],['kick','طرد'],['ban','حظر'],['role','الرتب'],['inquiry','📩 استفسارات الرتب'],['channel','القنوات'],['voice','🎙️ الرومات الصوتية'],['message','الرسائل المحذوفة'],['probot','🧹 حذف عبر ProBot'],['bot','البوتات'],['webhook','ويبهوكس'],['everyone','منشن everyone'],['server','إعدادات السيرفر'],['panel','عمليات اللوحة']];
 var RULE_AR={new_account:'حساب جديد',mass_roles_created:'رتب جماعية',mass_role_delete:'حذف رتب',mass_channel_create:'إنشاء قنوات',mass_channel_delete:'حذف قنوات',mass_ban:'حظر جماعي',mass_kick:'طرد جماعي',dangerous_perm_grant:'صلاحيات خطيرة',dangerous_role_assigned:'رتبة خطيرة',bot_added:'بوت جديد',webhook_created:'ويبهوك',everyone_spam:'منشن everyone',mass_join:'غارة دخول',mass_msg_delete:'مسح ضخم',server_changed:'إعدادات السيرفر'};
 function $(id){return document.getElementById(id);}
 function esc(s){return String(s==null?'':s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;');}
@@ -885,7 +942,7 @@ function qs(before){return '/api/events?q='+encodeURIComponent(S.q)+'&cat='+enco
 async function loadEvents(silent){
   try{
     var j=await api(qs());
-    var sig=j.events.map(function(e){return e._id+e.updatedAt+e.resolved;}).join('|');
+    var sig=j.events.map(function(e){return e._id+e.updatedAt+e.resolved+(e.inq?e.inq.status:'');}).join('|');
     if(silent&&sig===S.sig)return;
     S.sig=sig;S.events=j.events;drawEvents(j.events.length>=50);
   }catch(e){if(!silent)toast(e.message);}
@@ -913,11 +970,35 @@ function evRow(e){
     if(e.remedy)acts+='<button class="btn sm danger" onclick="doRemedy(\''+e._id+'\',this)">'+esc(e.remedy.label)+'</button>';
     acts+='<button class="btn sm ok" onclick="doResolve(\''+e._id+'\',this)">✅ حل العملية</button>';
   }
+  var isReply=!!(e.data&&e.data.act==='inq_reply');
+  if(e.cat==='role'&&e.actorId&&e.data&&e.data.act==='member_roles'&&String(e.details||'').indexOf('أُعطي')>-1){
+    if(!e.inq){if(S.level==='full')acts+='<button class="btn sm" data-id="'+e._id+'" onclick="sendInq(this)">📩 إرسال رسالة للعضو</button>';}
+    else acts+='<span class="badge '+(e.inq.status==='sent'?'medium':'done')+'">📩 '+(INQ_AR[e.inq.status]||'')+'</span>';
+  }
+  if(isReply&&e.inq){
+    if(e.inq.status==='replied'){
+      if(S.level==='full')acts+='<button class="btn sm ok" data-id="'+e.inq.id+'" onclick="decideInq(this,\'covenant\')">🤝 تم التعاهد</button><button class="btn sm danger" data-id="'+e.inq.id+'" onclick="decideInq(this,\'investigation\')">🔍 تحقيق</button>';
+      else acts+='<span class="badge medium">⏳ بانتظار القرار</span>';
+    }else acts+='<span class="badge '+(e.inq.status==='investigation'?'high':'done')+'">'+(INQ_AR[e.inq.status]||'')+'</span>';
+  }
   var imgs=(e.data&&e.data.images&&e.data.images.length)?'<div class="imgrow">'+e.data.images.map(function(im){return '<img src="/api/images/'+im.id+'" alt="" loading="lazy" onclick="showImg(\''+im.id+'\')">';}).join('')+'</div>':'';
   return '<div class="'+cls+'"><div class="log-body"><div class="log-title">'+badge+'<span>'+esc(e.title)+'</span>'+(e.count>1&&sus?'<span class="badge low">×'+e.count+'</span>':'')+'</div>'
     +(e.details?'<div class="log-det">'+esc(e.details)+'</div>':'')+imgs+'<div class="log-meta">'+meta+'</div></div><div class="log-act">'+acts+'</div></div>';
 }
 function showImg(id){modal('<div class="center"><img src="/api/images/'+id+'" alt="" style="max-width:100%;max-height:75vh;border-radius:10px"></div><div style="margin-top:14px" class="center"><button class="btn gray" onclick="closeModal()">إغلاق</button></div>');}
+var INQ_AR={sent:'أُرسل — بانتظار الرد',replied:'رد العضو',covenant:'تم التعاهد',investigation:'تحويل للتحقيق'};
+async function sendInq(b){
+  var ev=S.events.find(function(x){return x._id===b.dataset.id;});if(!ev)return;
+  if(!(await ask('راح يوصل '+(ev.actorTag||'العضو')+' رسالة خاصة من البوت يسأله ليش أعطى الرتبة، ولازم يكتب السبب.\n\nنرسل؟')))return;
+  b.disabled=true;
+  try{await api('/api/events/'+ev._id+'/inquire',{method:'POST'});toast('انرسلت الرسالة للعضو');loadEvents();}catch(e){toast(e.message);b.disabled=false;}
+}
+async function decideInq(b,d){
+  var all=b.parentNode.querySelectorAll('button');
+  if(!(await ask(d==='covenant'?'راح توصل العضو رسالة: تم تعاهد الأمن السيبراني. تأكيد؟':'راح توصل العضو رسالة: سيتم استدعاؤك للتحقيق. تأكيد؟')))return;
+  all.forEach(function(x){x.disabled=true;});
+  try{await api('/api/inquiries/'+b.dataset.id+'/decide',{method:'POST',body:JSON.stringify({decision:d})});toast('انرسل القرار للعضو');loadEvents();}catch(e){toast(e.message);all.forEach(function(x){x.disabled=false;});}
+}
 async function doRemedy(id,b){
   var ev=S.events.find(function(x){return x._id===id;});
   if(!(await ask('تنفيذ الإجراء: '+ev.remedy.label+'\n\n'+ev.title)))return;
@@ -1011,7 +1092,7 @@ function weeksHtml(w){
 }
 
 /* ══ نشاط بوت آخر 7 أيام ══ */
-var CAT_AR={join:'دخول',leave:'خروج',kick:'طرد',ban:'حظر',role:'الرتب',channel:'القنوات',voice:'الرومات الصوتية',message:'الرسائل',bot:'البوتات',webhook:'ويبهوكس',everyone:'منشن everyone',server:'إعدادات السيرفر',panel:'اللوحة',other:'أخرى'};
+var CAT_AR={join:'دخول',leave:'خروج',kick:'طرد',ban:'حظر',role:'الرتب',inquiry:'استفسارات الرتب',channel:'القنوات',voice:'الرومات الصوتية',message:'الرسائل',bot:'البوتات',webhook:'ويبهوكس',everyone:'منشن everyone',server:'إعدادات السيرفر',panel:'اللوحة',other:'أخرى'};
 S.botNames={};
 async function openBotAct(id){
   var nm=S.botNames[id]||'بوت';
