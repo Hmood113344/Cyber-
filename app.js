@@ -440,7 +440,7 @@ async function getMemberMap() {
     return memInflight;
 }
 app.get("/api/events", auth, wrap(async (req, res) => {
-    const { q, cat, unres, before, cu, rs } = req.query;
+    const { q, cat, unres, before, cu } = req.query;
     const f = {};
     if (cu === "1") f["data.catchup"] = true;
     if (cat === "sus") f.kind = "suspicious";
@@ -448,7 +448,6 @@ app.get("/api/events", auth, wrap(async (req, res) => {
     else if (cat === "probot") f["data.probot"] = true;
     else if (cat) f.cat = cat;
     if (unres === "1") { f.kind = "suspicious"; f.resolved = false; }
-    if (rs === "1") { f.kind = "suspicious"; f.resolved = true; }
     if (before) f.createdAt = { $lt: new Date(Number(before)) };
     if (q && String(q).trim()) {
         const t = String(q).trim(), w = parseWhen(t);
@@ -462,16 +461,7 @@ app.get("/api/events", auth, wrap(async (req, res) => {
     const inqs = evIds.length ? await Inquiry.find({ $or: [{ eventId: { $in: evIds } }, { _id: { $in: inqIds } }] }).select("eventId dmTag status reason").lean() : [];
     const byEv = {}, byId = {};
     inqs.forEach(i => { if (i.eventId) byEv[String(i.eventId)] = i; byId[String(i._id)] = i; });
-    let counts = null;
-    if (!before) {
-        const SUS = { kind: "suspicious" }, t0 = dayStart(dayKeyOf(Date.now())), td = { createdAt: { $gte: t0 } };
-        const [a, u, r, ta, tu, tr] = await Promise.all([
-            Event.countDocuments(SUS), Event.countDocuments({ ...SUS, resolved: false }), Event.countDocuments({ ...SUS, resolved: true }),
-            Event.countDocuments({ ...SUS, ...td }), Event.countDocuments({ ...SUS, ...td, resolved: false }), Event.countDocuments({ ...SUS, ...td, resolved: true }),
-        ]);
-        counts = { total: a, unresolved: u, resolved: r, today: { total: ta, unresolved: tu, resolved: tr } };
-    }
-    res.json({ counts, events: list.map(e => {
+    res.json({ events: list.map(e => {
         const i = (e.data && e.data.inqId && byId[String(e.data.inqId)]) || byEv[String(e._id)];
         return { ...e, hasMsgs: !!(e.data && (e.data.act === "bulk_delete" || e.data.act === "mass_msg_delete")), inq: i ? { id: String(i._id), status: i.status, dmTag: i.dmTag } : null };
     }) });
@@ -990,7 +980,7 @@ function loginPage(mode) {
 
 const CLIENT = String.raw`
 var PAGES=[['logs','📜 اللوق'],['stats','📊 الإحصائيات'],['bots','🤖 البوتات'],['perms','🔐 صلاحيات السيرفر']];
-var S={page:'logs',q:'',cat:'',unres:false,res:false,counts:null,cu:false,events:[],sig:'',timer:null,permsTab:'roles',permsView:'danger',permsQ:'',meta:null,presence:true,level:'view',meId:null};
+var S={page:'logs',q:'',cat:'',unres:false,cu:false,events:[],sig:'',timer:null,permsTab:'roles',permsView:'danger',permsQ:'',meta:null,presence:true,level:'view',meId:null};
 var CATS=[['','الكل'],['sus','⚠️ العمليات المشبوهة'],['newacc','🆕 حسابات جديدة'],['join','دخول'],['leave','خروج'],['kick','طرد'],['ban','حظر'],['role','الرتب'],['inquiry','📩 استفسارات الرتب'],['channel','القنوات'],['voice','🎙️ الرومات الصوتية'],['message','الرسائل المحذوفة'],['probot','🧹 حذف عبر ProBot'],['bot','البوتات'],['webhook','ويبهوكس'],['everyone','منشن everyone'],['server','إعدادات السيرفر'],['panel','عمليات اللوحة']];
 var RULE_AR={new_account:'حساب جديد',mass_roles_created:'رتب جماعية',mass_role_delete:'حذف رتب',mass_channel_create:'إنشاء قنوات',mass_channel_delete:'حذف قنوات',mass_ban:'حظر جماعي',mass_kick:'طرد جماعي',dangerous_perm_grant:'صلاحيات خطيرة',dangerous_role_assigned:'رتبة خطيرة',bot_added:'بوت جديد',webhook_created:'ويبهوك',everyone_spam:'منشن everyone',mass_join:'غارة دخول',mass_msg_delete:'مسح ضخم',server_changed:'إعدادات السيرفر'};
 function $(id){return document.getElementById(id);}
@@ -1071,7 +1061,7 @@ function showRecovered(){
 }
 function pgLogs(){
   var opts=CATS.map(function(c){return '<option value="'+c[0]+'"'+(S.cat===c[0]?' selected':'')+'>'+c[1]+'</option>';}).join('');
-  $('main').innerHTML='<h2>📜 اللوق الشامل</h2><div id="logstats"></div><div class="card"><div class="filters">'
+  $('main').innerHTML='<h2>📜 اللوق الشامل</h2><div class="card"><div class="filters">'
    +'<input id="f-q" placeholder="🔎 شخص (اسم/آيدي) أو وقت وتاريخ" value="'+esc(S.q)+'">'
    +'<select id="f-cat">'+opts+'</select>'
    +'<label class="chk"><input type="checkbox" id="f-un"'+(S.unres?' checked':'')+'> غير المحلولة فقط</label>'
@@ -1079,23 +1069,21 @@ function pgLogs(){
    +(S.level==='full'?'<button class="btn sm gray" onclick="openBackfill()">🔄 استرجاع الفائت</button>':'')+'</div><div class="muted" style="font-size:11px;margin-top:8px;line-height:1.8">💡 تقدر تبحث بالوقت والتاريخ بالعربي أو الإنجليزي، وتدمجه مع الاسم: <b>اليوم</b> • <b>أمس</b> • <b>10:30 م</b> • <b>3 مساء</b> • <b>5 أكتوبر</b> • <b>2026-10-01</b> • <b>الخميس</b> • <b>today</b> • <b>yesterday</b> • <b>9pm</b> • <b>ahmed أمس</b></div></div>'
    +'<div id="evlist"><div class="card center muted">جاري التحميل...</div></div><div class="center"><button class="btn gray" id="more" style="display:none" onclick="moreEvents()">تحميل المزيد</button></div>';
   var t;$('f-q').oninput=function(){S.q=this.value;clearTimeout(t);t=setTimeout(loadEvents,350);};
-  $('f-cat').onchange=function(){S.cat=this.value;drawCounts();loadEvents();};
-  $('f-un').onchange=function(){S.unres=this.checked;if(this.checked)S.res=false;drawCounts();loadEvents();};
+  $('f-cat').onchange=function(){S.cat=this.value;loadEvents();};
+  $('f-un').onchange=function(){S.unres=this.checked;loadEvents();};
   $('f-cu').onchange=function(){S.cu=this.checked;loadEvents();};
   $('evlist').onclick=function(ev){
     if(ev.target.closest('button,a,img,input,select,.log-act'))return;
     if(window.getSelection&&String(window.getSelection()))return;
     var it=ev.target.closest('.log-item');if(it&&it.getAttribute('data-id'))openEv(it.getAttribute('data-id'));
   };
-  drawCounts();
   loadEvents();
   S.timer=setInterval(function(){if(!$('ov'))loadEvents(true);},6000);
 }
-function qs(before){return '/api/events?q='+encodeURIComponent(S.q)+'&cat='+encodeURIComponent(S.cat)+'&unres='+(S.unres?1:0)+'&cu='+(S.cu?1:0)+'&rs='+(S.res?1:0)+(before?'&before='+before:'');}
+function qs(before){return '/api/events?q='+encodeURIComponent(S.q)+'&cat='+encodeURIComponent(S.cat)+'&unres='+(S.unres?1:0)+'&cu='+(S.cu?1:0)+(before?'&before='+before:'');}
 async function loadEvents(silent){
   try{
     var j=await api(qs());
-    if(j.counts){S.counts=j.counts;drawCounts();}
     var sig=j.events.map(function(e){return e._id+e.updatedAt+e.resolved+(e.inq?e.inq.status:'');}).join('|');
     if(silent&&sig===S.sig)return;
     S.sig=sig;S.events=j.events;drawEvents(j.events.length>=50);
@@ -1174,27 +1162,6 @@ async function showMsgs(id){
     html+='<div style="margin-top:14px"><button class="btn gray" onclick="closeModal()">إغلاق</button></div>';
     modal(html);
   }catch(e){toast(e.message);}
-}
-
-/* ══ إحصائيات اللوق (أزرار تصفية: العمليات / غير محلولة / محلولة) ══ */
-function drawCounts(){
-  var box=$('logstats');if(!box)return;
-  var c=S.counts;if(!c){box.innerHTML='';return;}
-  var all=(S.cat==='sus'&&!S.unres&&!S.res);
-  function card(cls,key,num,lbl,today,on){
-    return '<div class="stat '+cls+' click" style="padding:10px 4px;'+(on?'border-color:#60a5fa;box-shadow:0 0 0 1px #60a5fa;background:rgba(59,130,246,0.12)':'')+'" onclick="logStat(\''+key+'\')"><div class="num">'+num+'</div><div class="lbl">'+lbl+'</div><div class="lbl" style="font-size:11px">اليوم: '+today+'</div></div>';
-  }
-  box.innerHTML='<div style="display:grid;grid-template-columns:repeat(3,1fr);gap:8px;margin-bottom:14px">'
-    +card('red','all',c.total,'عمليات مشبوهة',c.today.total,all)
-    +card('amber','unres',c.unresolved,'غير محلولة',c.today.unresolved,S.unres)
-    +card('green','res',c.resolved,'محلولة',c.today.resolved,S.res)+'</div>';
-}
-function logStat(k){
-  if(k==='all'){if(S.cat==='sus'&&!S.unres&&!S.res)S.cat='';else{S.cat='sus';S.unres=false;S.res=false;}}
-  else if(k==='unres'){S.unres=!S.unres;if(S.unres)S.res=false;}
-  else{S.res=!S.res;if(S.res)S.unres=false;}
-  var u=$('f-un');if(u)u.checked=S.unres;var fc=$('f-cat');if(fc)fc.value=S.cat;
-  drawCounts();loadEvents();
 }
 
 /* ══ نسخ ══ */
