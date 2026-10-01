@@ -84,6 +84,14 @@ const MemberSchema = new mongoose.Schema({
 });
 const PanelMember = mongoose.model("CyberPanelMember", MemberSchema);
 
+// لقطة يومية لعدد الأعضاء (بدون انتهاء — حجمها صغير) + نقطة بداية الأسابيع + أرشيف الأسابيع المكتملة
+const DailyStat = mongoose.model("CyberDailyStat", new mongoose.Schema({ _id: String, members: Number, updatedAt: Date }));
+const StatMeta = mongoose.model("CyberStatMeta", new mongoose.Schema({ _id: String, value: String }));
+const WeekArchive = mongoose.model("CyberWeekArchive", new mongoose.Schema({
+    _id: Number, start: String, end: String, total: Number, resolved: Number, unresolved: Number,
+    byRule: mongoose.Schema.Types.Mixed, days: mongoose.Schema.Types.Mixed, savedAt: Date,
+}));
+
 // ── بث فوري للوحة (Server-Sent Events) — بدون أي تحديث كامل للصفحة ──
 const sseClients = new Set();
 function broadcastChanged() {
@@ -295,7 +303,23 @@ function attachHandlers() {
             const invs = await g.invites.fetch().catch(() => null);
             if (invs) invs.forEach(i => inviteCache.set(i.code, i.uses || 0));
         } catch (e) { console.log("ready err:", e.message); }
+        snapshotMembers(); archiveWeeks();
+        clearInterval(global.__statTimer);
+        global.__statTimer = setInterval(() => { snapshotMembers(); archiveWeeks(); }, 15 * 60 * 1000);
     });
+
+    // ── تحديث فوري لصلاحية من انسحبت/تغيّرت رتبته من ديسكورد مباشرة ──
+    client.on("guildMemberUpdate", (o, n) => {
+        try {
+            if (n.guild.id !== G()) return;
+            const ids = [CONFIG.CYBER_ROLE_ID, CONFIG.LEADER_ROLE_ID, CONFIG.DEPUTY_ROLE_ID].filter(Boolean);
+            if (!o.roles || !ids.some(id => o.roles.cache.has(id) !== n.roles.cache.has(id))) return;
+            applyAccess(n.id, levelOfMember(n));
+        } catch (e) { console.error("access update:", e.message); }
+    });
+    // ── لقطات عدد الأعضاء اليومية (للإحصائيات) ──
+    client.on("guildMemberAdd", m => { if (m.guild.id === G()) scheduleSnapshot(); });
+    client.on("guildMemberRemove", m => { if (m.guild.id === G()) scheduleSnapshot(); });
 
     client.on("inviteCreate", i => inviteCache.set(i.code, i.uses || 0));
     client.on("inviteDelete", i => inviteCache.delete(i.code));
@@ -878,6 +902,103 @@ app.post("/api/bots/:id/kick", auth, full, wrap(async (req, res) => {
     res.json({ ok: true });
 }));
 
+// ── إحصائيات: أيام / أسابيع / عدد الأعضاء ──
+const DAY = 864e5;
+const dayKeyOf = t => new Date(new Date(t).getTime() + 3 * 3600e3).toISOString().slice(0, 10);   // تاريخ اليوم بتوقيت الرياض
+const keyToMs = k => Date.parse(k + "T00:00:00Z");
+const addDays = (k, n) => new Date(keyToMs(k) + n * DAY).toISOString().slice(0, 10);
+const dayStart = k => new Date(keyToMs(k) - 3 * 3600e3);                                          // بداية اليوم بتوقيت الرياض
+const isKey = k => /^\d{4}-\d{2}-\d{2}$/.test(k || "") && !isNaN(keyToMs(k));
+
+let snapTimer = null;
+function scheduleSnapshot() { if (snapTimer) return; snapTimer = setTimeout(() => { snapTimer = null; snapshotMembers(); }, 5000); }
+async function snapshotMembers() {
+    try {
+        const g = await getGuild();
+        await DailyStat.updateOne({ _id: dayKeyOf(Date.now()) }, { $set: { members: g.memberCount, updatedAt: new Date() } }, { upsert: true });
+    } catch (e) { console.error("snapshot:", e.message); }
+}
+async function getEpoch() {
+    let m = await StatMeta.findById("epoch").lean();
+    if (m) return m.value;
+    const first = await Event.findOne().sort({ createdAt: 1 }).select("createdAt").lean();
+    const v = dayKeyOf(first ? first.createdAt : Date.now());
+    try { await StatMeta.create({ _id: "epoch", value: v }); } catch { m = await StatMeta.findById("epoch").lean(); return m ? m.value : v; }
+    return v;
+}
+const loadStats = () => DailyStat.find().sort({ _id: 1 }).lean();
+const membersOn = (docs, key) => { let r = null; for (const d of docs) { if (d._id <= key) r = d; else break; } return r ? { key: r._id, value: r.members } : null; };
+function memberChange(docs, from, to, live) {
+    const end = (live != null && to === dayKeyOf(Date.now())) ? { key: to, value: live } : membersOn(docs, to);
+    const base = membersOn(docs, addDays(from, -1));
+    return { end: end ? end.value : null, base: base ? base.value : null, baseKey: base ? base.key : null, delta: end && base ? end.value - base.value : null };
+}
+function dayRows(evs, docs, from, to) {
+    const rows = [];
+    for (let k = from; k <= to; k = addDays(k, 1)) {
+        const list = evs.filter(e => dayKeyOf(e.createdAt) === k);
+        const end = membersOn(docs, k), base = membersOn(docs, addDays(k, -1));
+        rows.push({ d: k, total: list.length, resolved: list.filter(e => e.resolved).length, unresolved: list.filter(e => !e.resolved).length,
+            members: end ? end.value : null, delta: end && base ? end.value - base.value : null });
+    }
+    return rows;
+}
+const countBy = evs => { const o = {}; evs.forEach(e => { const k = e.rule || "other"; o[k] = (o[k] || 0) + 1; }); return o; };
+
+// يبني قائمة الأسابيع (كل أسبوع 7 أيام من أول يوم تسجيل) ويحفظ الأسابيع المكتملة بالأرشيف
+async function buildWeeks() {
+    const epoch = await getEpoch(), today = dayKeyOf(Date.now());
+    const cur = Math.floor((keyToMs(today) - keyToMs(epoch)) / DAY / 7) + 1;
+    const docs = await loadStats();
+    const retentionStart = dayKeyOf(Date.now() - 59 * DAY);   // الأحداث تنحذف بعد 60 يوم
+    const evs = await Event.find({ kind: "suspicious", createdAt: { $gte: dayStart(epoch) } }).select("rule resolved createdAt").lean();
+    const arch = {}; (await WeekArchive.find().lean()).forEach(a => arch[a._id] = a);
+    const weeks = [];
+    for (let n = 1; n <= cur; n++) {
+        const start = addDays(epoch, (n - 1) * 7), end = addDays(epoch, n * 7 - 1);
+        const upto = end < today ? end : today, complete = end < today;
+        const inWeek = evs.filter(e => { const k = dayKeyOf(e.createdAt); return k >= start && k <= end; });
+        const mc = memberChange(docs, start, upto, null);
+        let w = { no: n, start, end, complete, total: inWeek.length, resolved: inWeek.filter(e => e.resolved).length, unresolved: inWeek.filter(e => !e.resolved).length,
+            byRule: countBy(inWeek), days: dayRows(inWeek, docs, start, upto), membersEnd: mc.end, membersBase: mc.base, delta: mc.delta };
+        const a = arch[n];
+        if (!inWeek.length && a && a.total) w = { ...w, total: a.total, resolved: a.resolved, unresolved: a.unresolved, byRule: a.byRule || {}, days: a.days || w.days, fromArchive: true };
+        else if (complete && start >= retentionStart) {
+            await WeekArchive.updateOne({ _id: n }, { $set: { start, end, total: w.total, resolved: w.resolved, unresolved: w.unresolved, byRule: w.byRule, days: w.days, savedAt: new Date() } }, { upsert: true }).catch(() => {});
+        }
+        weeks.push(w);
+    }
+    return { epoch, today, current: cur, weeks };
+}
+async function archiveWeeks() { try { await buildWeeks(); } catch (e) { console.error("archiveWeeks:", e.message); } }
+
+app.get("/api/stats/weeks", auth, wrap(async (req, res) => {
+    const w = await buildWeeks();
+    res.json({ today: w.today, current: w.current, weeks: w.weeks.map(x => ({ no: x.no, start: x.start, end: x.end, complete: x.complete, total: x.total, resolved: x.resolved, unresolved: x.unresolved, membersEnd: x.membersEnd, delta: x.delta })) });
+}));
+app.get("/api/stats/range", auth, wrap(async (req, res) => {
+    const from = String(req.query.from || ""), to = String(req.query.to || req.query.from || "");
+    if (!isKey(from) || !isKey(to) || from > to || keyToMs(to) - keyToMs(from) > 62 * DAY) return res.status(400).json({ error: "تاريخ غير صحيح" });
+    const g = await getGuild(), docs = await loadStats();
+    const rangeQ = { $gte: dayStart(from), $lt: dayStart(addDays(to, 1)) };
+    const evs = await Event.find({ kind: "suspicious", createdAt: rangeQ }).sort({ createdAt: -1 }).limit(2000)
+        .select("title details rule severity actorTag targetTag resolved resolvedBy createdAt").lean();
+    const joins = await Event.countDocuments({ kind: "normal", cat: "join", createdAt: rangeQ });
+    const leaves = await Event.countDocuments({ kind: "normal", cat: { $in: ["leave", "kick", "ban"] }, createdAt: rangeQ });
+    let out = {
+        from, to, total: evs.length, resolved: evs.filter(e => e.resolved).length, unresolved: evs.filter(e => !e.resolved).length, byRule: countBy(evs),
+        days: dayRows(evs, docs, from, to), members: memberChange(docs, from, to, g.memberCount), joins, leaves, archived: false, truncated: evs.length > 500,
+        ops: evs.slice(0, 500).map(e => ({ id: String(e._id), title: e.title, details: String(e.details || "").slice(0, 500), rule: e.rule, severity: e.severity,
+            actor: e.actorTag, target: e.targetTag, resolved: !!e.resolved, resolvedBy: e.resolvedBy || null, createdAt: e.createdAt })),
+    };
+    const wk = parseInt(req.query.week, 10);
+    if (!evs.length && wk > 0) {
+        const a = await WeekArchive.findById(wk).lean();
+        if (a && a.total) out = { ...out, total: a.total, resolved: a.resolved, unresolved: a.unresolved, byRule: a.byRule || {}, days: a.days || out.days, archived: true };
+    }
+    res.json(out);
+}));
+
 // ── API: الإحصائيات ──
 app.get("/api/stats", auth, wrap(async (req, res) => {
     const since = new Date(Date.now() - 7 * 864e5);
@@ -896,6 +1017,7 @@ app.get("/api/stats", auth, wrap(async (req, res) => {
     const g = await getGuild();
     res.json({
         week: sus.length, unresolved: sus.filter(e => !e.resolved).length, resolved: sus.filter(e => e.resolved).length,
+        today: (() => { const t = sus.filter(e => dayKey(e.createdAt) === dayKey(Date.now())); return { total: t.length, resolved: t.filter(e => e.resolved).length, unresolved: t.filter(e => !e.resolved).length }; })(),
         days, byRule, members: g.memberCount, presence: PRESENCE_OK,
         bots: { total: bots.length, online: online.map(b => ({ id: b.id, name: b.name, status: b.status })), offline: offline.map(b => ({ id: b.id, name: b.name })) },
     });
@@ -1030,16 +1152,6 @@ app.post("/api/members/:id/dismiss", auth, full, wrap(async (req, res) => {
     res.json({ ok: true });
 }));
 
-// إذا انسحبت رتبة الأمن السيبراني من ديسكورد مباشرة (مو من اللوحة) يتحدث عنده فوراً
-client.on("guildMemberUpdate", (o, n) => {
-    try {
-        if (n.guild.id !== CONFIG.GUILD_ID) return;
-        const ids = [CONFIG.CYBER_ROLE_ID, CONFIG.LEADER_ROLE_ID, CONFIG.DEPUTY_ROLE_ID].filter(Boolean);
-        if (!o.roles || !ids.some(id => o.roles.cache.has(id) !== n.roles.cache.has(id))) return;
-        applyAccess(n.id, levelOfMember(n));
-    } catch (e) { console.error("access update:", e.message); }
-});
-
 // ══════════════════════════════════════════════════════════════════════════
 // 6) الواجهة (نفس تصميم موقع فلاش: نفس الألوان والأزرار والخط)
 // ══════════════════════════════════════════════════════════════════════════
@@ -1108,6 +1220,7 @@ input:focus, select:focus { outline:none; border-color:var(--gold-soft); }
 .bar { flex:1; display:flex; flex-direction:column; align-items:center; justify-content:flex-end; height:100%; font-size:11px; color:var(--muted); gap:4px; }
 .bar i { display:block; width:100%; border-radius:6px 6px 0 0; background:linear-gradient(180deg,#60a5fa,#1d4ed8); min-height:3px; }
 .bar b { color:var(--gold-soft); font-size:12px; }
+.bar { cursor:pointer; } .bar:hover i { filter:brightness(1.3); } .stat.click { cursor:pointer; transition:.15s; } .stat.click:hover { border-color:var(--gold); transform:translateY(-2px); }
 .tabs { display:flex; gap:8px; margin-bottom:14px; flex-wrap:wrap; }
 .tab { background:rgba(255,255,255,0.04); border:1px solid rgba(59,130,246,0.3); padding:9px 18px; border-radius:8px; cursor:pointer; font-size:13px; color:#94a3b8; font-family:inherit; }
 .tab.active { background:var(--green2); color:#fff; border-color:var(--green2); }
@@ -1326,23 +1439,94 @@ async function showMsgs(id){
   }catch(e){toast(e.message);}
 }
 
+/* ══ تفاصيل العمليات المشبوهة (يوم / أسبوع) ══ */
+var WD_AR=['الأحد','الاثنين','الثلاثاء','الأربعاء','الخميس','الجمعة','السبت'];
+var WK_AR=['الأول','الثاني','الثالث','الرابع','الخامس','السادس','السابع','الثامن','التاسع','العاشر'];
+function weekName(n){return 'الأسبوع '+(WK_AR[n-1]||n);}
+function dayLabel(k){try{return new Date(k+'T12:00:00Z').toLocaleDateString('ar-SA-u-ca-gregory-nu-latn',{timeZone:'UTC',day:'numeric',month:'long',year:'numeric'});}catch(e){return k;}}
+function dayFull(k){return WD_AR[new Date(k+'T12:00:00Z').getUTCDay()]+' — '+dayLabel(k);}
+function prevDay(k){return new Date(new Date(k+'T12:00:00Z').getTime()-864e5).toISOString().slice(0,10);}
+function ppl(n){return n===1?'شخص واحد':n===2?'شخصين':n<=10?n+' أشخاص':n+' شخص';}
+function memberBadge(mc,from,single){
+  if(mc.end==null)return '<span class="muted">👥 عدد الأعضاء: غير مسجّل لهذي الفترة</span>';
+  var h='👥 الأعضاء: <b>'+mc.end+'</b> &nbsp;';
+  if(mc.delta==null)return h+'<span class="muted">(ما فيه سجل سابق للمقارنة)</span>';
+  var ref='';
+  if(mc.baseKey)ref=' <span class="muted">عن '+((single&&mc.baseKey===prevDay(from))?WD_AR[new Date(mc.baseKey+'T12:00:00Z').getUTCDay()]:dayLabel(mc.baseKey))+'</span>';
+  if(mc.delta>0)return h+'<span style="color:#4ade80;font-weight:bold">▲ زاد '+ppl(mc.delta)+'</span>'+ref;
+  if(mc.delta<0)return h+'<span style="color:#f87171;font-weight:bold">▼ نقص '+ppl(-mc.delta)+'</span>'+ref;
+  return h+'<span class="muted">＝ بدون تغيير</span>'+ref;
+}
+async function openRange(o){
+  modal('<h3>'+esc(o.title)+'</h3><div class="card center muted">جاري التحميل...</div><div class="row" style="justify-content:flex-start;margin-top:14px"><button class="btn gray" onclick="closeModal()">إغلاق</button></div>');
+  try{
+    var j=await api('/api/stats/range?from='+o.from+'&to='+o.to+(o.week?'&week='+o.week:''));
+    S.rng={o:o,j:j,f:o.filter||'all'};drawRange();
+  }catch(e){closeModal();toast(e.message);}
+}
+function setRngFilter(f){S.rng.f=f;drawRange();}
+function openDay(k,fromWeek){openRange({from:k,to:k,title:dayFull(k),back:(fromWeek&&S.rng)?S.rng.o:null});}
+function openToday(f){openRange({from:S.todayKey,to:S.todayKey,title:'اليوم — '+dayFull(S.todayKey),filter:f});}
+function openWeek(n){
+  var x=S.wk.weeks.find(function(w){return w.no===n;});
+  openRange({from:x.start,to:x.complete?x.end:S.wk.today,title:weekName(n)+(x.complete?'':' (جاري)'),sub:'من '+dayLabel(x.start)+' إلى '+dayLabel(x.end),week:n});
+}
+function drawRange(){
+  var r=S.rng,o=r.o,j=r.j,single=o.from===o.to;
+  var tabs=[['all','🚨 المشبوهة',j.total],['unresolved','⏳ غير محلولة',j.unresolved],['resolved','✅ محلولة',j.resolved]].map(function(t){
+    return '<button class="tab '+(r.f===t[0]?'active':'')+'" onclick="setRngFilter(\''+t[0]+'\')">'+t[1]+' ('+t[2]+')</button>';}).join('');
+  var days='';
+  if(!single&&j.days&&j.days.length){
+    days='<div class="card" style="margin:10px 0"><h3 style="font-size:14px;margin-bottom:6px">📅 الأيام <span class="muted" style="font-size:11px;font-weight:400">(اضغط على يوم لتفاصيله)</span></h3>'+j.days.map(function(d){
+      var dl=(d.delta==null||d.delta===0)?'':' <span style="color:'+(d.delta>0?'#4ade80':'#f87171')+'">('+(d.delta>0?'+':'')+d.delta+')</span>';
+      return '<div class="prow" style="cursor:pointer" onclick="openDay(\''+d.d+'\',true)"><span><b>'+WD_AR[new Date(d.d+'T12:00:00Z').getUTCDay()]+'</b> <span class="muted" style="font-size:11px">'+dayLabel(d.d)+'</span></span>'
+       +'<span style="text-align:left;white-space:nowrap">🚨 '+d.total+' • ⏳ '+d.unresolved+' • ✅ '+d.resolved+(d.members!=null?' • 👥 '+d.members+dl:'')+'</span></div>';
+    }).join('')+'</div>';
+  }
+  var sevAr={high:'خطير',medium:'متوسط',low:'منخفض'};
+  var list=j.ops.filter(function(e){return r.f==='all'||(r.f==='resolved'?e.resolved:!e.resolved);});
+  var ops=list.map(function(e){
+    return '<div class="card" style="margin:8px 0;padding:12px"><div class="log-title"><span>'+esc(e.title)+'</span><span class="badge '+esc(e.severity)+'">'+(sevAr[e.severity]||esc(e.severity))+'</span>'
+     +(e.resolved?'<span class="badge done">✅ محلولة</span>':'<span class="badge medium">⏳ غير محلولة</span>')+'</div>'
+     +(e.details?'<div class="log-det">'+esc(e.details)+'</div>':'')
+     +'<div class="log-meta">🕒 '+fmt(e.createdAt)+(RULE_AR[e.rule]?' &nbsp;•&nbsp; '+esc(RULE_AR[e.rule]):'')+(e.actor?' &nbsp;•&nbsp; 👤 '+esc(e.actor):'')+(e.target?' &nbsp;•&nbsp; 🎯 '+esc(e.target):'')+(e.resolved&&e.resolvedBy?' &nbsp;•&nbsp; ✔️ '+esc(e.resolvedBy):'')+'</div></div>';
+  }).join('')||'<div class="card center muted">'+(j.archived?'تفاصيل العمليات انحذفت (الأحداث تنحفظ 60 يوم) — الأرقام فوق محفوظة':'ما فيه عمليات')+'</div>';
+  modal('<h3>'+esc(o.title)+'</h3>'+(o.sub?'<p class="muted center" style="font-size:12px;margin-bottom:8px">'+esc(o.sub)+'</p>':'')
+   +'<div style="max-height:68vh;overflow-y:auto">'
+   +'<div class="card" style="margin:8px 0"><div>'+memberBadge(j.members,o.from,single)+'</div><div class="log-meta">🚪 دخول: '+j.joins+' &nbsp;•&nbsp; خروج/طرد/حظر: '+j.leaves+'</div></div>'
+   +'<div class="tabs" style="margin-top:10px">'+tabs+'</div>'+days+ops
+   +(j.truncated?'<p class="muted center" style="font-size:12px">معروض أحدث 500 عملية فقط</p>':'')+'</div>'
+   +'<div class="row" style="justify-content:flex-start;margin-top:14px">'+(o.back?'<button class="btn" onclick="openRange(S.rng.o.back)">⬅️ رجوع</button>':'')+'<button class="btn gray" onclick="closeModal()">إغلاق</button></div>');
+}
+function weeksHtml(w){
+  var rows=w.weeks.slice().reverse().map(function(x){
+    var tag=x.complete?'<span class="badge done">مكتمل</span>':'<span class="badge medium">جاري</span>';
+    var mem=x.membersEnd!=null?(' • 👥 '+x.membersEnd+((x.delta!=null&&x.delta!==0)?' <span style="color:'+(x.delta>0?'#4ade80':'#f87171')+'">('+(x.delta>0?'+':'')+x.delta+')</span>':'')):'';
+    return '<div class="prow" style="cursor:pointer" onclick="openWeek('+x.no+')"><span><b>'+weekName(x.no)+'</b> '+tag+'<div class="log-meta">من '+dayLabel(x.start)+' إلى '+dayLabel(x.end)+'</div></span>'
+     +'<span style="text-align:left;white-space:nowrap">🚨 '+x.total+' • ⏳ '+x.unresolved+' • ✅ '+x.resolved+mem+'</span></div>';
+  }).join('');
+  return '<div class="card"><h3>🗓️ الأسابيع</h3><p class="muted" style="font-size:12px;margin-bottom:8px">كل أسبوع 7 أيام، وإذا خلص يتسجّل. اضغط على أسبوع لعرض عملياته.</p>'+rows+'</div>';
+}
+
 /* ══ الإحصائيات ══ */
 async function pgStats(){
   $('main').innerHTML='<h2>📊 الإحصائيات</h2><div class="card center muted">جاري التحميل...</div>';
   try{
     var s=await api('/api/stats');if(S.page!=='stats')return;
+    S.todayKey=s.days[s.days.length-1].d;
+    var wkHtml='';try{var wj=await api('/api/stats/weeks');S.wk=wj;wkHtml=weeksHtml(wj);}catch(e){}
     var max=Math.max.apply(null,s.days.map(function(d){return d.n;}).concat([1]));
     var wd=['الأحد','الاثنين','الثلاثاء','الأربعاء','الخميس','الجمعة','السبت'];
-    var bars=s.days.map(function(d){var dt=new Date(d.d+'T12:00:00Z');return '<div class="bar"><b>'+d.n+'</b><i style="height:'+Math.round(d.n/max*100)+'%"></i>'+wd[dt.getUTCDay()]+'</div>';}).join('');
+    var bars=s.days.map(function(d){var dt=new Date(d.d+'T12:00:00Z');return '<div class="bar" onclick="openDay(\''+d.d+'\')"><b>'+d.n+'</b><i style="height:'+Math.round(d.n/max*100)+'%"></i>'+wd[dt.getUTCDay()]+'</div>';}).join('');
     var rules=Object.keys(s.byRule).sort(function(a,b){return s.byRule[b]-s.byRule[a];}).map(function(k){return '<div class="prow"><span>'+esc(RULE_AR[k]||k)+'</span><b>'+s.byRule[k]+'</b></div>';}).join('')||'<p class="muted center">ما فيه عمليات مشبوهة هذا الأسبوع 👌</p>';
     var on=s.bots.online.map(function(b){return '<div class="prow"><span><i class="st '+b.status+'"></i>'+esc(b.name)+'</span></div>';}).join('')||'<p class="muted center">لا أحد</p>';
     var off=s.bots.offline.map(function(b){return '<div class="prow"><span><i class="st offline"></i>'+esc(b.name)+'</span></div>';}).join('')||'<p class="muted center">لا أحد</p>';
     $('main').innerHTML='<h2>📊 الإحصائيات</h2>'
-     +'<div class="grid4"><div class="stat red"><div class="num">'+s.week+'</div><div class="lbl">عمليات مشبوهة (آخر 7 أيام)</div></div>'
-     +'<div class="stat amber"><div class="num">'+s.unresolved+'</div><div class="lbl">غير محلولة</div></div>'
-     +'<div class="stat green"><div class="num">'+s.resolved+'</div><div class="lbl">محلولة</div></div>'
+     +'<div class="grid4"><div class="stat red click" onclick="openToday(\'all\')"><div class="num">'+s.today.total+'</div><div class="lbl">عمليات مشبوهة اليوم</div><div class="lbl" style="font-size:11px">آخر 7 أيام: '+s.week+'</div></div>'
+     +'<div class="stat amber click" onclick="openToday(\'unresolved\')"><div class="num">'+s.today.unresolved+'</div><div class="lbl">غير محلولة اليوم</div><div class="lbl" style="font-size:11px">آخر 7 أيام: '+s.unresolved+'</div></div>'
+     +'<div class="stat green click" onclick="openToday(\'resolved\')"><div class="num">'+s.today.resolved+'</div><div class="lbl">محلولة اليوم</div><div class="lbl" style="font-size:11px">آخر 7 أيام: '+s.resolved+'</div></div>'
      +'<div class="stat"><div class="num">'+s.members+'</div><div class="lbl">أعضاء السيرفر</div></div></div>'
-     +'<div class="card"><h3>العمليات المشبوهة خلال الأسبوع</h3><div class="bars">'+bars+'</div></div>'
+     +'<div class="card"><h3>العمليات المشبوهة خلال الأسبوع</h3><p class="muted" style="font-size:12px">اضغط على أي يوم لعرض عملياته وعدد الأعضاء فيه</p><div class="bars">'+bars+'</div></div>'+wkHtml
      +'<div class="card"><h3>حسب النوع</h3>'+rules+'</div>'
      +'<div class="grid3"><div class="stat"><div class="num">'+s.bots.total+'</div><div class="lbl">البوتات داخل السيرفر</div></div>'
      +'<div class="stat green"><div class="num">'+s.bots.online.length+'</div><div class="lbl">أونلاين الآن</div></div>'
