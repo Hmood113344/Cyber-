@@ -1,37 +1,26 @@
 // ══════════════════════════════════════════════════════════════════════════
-// الأمن السيبراني — وزارة الداخلية (ملف واحد شامل: موقع + بوت)
+// الأمن السيبراني — وزارة الداخلية — ملف الموقع فقط (بدون بوت)
+// البوت في ملف ثاني على استضافة ثانية، والاثنين يتكلمون عن طريق نفس قاعدة MongoDB.
 // ══════════════════════════════════════════════════════════════════════════
 const express = require("express");
 const session = require("express-session");
 const crypto = require("crypto");
 const mongoose = require("mongoose");
-const {
-    Client, GatewayIntentBits, Partials, PermissionFlagsBits, PermissionsBitField, AuditLogEvent,
-} = require("discord.js");
+const { PermissionFlagsBits } = require("discord.js");   // لأسماء الصلاحيات فقط — الموقع ما يسجّل دخول بأي بوت
 
 // ══════════════════════════════════════════════════════════════════════════
-// 1) الإعدادات — من Environment Variables في Render
+// 1) الإعدادات — من Environment Variables
+//    MONGO_URI لازم يكون نفس اللي في البوت بالضبط
 // ══════════════════════════════════════════════════════════════════════════
 const CONFIG = {
     DISCORD_CLIENT_ID: process.env.DISCORD_CLIENT_ID || "",
     DISCORD_CLIENT_SECRET: process.env.DISCORD_CLIENT_SECRET || "",
-    DISCORD_CALLBACK_URL: process.env.DISCORD_CALLBACK_URL || "",   // مثال: https://xxx.onrender.com/auth/discord/callback
-    BOT_TOKEN: process.env.BOT_TOKEN || "",
-    // ⬇️ حط آيدي سيرفر وزارة الداخلية هنا
-    GUILD_ID: process.env.GUILD_ID || "1497233353030766662",
+    DISCORD_CALLBACK_URL: process.env.DISCORD_CALLBACK_URL || "",   // مثال: https://xxx.com/auth/discord/callback
     MONGO_URI: process.env.MONGO_URI || "",
-    // ⬇️ حط آيدي رتبة الأمن السيبراني هنا بين علامتي التنصيص (شرط الدخول للموقع)
-    CYBER_ROLE_ID: "1554783236369031240",       // رتبة عضو الأمن السيبراني (شرط أصل الدخول)
-    LEADER_ROLE_ID: "1554992888260337736",       // رتبة قائد الأمن السيبراني (صلاحيات كاملة)
-    DEPUTY_ROLE_ID: "1554992975887728760",       // رتبة نائب قائد الأمن السيبراني (صلاحيات كاملة)
     SESSION_SECRET: process.env.SESSION_SECRET || "غيّر_هذا_السر_2026",
     PORT: process.env.PORT || 7800,
     SITE_NAME: "الأمن السيبراني",
     SITE_SUB: "وزارة الداخلية",
-    PROBOT_ID: process.env.PROBOT_ID || "282859044593598464",
-
-    // حدود العمليات المشبوهة
-    YOUNG_ACCOUNT_DAYS: 30,
 };
 
 // ══════════════════════════════════════════════════════════════════════════
@@ -96,6 +85,18 @@ const WeekArchive = mongoose.model("CyberWeekArchive", new mongoose.Schema({
     byRule: mongoose.Schema.Types.Mixed, days: mongoose.Schema.Types.Mixed, savedAt: Date,
 }));
 
+// ── جداول الربط بين الموقع والبوت (لازم تكون نفسها بالضبط في ملف البوت) ──
+const Job = mongoose.model("CyberJob", new mongoose.Schema({
+    type: String,
+    params: { type: mongoose.Schema.Types.Mixed, default: {} },
+    status: { type: String, default: "pending", index: true },   // pending | running | done | error
+    result: mongoose.Schema.Types.Mixed,
+    error: String, errStatus: Number,
+    createdAt: { type: Date, default: Date.now, index: true, expires: 60 * 30 },
+    startedAt: Date, doneAt: Date,
+}, { minimize: false }));
+const Access = mongoose.model("CyberAccess", new mongoose.Schema({ _id: String, level: { type: String, default: null }, updatedAt: Date }));
+
 // ── بث فوري للوحة (Server-Sent Events) — بدون أي تحديث كامل للصفحة ──
 const sseClients = new Set();
 function broadcastChanged() {
@@ -158,491 +159,45 @@ const permMeta = list => list.map(k => ({ k, ar: PERM_AR[k] || enOf(k), en: enOf
     .sort((a, b) => (b.danger ? 1 : 0) - (a.danger ? 1 : 0));
 
 // ══════════════════════════════════════════════════════════════════════════
-// 4) البوت
+// 4) أدوات الموقع (بدل البوت: كل شي يجي من القاعدة)
 // ══════════════════════════════════════════════════════════════════════════
-let client = null;
-let PRESENCE_OK = true;
 const sleep = ms => new Promise(r => setTimeout(r, ms));
-const tagOf = u => u ? (u.tag && !u.tag.endsWith("#0") ? u.tag : u.username) : null;
-const getGuild = async () => client.guilds.cache.get(CONFIG.GUILD_ID) || await client.guilds.fetch(CONFIG.GUILD_ID);
-
-const inviteCache = new Map();  // code -> uses
-const msgCache = new Map();     // آخر الرسائل (لعرض المحذوف)
-const everyoneHits = new Map();
-
-// ── كاش الصور: نحمّل صورة المرفق فور إرسالها، عشان تضل متوفرة حتى بعد حذفها من ديسكورد ──
-const imgCache = new Map(); // attachmentId -> { buf, type, name, size }
-function evictImgCache() { while (imgCache.size > 400) imgCache.delete(imgCache.keys().next().value); }
-function attMeta(m) {
-    return [...(m.attachments?.values() || [])].map(a => ({ id: a.id, name: a.name, contentType: a.contentType || null, size: a.size || 0, url: a.url }));
-}
-async function cacheImages(atts) {
-    for (const a of atts || []) {
-        const isImg = (a.contentType && a.contentType.startsWith("image/")) || /\.(png|jpe?g|webp|gif)(\?|$)/i.test(a.url || a.name || "");
-        if (!isImg || !a.url) continue;
-        if (a.size && a.size > 8 * 1024 * 1024) continue;
-        try {
-            const ctrl = new AbortController(); const t = setTimeout(() => ctrl.abort(), 6000);
-            const r = await fetch(a.url, { signal: ctrl.signal }); clearTimeout(t);
-            if (!r.ok) continue;
-            const buf = Buffer.from(await r.arrayBuffer());
-            imgCache.set(a.id, { buf, type: a.contentType || "image/png", name: a.name || "image", size: buf.length });
-            evictImgCache();
-        } catch { }
-    }
-}
-// ينقل الصور المحفوظة بالذاكرة إلى قاعدة البيانات مرتبطة بحدث معيّن، ويرجع بيانات وصفية فقط (بدون base64)
-async function persistImages(eventId, atts) {
-    const out = [];
-    for (const a of atts || []) {
-        const cached = imgCache.get(a.id);
-        if (!cached) continue;
-        try {
-            const doc = await EventImage.create({ eventId, name: cached.name, contentType: cached.type, size: cached.size, data: cached.buf });
-            out.push({ id: String(doc._id), name: cached.name, contentType: cached.type, size: cached.size });
-        } catch { }
-    }
-    return out;
-}
-
-function cacheMsg(m) {
-    msgCache.set(m.id, {
-        id: m.id, authorId: m.author?.id, authorTag: tagOf(m.author), bot: !!m.author?.bot, channelId: m.channelId,
-        content: String(m.content || "").slice(0, 500), att: m.attachments?.size || 0, atts: attMeta(m), at: m.createdTimestamp,
-    });
-    if (msgCache.size > 20000) msgCache.delete(msgCache.keys().next().value);
-    queueMsgLog(m);
-}
-const msgLogBuf = []; let msgLogTimer = null;
-function queueMsgLog(m) {
-    try {
-        if (m.guildId !== CONFIG.GUILD_ID || !m.author || isSelf(m.author.id)) return;
-        if (!m.content && !(m.attachments && m.attachments.size)) return;
-        msgLogBuf.push({ _id: m.id, channelId: m.channelId, authorId: m.author.id, authorTag: tagOf(m.author), content: String(m.content || "").slice(0, 500), att: (m.attachments && m.attachments.size) || 0, at: new Date(m.createdTimestamp) });
-        if (!msgLogTimer) msgLogTimer = setTimeout(flushMsgLog, 5000);
-    } catch {}
-}
-async function flushMsgLog() {
-    msgLogTimer = null;
-    const batch = msgLogBuf.splice(0, msgLogBuf.length);
-    if (!batch.length) return;
-    try { await MsgLog.insertMany(batch, { ordered: false }); } catch {}
-}
 
 async function logEvent(o) {
     try { const ev = await Event.create({ ...o, updatedAt: new Date() }); broadcastChanged(); return ev; }
     catch (e) { console.error("logEvent:", e.message); }
 }
-
-// عملية مشبوهة (تُدمج مع المفتوحة المشابهة خلال 24 ساعة)
-async function raise(o) {
-    try {
-        if (o.key) {
-            const ev = await Event.findOne({ kind: "suspicious", key: o.key, resolved: false, createdAt: { $gte: new Date(Date.now() - 864e5) } });
-            if (ev) {
-                ev.details = o.details; ev.remedy = o.remedy || ev.remedy; ev.count = o.count || (ev.count + 1);
-                ev.data = o.data || ev.data; ev.markModified("data"); ev.markModified("remedy"); ev.updatedAt = new Date();
-                await ev.save(); broadcastChanged(); return ev;
-            }
-        }
-        const ev = await Event.create({ severity: "high", ...o, kind: "suspicious", updatedAt: new Date() });
-        broadcastChanged(); return ev;
-    } catch (e) { console.error("raise:", e.message); }
-}
-
-async function findAudit(guild, type, match) {
-    await sleep(900);
-    for (let i = 0; i < 2; i++) {
-        try {
-            const logs = await guild.fetchAuditLogs({ type, limit: 8 });
-            const now = Date.now();
-            const e = logs.entries.find(x => now - x.createdTimestamp < 20000 && (!match || match(x)));
-            if (e) return e;
-        } catch { return null; }
-        await sleep(1200);
-    }
-    return null;
-}
-const isSelf = id => client && client.user && id === client.user.id;
-
-// قواعد العمليات المشبوهة المبنية على التكرار
-const RULES = {
-    mass_roles_created: { title: "إنشاء 5 رتب أو أكثر خلال يوم واحد", action: "role_create", min: 1440, limit: 5, cat: "role", remedy: "delete_roles" },
-    mass_role_delete:   { title: "حذف 3 رتب أو أكثر خلال 10 دقائق", action: "role_delete", min: 10, limit: 3, cat: "role", remedy: "strip" },
-    mass_channel_create:{ title: "إنشاء 5 قنوات أو أكثر خلال 10 دقائق", action: "channel_create", min: 10, limit: 5, cat: "channel", remedy: "delete_channels" },
-    mass_channel_delete:{ title: "حذف 3 قنوات أو أكثر خلال 10 دقائق", action: "channel_delete", min: 10, limit: 3, cat: "channel", remedy: "strip" },
-    mass_ban:           { title: "حظر 3 أعضاء أو أكثر خلال 10 دقائق", action: "ban", min: 10, limit: 3, cat: "ban", remedy: "strip" },
-    mass_kick:          { title: "طرد 3 أعضاء أو أكثر خلال 10 دقائق", action: "kick", min: 10, limit: 3, cat: "kick", remedy: "strip" },
-};
-async function burst(ruleKey, actorId, actorTag) {
-    const R = RULES[ruleKey];
-    if (!R || !actorId || isSelf(actorId)) return;
-    const evs = await Event.find({ "data.act": R.action, actorId, createdAt: { $gte: new Date(Date.now() - R.min * 60000) } }).lean();
-    if (evs.length < R.limit) return;
-    let remedy;
-    if (R.remedy === "delete_roles") remedy = { type: "delete_roles", label: "🗑️ حذف جميع الرتب (" + evs.length + ")", params: { roleIds: evs.map(e => e.targetId).filter(Boolean) } };
-    else if (R.remedy === "delete_channels") remedy = { type: "delete_channels", label: "🗑️ حذف القنوات (" + evs.length + ")", params: { channelIds: evs.map(e => e.targetId).filter(Boolean) } };
-    else remedy = { type: "strip_roles", label: "🚫 سحب جميع رتبه", params: { userId: actorId } };
-    await raise({
-        rule: ruleKey, key: ruleKey + ":" + actorId, cat: R.cat, title: R.title, severity: "high",
-        details: "المنفذ نفّذ " + evs.length + " عملية متتالية", actorId, actorTag, count: evs.length, remedy,
-    });
-}
-
-function dangerOf(permNames) { return permNames.filter(n => DANGER_LEVEL[n] === "critical"); }
-
 const LOGCAT = (o) => logEvent({ kind: "normal", severity: "low", ...o });
 
-function startBot() {
-    const intents = [
-        GatewayIntentBits.Guilds, GatewayIntentBits.GuildMembers, GatewayIntentBits.GuildMessages, GatewayIntentBits.MessageContent,
-        GatewayIntentBits.GuildModeration, GatewayIntentBits.GuildInvites, GatewayIntentBits.GuildWebhooks, GatewayIntentBits.GuildVoiceStates,
-    ];
-    if (PRESENCE_OK) intents.push(GatewayIntentBits.GuildPresences);
-    client = new Client({ intents, partials: [Partials.Message, Partials.Channel, Partials.GuildMember] });
-    attachHandlers();
-    client.login(CONFIG.BOT_TOKEN).catch(e => {
-        console.log("❌ فشل تسجيل دخول البوت:", e.message);
-        if (PRESENCE_OK && /disallowed/i.test(e.message)) {
-            console.log("⚠️ Presence Intent غير مفعّل — نكمل بدونه (حالة البوتات أونلاين/أوفلاين ما راح تظهر بدقة). فعّله من Developer Portal → Bot");
-            PRESENCE_OK = false; try { client.destroy(); } catch {} startBot();
-        }
-    });
+// البوت يكتب نبضة كل 30 ثانية — إذا انقطعت يعني البوت طافي
+const readLastAlive = async () => { const m = await StatMeta.findById("lastAlive").lean(); return m ? Number(m.value) || 0 : 0; };
+async function botAlive() { return Date.now() - (await readLastAlive()) < 100000; }
+
+// يرسل طلب للبوت عن طريق القاعدة وينتظر النتيجة
+async function callBot(type, params, timeoutMs) {
+    if (!(await botAlive())) { const e = new Error("البوت غير متصل حالياً — تأكد إنه شغّال على استضافته"); e.status = 503; throw e; }
+    const job = await Job.create({ type, params: params || {}, status: "pending" });
+    const t0 = Date.now(), limit = timeoutMs || 25000;
+    while (Date.now() - t0 < limit) {
+        await sleep(300);
+        const j = await Job.findById(job._id).lean();
+        if (!j) break;
+        if (j.status === "done") return j.result;
+        if (j.status === "error") { const e = new Error(j.error || "فشل التنفيذ"); e.status = j.errStatus || 500; throw e; }
+    }
+    await Job.deleteOne({ _id: job._id, status: "pending" }).catch(() => {});
+    const e = new Error("البوت ما رد بالوقت المناسب — حاول مرة ثانية"); e.status = 504; throw e;
 }
 
-function attachHandlers() {
-    const G = () => CONFIG.GUILD_ID;
-
-    client.once("ready", async () => {
-        console.log("🤖 Bot ready:", client.user.tag);
-        try {
-            const g = await getGuild();
-            await g.members.fetch().catch(() => {});
-            await g.channels.fetch().catch(() => {});
-            await g.roles.fetch().catch(() => {});
-            const invs = await g.invites.fetch().catch(() => null);
-            if (invs) invs.forEach(i => inviteCache.set(i.code, i.uses || 0));
-        } catch (e) { console.log("ready err:", e.message); }
-        snapshotMembers(); archiveWeeks();
-        try {
-            let last = await readLastAlive();
-            if (!last) { const ne = await Event.findOne().sort({ createdAt: -1 }).select("createdAt").lean(); if (ne) last = new Date(ne.createdAt).getTime(); }
-            if (last && Date.now() - last >= 120000) await StatMeta.updateOne({ _id: "lastGap" }, { $set: { value: String(last) } }, { upsert: true }).catch(() => {});
-            await beat();
-            clearInterval(global.__beatTimer);
-            global.__beatTimer = setInterval(beat, 30000);
-            if (last) catchUpAudit(last).catch(e => console.error("catchUp:", e.message));
-        } catch (e) { console.error("heartbeat:", e.message); }
-        clearInterval(global.__statTimer);
-        global.__statTimer = setInterval(() => { snapshotMembers(); archiveWeeks(); }, 15 * 60 * 1000);
-    });
-
-    // ── تحديث فوري لصلاحية من انسحبت/تغيّرت رتبته من ديسكورد مباشرة ──
-    client.on("guildMemberUpdate", (o, n) => {
-        try {
-            if (n.guild.id !== G()) return;
-            const ids = [CONFIG.CYBER_ROLE_ID, CONFIG.LEADER_ROLE_ID, CONFIG.DEPUTY_ROLE_ID].filter(Boolean);
-            if (!o.roles || !ids.some(id => o.roles.cache.has(id) !== n.roles.cache.has(id))) return;
-            applyAccess(n.id, levelOfMember(n));
-        } catch (e) { console.error("access update:", e.message); }
-    });
-    // ── لقطات عدد الأعضاء اليومية (للإحصائيات) ──
-    client.on("guildMemberAdd", m => { if (m.guild.id === G()) scheduleSnapshot(); });
-    client.on("guildMemberRemove", m => { if (m.guild.id === G()) scheduleSnapshot(); });
-
-    client.on("inviteCreate", i => inviteCache.set(i.code, i.uses || 0));
-    client.on("inviteDelete", i => inviteCache.delete(i.code));
-
-    // ── دخول عضو ──
-    client.on("guildMemberAdd", async m => {
-        if (m.guild.id !== G()) return;
-        const ageDays = Math.floor((Date.now() - m.user.createdTimestamp) / 864e5);
-        let inviterId = null, inviterTag = null, code = null;
-        try {
-            const invs = await m.guild.invites.fetch();
-            const used = invs.find(i => (i.uses || 0) > (inviteCache.get(i.code) || 0));
-            invs.forEach(i => inviteCache.set(i.code, i.uses || 0));
-            if (used) { code = used.code; inviterId = used.inviter?.id || null; inviterTag = tagOf(used.inviter); }
-        } catch {}
-        const base = {
-            cat: "join", actorId: inviterId, actorTag: inviterTag, targetId: m.id, targetTag: tagOf(m.user),
-            data: { act: "join", ageDays, created: m.user.createdTimestamp, inviterId, inviterTag, code, bot: m.user.bot },
-        };
-        const lines = [
-            "📅 عمر الحساب: " + ageDays + " يوم (أُنشئ " + new Date(m.user.createdTimestamp).toLocaleDateString("ar-SA") + ")",
-            "📨 الداعي: " + (inviterTag ? inviterTag + " (" + inviterId + ")" : "غير معروف") + (code ? " — الدعوة: " + code : ""),
-        ].join("\n");
-
-        if (m.user.bot) {
-            const a = await findAudit(m.guild, AuditLogEvent.BotAdd, x => x.target?.id === m.id);
-            const by = a?.executor;
-            await raise({
-                cat: "bot", rule: "bot_added", key: "bot_added:" + m.id, severity: "high", title: "إضافة بوت جديد للسيرفر",
-                details: "البوت: " + tagOf(m.user) + "\nأضافه: " + (tagOf(by) || "غير معروف"), actorId: by?.id, actorTag: tagOf(by),
-                targetId: m.id, targetTag: tagOf(m.user), data: { act: "bot_add" },
-                remedy: { type: "kick_member", label: "👢 طرد البوت", params: { userId: m.id } },
-            });
-            return;
-        }
-        if (ageDays < CONFIG.YOUNG_ACCOUNT_DAYS) {
-            await raise({
-                ...base, rule: "new_account", key: "new_account:" + m.id, severity: "medium", title: "دخول حساب جديد (أقل من شهر)",
-                details: lines, remedy: { type: "kick_member", label: "👢 طرد", params: { userId: m.id } },
-            });
-        } else {
-            await LOGCAT({ ...base, title: "دخول عضو", details: lines });
-        }
-        // غارة: 10 دخول خلال دقيقة
-        const recent = await Event.find({ "data.act": "join", createdAt: { $gte: new Date(Date.now() - 60000) } }).lean();
-        if (recent.length >= 10) {
-            await raise({
-                cat: "join", rule: "mass_join", key: "mass_join", severity: "high", title: "دخول جماعي مفاجئ (احتمال غارة)",
-                details: recent.length + " عضو دخلوا خلال آخر دقيقة", count: recent.length,
-                remedy: { type: "kick_many", label: "👢 طرد الداخلين (" + recent.length + ")", params: { userIds: recent.map(e => e.targetId) } },
-            });
-        }
-    });
-
-    // ── خروج / طرد ──
-    client.on("guildMemberRemove", async m => {
-        if (m.guild.id !== G()) return;
-        const a = await findAudit(m.guild, AuditLogEvent.MemberKick, x => x.target?.id === m.id);
-        if (a) {
-            if (isSelf(a.executor?.id)) return;
-            await LOGCAT({ cat: "kick", title: "طرد عضو", details: "السبب: " + (a.reason || "بدون سبب"), actorId: a.executor?.id, actorTag: tagOf(a.executor), targetId: m.id, targetTag: tagOf(m.user), data: { act: "kick" } });
-            return burst("mass_kick", a.executor?.id, tagOf(a.executor));
-        }
-        await LOGCAT({ cat: "leave", title: "خروج عضو", details: "", targetId: m.id, targetTag: tagOf(m.user), data: { act: "leave" } });
-    });
-
-    // ── باند ──
-    client.on("guildBanAdd", async b => {
-        if (b.guild.id !== G()) return;
-        const a = await findAudit(b.guild, AuditLogEvent.MemberBanAdd, x => x.target?.id === b.user.id);
-        if (isSelf(a?.executor?.id)) return;
-        await LOGCAT({ cat: "ban", title: "حظر عضو", details: "السبب: " + (b.reason || a?.reason || "بدون سبب"), actorId: a?.executor?.id, actorTag: tagOf(a?.executor), targetId: b.user.id, targetTag: tagOf(b.user), data: { act: "ban" } });
-        if (a?.executor) await burst("mass_ban", a.executor.id, tagOf(a.executor));
-    });
-    client.on("guildBanRemove", async b => {
-        if (b.guild.id !== G()) return;
-        const a = await findAudit(b.guild, AuditLogEvent.MemberBanRemove, x => x.target?.id === b.user.id);
-        if (isSelf(a?.executor?.id)) return;
-        await LOGCAT({ cat: "ban", title: "فك حظر عضو", details: "", actorId: a?.executor?.id, actorTag: tagOf(a?.executor), targetId: b.user.id, targetTag: tagOf(b.user), data: { act: "unban" } });
-    });
-
-    // ── الرتب ──
-    client.on("roleCreate", async r => {
-        if (r.guild.id !== G()) return;
-        const a = await findAudit(r.guild, AuditLogEvent.RoleCreate, x => x.target?.id === r.id);
-        if (isSelf(a?.executor?.id)) return;
-        await LOGCAT({ cat: "role", title: "إنشاء رتبة", details: "الرتبة: " + r.name, actorId: a?.executor?.id, actorTag: tagOf(a?.executor), targetId: r.id, targetTag: r.name, data: { act: "role_create" } });
-        if (a?.executor && !r.managed) await burst("mass_roles_created", a.executor.id, tagOf(a.executor));
-        const crit = dangerOf(r.permissions.toArray());
-        if (crit.length) await raise({
-            cat: "role", rule: "dangerous_perm_grant", key: "dpg:" + r.id, title: "إنشاء رتبة بصلاحيات خطيرة",
-            details: "الرتبة: " + r.name + "\nالصلاحيات: " + crit.map(n => PERM_AR[n] || n).join("، "), actorId: a?.executor?.id, actorTag: tagOf(a?.executor),
-            targetId: r.id, targetTag: r.name, remedy: { type: "revoke_perms", label: "🔒 سحب الصلاحيات الخطيرة", params: { roleId: r.id, perms: crit } },
-        });
-    });
-    client.on("roleDelete", async r => {
-        if (r.guild.id !== G()) return;
-        const a = await findAudit(r.guild, AuditLogEvent.RoleDelete, x => x.target?.id === r.id);
-        if (isSelf(a?.executor?.id)) return;
-        await LOGCAT({ cat: "role", title: "حذف رتبة", details: "الرتبة: " + r.name, actorId: a?.executor?.id, actorTag: tagOf(a?.executor), targetId: r.id, targetTag: r.name, data: { act: "role_delete" } });
-        if (a?.executor) await burst("mass_role_delete", a.executor.id, tagOf(a.executor));
-    });
-    client.on("roleUpdate", async (o, n) => {
-        if (n.guild.id !== G() || o.permissions.bitfield === n.permissions.bitfield) return;
-        const before = o.permissions.toArray(), after = n.permissions.toArray();
-        const added = after.filter(x => !before.includes(x)), removed = before.filter(x => !after.includes(x));
-        const a = await findAudit(n.guild, AuditLogEvent.RoleUpdate, x => x.target?.id === n.id);
-        if (isSelf(a?.executor?.id)) return;
-        await LOGCAT({
-            cat: "role", title: "تعديل صلاحيات رتبة",
-            details: "الرتبة: " + n.name + (added.length ? "\n➕ أضاف: " + added.map(x => PERM_AR[x] || x).join("، ") : "") + (removed.length ? "\n➖ سحب: " + removed.map(x => PERM_AR[x] || x).join("، ") : ""),
-            actorId: a?.executor?.id, actorTag: tagOf(a?.executor), targetId: n.id, targetTag: n.name, data: { act: "role_perms" },
-        });
-        const crit = dangerOf(added);
-        if (crit.length) await raise({
-            cat: "role", rule: "dangerous_perm_grant", key: "dpg:" + n.id, title: "منح صلاحيات خطيرة لرتبة",
-            details: "الرتبة: " + n.name + "\nالصلاحيات: " + crit.map(x => PERM_AR[x] || x).join("، "), actorId: a?.executor?.id, actorTag: tagOf(a?.executor),
-            targetId: n.id, targetTag: n.name, remedy: { type: "revoke_perms", label: "🔒 سحب الصلاحيات الخطيرة", params: { roleId: n.id, perms: crit } },
-        });
-    });
-
-    // ── تغيير رتب عضو ──
-    client.on("guildMemberUpdate", async (o, n) => {
-        if (n.guild.id !== G() || !o.roles) return;
-        const added = n.roles.cache.filter(r => !o.roles.cache.has(r.id)), removed = o.roles.cache.filter(r => !n.roles.cache.has(r.id));
-        if (!added.size && !removed.size) return;
-        const a = await findAudit(n.guild, AuditLogEvent.MemberRoleUpdate, x => x.target?.id === n.id);
-        if (isSelf(a?.executor?.id)) return;
-        await LOGCAT({
-            cat: "role", title: "تغيير رتب عضو",
-            details: (added.size ? "➕ أُعطي: " + added.map(r => r.name).join("، ") : "") + (removed.size ? (added.size ? "\n" : "") + "➖ سُحب منه: " + removed.map(r => r.name).join("، ") : ""),
-            actorId: a?.executor?.id, actorTag: tagOf(a?.executor), targetId: n.id, targetTag: tagOf(n.user), data: { act: "member_roles" },
-        });
-        for (const r of added.values()) {
-            const crit = dangerOf(r.permissions.toArray());
-            if (crit.length) await raise({
-                cat: "role", rule: "dangerous_role_assigned", key: "dra:" + n.id + ":" + r.id, title: "إعطاء رتبة خطيرة لعضو",
-                details: "العضو: " + tagOf(n.user) + "\nالرتبة: " + r.name + "\nصلاحياتها الخطيرة: " + crit.map(x => PERM_AR[x] || x).join("، "),
-                actorId: a?.executor?.id, actorTag: tagOf(a?.executor), targetId: n.id, targetTag: tagOf(n.user),
-                remedy: { type: "remove_role", label: "➖ سحب الرتبة منه", params: { userId: n.id, roleId: r.id } },
-            });
-        }
-    });
-
-    // ── القنوات ──
-    client.on("channelCreate", async c => {
-        if (!c.guild || c.guild.id !== G()) return;
-        const a = await findAudit(c.guild, AuditLogEvent.ChannelCreate, x => x.target?.id === c.id);
-        if (isSelf(a?.executor?.id)) return;
-        await LOGCAT({ cat: "channel", title: "إنشاء قناة", details: "القناة: " + c.name, actorId: a?.executor?.id, actorTag: tagOf(a?.executor), targetId: c.id, targetTag: c.name, data: { act: "channel_create" } });
-        if (a?.executor) await burst("mass_channel_create", a.executor.id, tagOf(a.executor));
-    });
-    client.on("channelDelete", async c => {
-        if (!c.guild || c.guild.id !== G()) return;
-        const a = await findAudit(c.guild, AuditLogEvent.ChannelDelete, x => x.target?.id === c.id);
-        if (isSelf(a?.executor?.id)) return;
-        await LOGCAT({ cat: "channel", title: "حذف قناة", details: "القناة: " + c.name, actorId: a?.executor?.id, actorTag: tagOf(a?.executor), targetId: c.id, targetTag: c.name, data: { act: "channel_delete" } });
-        if (a?.executor) await burst("mass_channel_delete", a.executor.id, tagOf(a.executor));
-    });
-
-    // ── ويبهوك ──
-    client.on("webhooksUpdate", async ch => {
-        if (!ch.guild || ch.guild.id !== G()) return;
-        const a = await findAudit(ch.guild, AuditLogEvent.WebhookCreate, null);
-        if (!a || isSelf(a.executor?.id)) return;
-        await raise({
-            cat: "webhook", rule: "webhook_created", key: "wh:" + a.target?.id, title: "إنشاء ويبهوك جديد",
-            details: "القناة: " + ch.name + "\nالاسم: " + (a.target?.name || "-"), actorId: a.executor?.id, actorTag: tagOf(a.executor), targetId: a.target?.id,
-            remedy: { type: "delete_webhook", label: "🗑️ حذف الويبهوك", params: { webhookId: a.target?.id } },
-        });
-    });
-
-    // ── إعدادات السيرفر ──
-    client.on("guildUpdate", async (o, n) => {
-        if (n.id !== G()) return;
-        const ch = [];
-        if (o.name !== n.name) ch.push("الاسم: " + o.name + " ← " + n.name);
-        if (o.icon !== n.icon) ch.push("تغيير أيقونة السيرفر");
-        if (o.vanityURLCode !== n.vanityURLCode) ch.push("تغيير الرابط المخصص");
-        if (o.verificationLevel !== n.verificationLevel) ch.push("تغيير مستوى التحقق");
-        if (!ch.length) return;
-        const a = await findAudit(n, AuditLogEvent.GuildUpdate, null);
-        if (isSelf(a?.executor?.id)) return;
-        await raise({
-            cat: "server", rule: "server_changed", key: "srv:" + (a?.executor?.id || "x"), severity: "medium", title: "تغيير إعدادات السيرفر",
-            details: ch.join("\n"), actorId: a?.executor?.id, actorTag: tagOf(a?.executor),
-        });
-    });
-
-    // ── الرسائل ──
-    client.on("messageCreate", async m => {
-        if (m.guildId !== G() || !m.author) return;
-        cacheMsg(m);
-        if (m.attachments && m.attachments.size) cacheImages(attMeta(m)).catch(() => {});
-        if (!m.author.bot && m.mentions.everyone) {
-            const arr = (everyoneHits.get(m.author.id) || []).filter(t => Date.now() - t < 600000); arr.push(Date.now()); everyoneHits.set(m.author.id, arr);
-            if (arr.length >= 3) await raise({
-                cat: "everyone", rule: "everyone_spam", key: "ev:" + m.author.id, severity: "medium", title: "تكرار منشن @everyone / @here",
-                details: arr.length + " منشن خلال 10 دقائق", actorId: m.author.id, actorTag: tagOf(m.author), count: arr.length,
-                remedy: { type: "timeout", label: "⏳ تقييد ساعة", params: { userId: m.author.id, minutes: 60 } },
-            });
-        }
-    });
-
-    client.on("messageDelete", async msg => {
-        if (msg.guildId !== G()) return;
-        const c = msgCache.get(msg.id);
-        const authorId = msg.author?.id || c?.authorId;
-        if (isSelf(authorId)) return;
-        const a = await findAudit(await getGuild(), AuditLogEvent.MessageDelete, x => x.extra?.channel?.id === msg.channelId && (!authorId || x.target?.id === authorId));
-        const exId = a?.executor?.id;
-        if (isSelf(exId)) return;
-        const probot = exId === CONFIG.PROBOT_ID;
-        const content = String(msg.content || c?.content || "").slice(0, 500);
-        const attsMeta = (msg.attachments && msg.attachments.size) ? attMeta(msg) : (c?.atts || []);
-        const ev = await LOGCAT({
-            cat: "message", title: probot ? "حذف رسالة عبر ProBot" : "حذف رسالة",
-            details: "الروم: #" + (msg.channel?.name || msg.channelId) + "\nصاحب الرسالة: " + (tagOf(msg.author) || c?.authorTag || "غير معروف") + "\nالمحتوى: " + (content || "(غير متوفر)"),
-            actorId: exId || authorId, actorTag: a ? tagOf(a.executor) : (tagOf(msg.author) || c?.authorTag),
-            targetId: authorId, targetTag: tagOf(msg.author) || c?.authorTag, data: { act: "msg_delete", probot },
-        });
-        if (ev && attsMeta.length) {
-            const imgs = await persistImages(ev._id, attsMeta);
-            if (imgs.length) { ev.data.images = imgs; ev.markModified("data"); await ev.save(); broadcastChanged(); }
-        }
-    });
-
-    client.on("messageDeleteBulk", async (msgs, channel) => {
-        if (!channel.guild || channel.guild.id !== G()) return;
-        const list = [];
-        msgs.forEach(m => {
-            const c = msgCache.get(m.id) || {};
-            list.push({
-                id: m.id, authorId: m.author?.id || c.authorId, authorTag: tagOf(m.author) || c.authorTag || "غير معروف",
-                content: String(m.content || c.content || "").slice(0, 300), att: m.attachments?.size || c.att || 0, at: m.createdTimestamp || c.at,
-                _atts: (m.attachments && m.attachments.size) ? attMeta(m) : (c.atts || []),
-            });
-        });
-        list.sort((x, y) => (x.at || 0) - (y.at || 0));
-        const a = await findAudit(channel.guild, AuditLogEvent.MessageBulkDelete, x => x.target?.id === channel.id);
-        if (isSelf(a?.executor?.id)) return;
-        const probot = a?.executor?.id === CONFIG.PROBOT_ID;
-        // من هو اللي كتب أمر المسح (رسالة الأمر تنحذف مع المسح)
-        const cmd = list.find(x => x.authorId && x.authorId !== CONFIG.PROBOT_ID && /^[-!.\/]?(clear|purge|prune|مسح|امسح)(\s|$)/i.test(x.content || ""));
-        const invokerId = cmd?.authorId || a?.executor?.id || null;
-        const invokerTag = cmd?.authorTag || tagOf(a?.executor);
-        const count = msgs.size;
-        const trimmed = list.slice(0, 200).map(({ _atts, ...rest }) => rest); // نحفظ الميتاداتا بدون الصور مؤقتاً
-        const ev = await LOGCAT({
-            cat: "message", title: (probot ? "مسح رسائل عبر ProBot" : "حذف جماعي للرسائل") + " (" + count + " رسالة)",
-            details: "الروم: #" + channel.name + (probot && cmd ? "\nنفّذ أمر المسح: " + invokerTag : "") + (probot ? "\nالمنفّذ الفعلي: ProBot" : ""),
-            actorId: invokerId, actorTag: invokerTag, count, data: { act: "bulk_delete", probot, channel: channel.name, messages: trimmed },
-        });
-        const imgsByMsgId = {};
-        const withAtts = list.slice(0, 200).filter(x => x._atts && x._atts.length);
-        if (ev && withAtts.length) {
-            for (const item of withAtts) {
-                const imgs = await persistImages(ev._id, item._atts);
-                if (imgs.length) { imgsByMsgId[item.id] = imgs; const t = ev.data.messages.find(x => x.id === item.id); if (t) t.images = imgs; }
-            }
-            ev.markModified("data"); await ev.save(); broadcastChanged();
-        }
-        if (count >= 30) {
-            const susEv = await raise({
-                cat: "message", rule: "mass_msg_delete", key: "mmd:" + (invokerId || "x"), severity: "medium", title: "مسح رسائل ضخم (" + count + " رسالة)",
-                details: "الروم: #" + channel.name + "\nالمنفّذ: " + (invokerTag || "غير معروف") + (probot ? " (عبر ProBot)" : ""), actorId: invokerId, actorTag: invokerTag,
-                count, data: { act: "mass_msg_delete", probot, messages: trimmed, channel: channel.name },
-            });
-            if (susEv && Object.keys(imgsByMsgId).length) {
-                susEv.data.messages.forEach(m => { if (imgsByMsgId[m.id]) m.images = imgsByMsgId[m.id]; });
-                susEv.markModified("data"); await susEv.save(); broadcastChanged();
-            }
-        }
-        return ev;
-    });
-
-    // ── الرومات الصوتية: دخول / خروج / انتقال ──
-    client.on("voiceStateUpdate", async (o, n) => {
-        const m = n.member || o.member;
-        if (!m || m.guild.id !== G() || m.user.bot) return;
-        const oc = o.channelId, nc = n.channelId;
-        if (oc === nc) return;
-        let title, details;
-        if (!oc && nc) { title = "دخول روم صوتي"; details = "🎙️ الروم: " + n.channel.name + "\n👥 الموجودين الآن: " + n.channel.members.size; }
-        else if (oc && !nc) { title = "خروج من روم صوتي"; details = "🎙️ الروم: " + o.channel.name + "\n👥 الموجودين الآن: " + o.channel.members.size; }
-        else { title = "انتقال بين رومات صوتية"; details = "من: " + o.channel.name + "\nإلى: " + n.channel.name; }
-        await LOGCAT({ cat: "voice", title, details, actorId: m.id, actorTag: tagOf(m.user), targetId: m.id, targetTag: tagOf(m.user), data: { act: "voice" } });
-    });
-
-    client.on("error", e => console.log("client error:", e.message));
+let presenceCache = { v: true, t: 0 };
+async function getPresence() {
+    if (Date.now() - presenceCache.t < 30000) return presenceCache.v;
+    const m = await StatMeta.findById("presence").lean();
+    presenceCache = { v: !m || m.value !== "0", t: Date.now() };
+    return presenceCache.v;
 }
-
-if (CONFIG.BOT_TOKEN) startBot();
-else console.log("⚠️ BOT_TOKEN غير موجود");
+// آخر عدد أعضاء سجّله البوت (يتحدّث مع كل دخول/خروج)
+async function liveMembers() { const d = await DailyStat.findOne().sort({ _id: -1 }).lean(); return d ? d.members : null; }
 
 // ══════════════════════════════════════════════════════════════════════════
 // 5) الموقع (Express) — تسجيل دخول ديسكورد + حماية بالرتبة
@@ -654,29 +209,19 @@ app.use(session({
     secret: CONFIG.SESSION_SECRET, resave: false, saveUninitialized: false,
     cookie: { maxAge: 7 * 864e5, httpOnly: true, sameSite: "lax", secure: "auto" },
 }));
-const wrap = fn => (req, res, next) => Promise.resolve(fn(req, res, next)).catch(e => { console.error("❌", req.method, req.path, e); if (!res.headersSent) res.status(500).json({ error: e.message || "صار خطأ بالسيرفر" }); });
+const wrap = fn => (req, res, next) => Promise.resolve(fn(req, res, next)).catch(e => { console.error("❌", req.method, req.path, e.message); if (!res.headersSent) res.status(e.status || 500).json({ error: e.message || "صار خطأ بالسيرفر" }); });
 
+// الصلاحية تجي من جدول CyberAccess اللي البوت يحدّثه لحظياً من رتب ديسكورد
 const roleCheck = new Map();
 async function stillAuthorized(uid) {
     const c = roleCheck.get(uid);
-    if (c && Date.now() - c.t < 30000) return c;
+    if (c && Date.now() - c.t < 10000) return c;
     let level = null; // 'full' | 'view' | null
-    try {
-        const g = await getGuild();
-        const m = await g.members.fetch({ user: uid });
-        const isFull = (CONFIG.LEADER_ROLE_ID && m.roles.cache.has(CONFIG.LEADER_ROLE_ID)) || (CONFIG.DEPUTY_ROLE_ID && m.roles.cache.has(CONFIG.DEPUTY_ROLE_ID));
-        const isMember = CONFIG.CYBER_ROLE_ID && m.roles.cache.has(CONFIG.CYBER_ROLE_ID);
-        level = isFull ? "full" : isMember ? "view" : null;
-    } catch { level = null; }
+    try { const d = await Access.findById(uid).lean(); level = d && d.level ? d.level : null; } catch { level = null; }
     const res = { ok: !!level, level };
     roleCheck.set(uid, { ...res, t: Date.now() });
     return res;
 }
-const levelOfMember = m => {
-    const isFull = (CONFIG.LEADER_ROLE_ID && m.roles.cache.has(CONFIG.LEADER_ROLE_ID)) || (CONFIG.DEPUTY_ROLE_ID && m.roles.cache.has(CONFIG.DEPUTY_ROLE_ID));
-    const isMember = CONFIG.CYBER_ROLE_ID && m.roles.cache.has(CONFIG.CYBER_ROLE_ID);
-    return isFull ? "full" : isMember ? "view" : null;
-};
 // يرسل حدث فوري لكل صفحات هذا الشخص المفتوحة (فصل أو تغيّر صلاحيته)
 function pushToUser(uid, event, data) {
     const line = "event: " + event + "\ndata: " + JSON.stringify(data || {}) + "\n\n";
@@ -743,8 +288,9 @@ app.get("/auth/discord/callback", wrap(async (req, res) => {
 }));
 app.get("/auth/logout", (req, res) => req.session.destroy(() => res.redirect("/")));
 
+
 // ── API: من أنا ──
-app.get("/api/me", auth, (req, res) => res.json({ user: req.session.user, presence: PRESENCE_OK }));
+app.get("/api/me", auth, wrap(async (req, res) => res.json({ user: req.session.user, presence: await getPresence() })));
 
 // ── بث فوري (SSE): يخبر الموقع إنه فيه تحديث جديد باللوق، بدون أي ريفرش للصفحة ──
 app.get("/api/events/stream", wrap(async (req, res) => {
@@ -798,73 +344,13 @@ async function panelLog(req, title, details, extra = {}) {
     await LOGCAT({ cat: "panel", title, details, actorId: req.session.user.id, actorTag: req.session.user.tag, data: { act: "panel_action" }, ...extra });
 }
 
-// ── تنفيذ العلاج (الأزرار) ──
-async function runRemedy(g, r, who) {
-    const reason = "لوحة الأمن السيبراني — " + who;
-    const p = r.params || {};
-    switch (r.type) {
-        case "kick_member": {
-            const m = await g.members.fetch(p.userId).catch(() => null);
-            if (!m) throw new Error("العضو مو موجود بالسيرفر (طلع أو انطرد)");
-            if (!m.kickable) throw new Error("ما أقدر أطرده — رتبته أعلى من البوت");
-            await m.kick(reason); return "تم الطرد";
-        }
-        case "kick_many": {
-            let ok = 0;
-            for (const id of p.userIds || []) { const m = await g.members.fetch(id).catch(() => null); if (m && m.kickable) { await m.kick(reason).catch(() => {}); ok++; } }
-            return "تم طرد " + ok + " عضو";
-        }
-        case "delete_roles": {
-            let ok = 0;
-            for (const id of p.roleIds || []) { const ro = g.roles.cache.get(id); if (ro && ro.editable) { await ro.delete(reason).catch(() => {}); ok++; } }
-            return "تم حذف " + ok + " رتبة";
-        }
-        case "delete_channels": {
-            let ok = 0;
-            for (const id of p.channelIds || []) { const c = g.channels.cache.get(id); if (c && c.deletable) { await c.delete(reason).catch(() => {}); ok++; } }
-            return "تم حذف " + ok + " قناة";
-        }
-        case "strip_roles": {
-            const m = await g.members.fetch(p.userId).catch(() => null);
-            if (!m) throw new Error("العضو مو موجود بالسيرفر");
-            const keep = m.roles.cache.filter(x => x.id === g.id || x.managed || !x.editable);
-            const removed = m.roles.cache.size - keep.size;
-            await m.roles.set(keep.map(x => x.id), reason);
-            return "تم سحب " + removed + " رتبة" + (keep.size > 1 ? " (بعض الرتب أعلى من البوت وما انسحبت)" : "");
-        }
-        case "remove_role": {
-            const m = await g.members.fetch(p.userId).catch(() => null);
-            if (!m) throw new Error("العضو مو موجود بالسيرفر");
-            await m.roles.remove(p.roleId, reason); return "تم سحب الرتبة";
-        }
-        case "revoke_perms": {
-            const ro = g.roles.cache.get(p.roleId);
-            if (!ro) throw new Error("الرتبة انحذفت");
-            if (!ro.editable) throw new Error("ما أقدر أعدّل الرتبة — أعلى من رتبة البوت");
-            const keep = ro.permissions.toArray().filter(n => !(p.perms || []).includes(n));
-            await ro.setPermissions(new PermissionsBitField(keep.map(n => P[n])), reason); return "تم سحب الصلاحيات الخطيرة";
-        }
-        case "delete_webhook": {
-            const whs = await g.fetchWebhooks();
-            const w = whs.get(p.webhookId);
-            if (!w) throw new Error("الويبهوك انحذف");
-            await w.delete(reason); return "تم حذف الويبهوك";
-        }
-        case "timeout": {
-            const m = await g.members.fetch(p.userId).catch(() => null);
-            if (!m) throw new Error("العضو مو موجود بالسيرفر");
-            if (!m.moderatable) throw new Error("ما أقدر أقيّده — رتبته أعلى من البوت");
-            await m.timeout((p.minutes || 60) * 60000, reason); return "تم التقييد";
-        }
-    }
-    throw new Error("إجراء غير معروف");
-}
+// ── تنفيذ العلاج (الأزرار) — البوت هو اللي ينفّذ ──
 app.post("/api/events/:id/remedy", auth, full, wrap(async (req, res) => {
     const e = await Event.findById(req.params.id);
     if (!e || !e.remedy) return res.status(404).json({ error: "ما فيه إجراء لهذي العملية" });
     if (e.resolved) return res.status(400).json({ error: "العملية محلولة من قبل" });
-    const g = await getGuild();
-    const msg = await runRemedy(g, e.remedy, req.session.user.tag);
+    const out = await callBot("remedy", { remedy: JSON.parse(JSON.stringify(e.remedy)), who: req.session.user.tag }, 90000);
+    const msg = out.msg;
     e.resolved = true; e.resolvedBy = req.session.user.tag; e.resolvedAt = new Date(); e.updatedAt = new Date(); await e.save();
     await panelLog(req, "تنفيذ إجراء: " + e.remedy.label.replace(/^\S+\s/, ""), "العملية: " + e.title + " — " + msg);
     res.json({ ok: true, msg });
@@ -878,57 +364,13 @@ app.post("/api/events/:id/resolve", auth, full, wrap(async (req, res) => {
 }));
 
 // ── API: البوتات ──
-const KNOWN_BOTS = [
-    [/probot/i, "بوت إدارة عام: ترحيب، حماية، مسح الرسائل (clear)، لوق، مستويات ورتب تلقائية."],
-    [/mee6/i, "بوت إدارة: مستويات، ترحيب، مودريشن، رتب تلقائية."],
-    [/dyno/i, "بوت مودريشن: عقوبات، أوامر مخصصة، رتب تلقائية، لوق."],
-    [/carl/i, "بوت رتب تفاعلية ولوق ومودريشن."],
-    [/wick/i, "بوت حماية من الغارات والسبام والحسابات الجديدة."],
-    [/ticket/i, "بوت نظام التذاكر (فتح وإغلاق تذاكر الدعم)."],
-    [/sapphire/i, "بوت إدارة: لوق، مودريشن، ترحيب، رتب تفاعلية."],
-    [/dank|owo|mudae|mimu/i, "بوت ترفيه/ألعاب واقتصاد."],
-    [/fredboat|jockie|groovy|rythm|music|hydra/i, "بوت موسيقى بالرومات الصوتية."],
-    [/discord ?servers|disboard/i, "بوت نشر وترويج السيرفر."],
-    [/giveaway/i, "بوت مسابقات وهدايا."],
-];
-function botInfo(m) {
-    const hit = KNOWN_BOTS.find(([re]) => re.test(m.user.username));
-    const perms = m.permissions.toArray();
-    const dang = perms.filter(isDanger);
-    let desc = hit ? hit[1] : "بوت غير معروف — راجع صلاحياته أدناه وتأكد إنه موثوق.";
-    if (perms.includes("Administrator")) desc += " ⚠️ عنده صلاحية مدير كاملة.";
-    return { desc, dang: dang.map(n => ({ k: n, ar: PERM_AR[n] || n, level: DANGER_LEVEL[n] })) };
-}
-async function botList() {
-    const g = await getGuild();
-    const bots = g.members.cache.filter(m => m.user.bot && m.id !== client.user.id);
-    const since = new Date(Date.now() - 864e5);
-    const acts = await Event.aggregate([
-        { $match: { actorId: { $in: [...bots.keys()] }, createdAt: { $gte: since } } },
-        { $group: { _id: { a: "$actorId", t: "$title" }, n: { $sum: 1 } } },
-    ]);
-    const actMap = {};
-    acts.forEach(x => { (actMap[x._id.a] = actMap[x._id.a] || []).push(x._id.t + " ×" + x.n); });
-    const addedBy = {};
-    (await Event.find({ rule: "bot_added", targetId: { $in: [...bots.keys()] } }).lean()).forEach(e => { addedBy[e.targetId] = e.actorTag; });
-    return bots.map(m => {
-        const st = PRESENCE_OK ? (m.presence?.status || "offline") : "unknown";
-        const info = botInfo(m);
-        return {
-            id: m.id, name: m.user.username, avatar: m.user.displayAvatarURL({ size: 64 }), status: st,
-            desc: info.desc, dang: info.dang, joinedAt: m.joinedTimestamp, addedBy: addedBy[m.id] || null,
-            activity: actMap[m.id] || [],
-        };
-    }).sort((a, b) => (b.dang.length - a.dang.length));
-}
-app.get("/api/bots", auth, wrap(async (req, res) => res.json({ bots: await botList(), presence: PRESENCE_OK })));
+app.get("/api/bots", auth, wrap(async (req, res) => {
+    const r = await callBot("bots");
+    res.json({ bots: r.bots, presence: r.presence });
+}));
 app.post("/api/bots/:id/kick", auth, full, wrap(async (req, res) => {
-    const g = await getGuild();
-    const m = await g.members.fetch(req.params.id).catch(() => null);
-    if (!m || !m.user.bot) return res.status(404).json({ error: "البوت مو موجود" });
-    if (!m.kickable) return res.status(400).json({ error: "ما أقدر أطرده — رتبته أعلى من رتبة بوت الحماية" });
-    await m.kick("لوحة الأمن السيبراني — " + req.session.user.tag);
-    await panelLog(req, "طرد بوت", "البوت: " + m.user.username, { targetId: m.id, targetTag: m.user.username });
+    const r = await callBot("bot_kick", { id: req.params.id, who: req.session.user.tag });
+    await panelLog(req, "طرد بوت", "البوت: " + r.name, { targetId: r.id, targetTag: r.name });
     res.json({ ok: true });
 }));
 
@@ -940,14 +382,6 @@ const addDays = (k, n) => new Date(keyToMs(k) + n * DAY).toISOString().slice(0, 
 const dayStart = k => new Date(keyToMs(k) - 3 * 3600e3);                                          // بداية اليوم بتوقيت الرياض
 const isKey = k => /^\d{4}-\d{2}-\d{2}$/.test(k || "") && !isNaN(keyToMs(k));
 
-let snapTimer = null;
-function scheduleSnapshot() { if (snapTimer) return; snapTimer = setTimeout(() => { snapTimer = null; snapshotMembers(); }, 5000); }
-async function snapshotMembers() {
-    try {
-        const g = await getGuild();
-        await DailyStat.updateOne({ _id: dayKeyOf(Date.now()) }, { $set: { members: g.memberCount, updatedAt: new Date() } }, { upsert: true });
-    } catch (e) { console.error("snapshot:", e.message); }
-}
 async function getEpoch() {
     let m = await StatMeta.findById("epoch").lean();
     if (m) return m.value;
@@ -1009,7 +443,7 @@ app.get("/api/stats/weeks", auth, wrap(async (req, res) => {
 app.get("/api/stats/range", auth, wrap(async (req, res) => {
     const from = String(req.query.from || ""), to = String(req.query.to || req.query.from || "");
     if (!isKey(from) || !isKey(to) || from > to || keyToMs(to) - keyToMs(from) > 62 * DAY) return res.status(400).json({ error: "تاريخ غير صحيح" });
-    const g = await getGuild(), docs = await loadStats();
+    const docs = await loadStats(), liveM = await liveMembers();
     const rangeQ = { $gte: dayStart(from), $lt: dayStart(addDays(to, 1)) };
     const evs = await Event.find({ kind: "suspicious", createdAt: rangeQ }).sort({ createdAt: -1 }).limit(2000)
         .select("title details rule severity actorTag targetTag resolved resolvedBy createdAt").lean();
@@ -1017,7 +451,7 @@ app.get("/api/stats/range", auth, wrap(async (req, res) => {
     const leaves = await Event.countDocuments({ kind: "normal", cat: { $in: ["leave", "kick", "ban"] }, createdAt: rangeQ });
     let out = {
         from, to, total: evs.length, resolved: evs.filter(e => e.resolved).length, unresolved: evs.filter(e => !e.resolved).length, byRule: countBy(evs),
-        days: dayRows(evs, docs, from, to), members: memberChange(docs, from, to, g.memberCount), joins, leaves, archived: false, truncated: evs.length > 500,
+        days: dayRows(evs, docs, from, to), members: memberChange(docs, from, to, liveM), joins, leaves, archived: false, truncated: evs.length > 500,
         ops: evs.slice(0, 500).map(e => ({ id: String(e._id), title: e.title, details: String(e.details || "").slice(0, 500), rule: e.rule, severity: e.severity,
             actor: e.actorTag, target: e.targetTag, resolved: !!e.resolved, resolvedBy: e.resolvedBy || null, createdAt: e.createdAt })),
     };
@@ -1030,228 +464,7 @@ app.get("/api/stats/range", auth, wrap(async (req, res) => {
 }));
 
 
-// ══════════════════════════════════════════════════════════════════════════
-// تعويض الفجوة: لما يرجع البوت يقرأ سجل ديسكورد الرسمي من آخر نبضة ويسجّل اللي فاته وهو طافي
-// ══════════════════════════════════════════════════════════════════════════
-const beat = () => StatMeta.updateOne({ _id: "lastAlive" }, { $set: { value: String(Date.now()) } }, { upsert: true }).catch(() => {});
-const readLastAlive = async () => { const m = await StatMeta.findById("lastAlive").lean(); return m ? Number(m.value) || 0 : 0; };
-const CATCH_MARK = "\n⏱️ رُصدت بعد رجوع البوت (فاتت وهو طافي)";
-const fmtDur = ms => { const m = Math.round(ms / 60000), d = Math.floor(m / 1440), h = Math.floor((m % 1440) / 60), mm = m % 60; return [d ? d + " يوم" : "", h ? h + " ساعة" : "", mm || (!d && !h) ? mm + " دقيقة" : ""].filter(Boolean).join(" و "); };
-const fmtTime = t => new Date(t).toLocaleString("ar-SA-u-ca-gregory-nu-latn", { timeZone: "Asia/Riyadh", dateStyle: "medium", timeStyle: "short" });
-const changeOf = (e, key) => (e.changes || []).find(c => c.key === key);
-async function alreadyLogged(f, t) {
-    const q = { createdAt: { $gte: new Date(t - 180000), $lte: new Date(t + 180000) } };
-    q["data.catchup"] = { $ne: true };   // نقارن مع اللي انسجّل لايف فقط
-    for (const k of ["cat", "targetId", "actorId", "count", "data.act"]) if (f[k]) q[k] = f[k];
-    return !!(await Event.exists(q));
-}
-// يعيد بناء الرسائل اللي انمسحت بأمر مسح (clear) من النسخة المحفوظة: اللي كانت موجودة قبل المسح وما هي موجودة الحين
-async function reconstructPurge(g, chId, purgeTs, count, claimed) {
-    if (!chId || !count) return [];
-    const cands = await MsgLog.find({ channelId: chId, at: { $lte: new Date(purgeTs + 3000), $gte: new Date(purgeTs - 14 * 864e5) } })
-        .sort({ at: -1 }).limit(Math.max(count * 3, 300)).lean();
-    const fresh = cands.filter(c => !claimed.has(c._id));
-    if (!fresh.length) return [];
-    const ch = g.channels.cache.get(chId);
-    if (!ch || !ch.messages) return [];
-    const oldest = fresh[fresh.length - 1].at.getTime();
-    const exist = new Set(); let before, okFetch = false, floor = oldest;
-    for (let i = 0; i < 12; i++) {
-        const batch = await ch.messages.fetch({ limit: 100, before }).catch(() => null);
-        if (!batch) break;
-        okFetch = true;
-        if (!batch.size) { floor = 0; break; }
-        batch.forEach(m => exist.add(m.id));
-        const last = batch.last(); before = last.id; floor = last.createdTimestamp;
-        if (last.createdTimestamp <= oldest || batch.size < 100) { floor = 0; break; }
-    }
-    if (!okFetch) return [];
-    const gone = fresh.filter(c => c.at.getTime() >= floor && !exist.has(c._id)).slice(0, count).reverse();
-    gone.forEach(c => claimed.add(c._id));
-    return gone;
-}
-async function catchUpAudit(last, opts = {}) {
-    const g = await getGuild(), now = Date.now();
-    const since = Math.max(last, now - 44 * 864e5);
-    const entries = []; let before;
-    for (let page = 0; page < 15; page++) {
-        const logs = await g.fetchAuditLogs({ limit: 100, before }).catch(() => null);
-        if (!logs || !logs.entries.size) break;
-        const arr = [...logs.entries.values()];
-        arr.forEach(e => { if (e.createdTimestamp > since) entries.push(e); });
-        const oldest = arr[arr.length - 1];
-        if (oldest.createdTimestamp <= since || arr.length < 100) break;
-        before = oldest.id;
-    }
-    entries.sort((a, b) => a.createdTimestamp - b.createdTimestamp);
-    const claimed = new Set();
-    (await Event.find({ "data.act": "bulk_delete", createdAt: { $gte: new Date(since - 864e5) } }).select("data.messages.id").lean())
-        .forEach(ev => ((ev.data && ev.data.messages) || []).forEach(x => claimed.add(x.id)));
-    const A = AuditLogEvent;
-    let n = 0;
-    for (const e of entries) {
-        const by = e.executor, byId = by && by.id;
-        if (isSelf(byId)) continue;
-        if (await Event.exists({ "data.auditId": e.id })) continue;   // انسجّلت قبل من استرجاع سابق
-        const t = e.createdTimestamp, base = { actorId: byId, actorTag: tagOf(by), createdAt: new Date(t) };
-        const tid = e.targetId || (e.target && e.target.id) || null;
-        try {
-            switch (e.action) {
-                case A.MemberKick: {
-                    if (await alreadyLogged({ cat: "kick", targetId: tid }, t)) break;
-                    await LOGCAT({ ...base, cat: "kick", title: "طرد عضو", details: "السبب: " + (e.reason || "بدون سبب") + CATCH_MARK, targetId: tid, targetTag: tagOf(e.target), data: { auditId: e.id, act: "kick", catchup: true } }); n++; break;
-                }
-                case A.MemberBanAdd: {
-                    if (await alreadyLogged({ cat: "ban", targetId: tid }, t)) break;
-                    await LOGCAT({ ...base, cat: "ban", title: "حظر عضو", details: "السبب: " + (e.reason || "بدون سبب") + CATCH_MARK, targetId: tid, targetTag: tagOf(e.target), data: { auditId: e.id, act: "ban", catchup: true } }); n++; break;
-                }
-                case A.MemberBanRemove: {
-                    if (await alreadyLogged({ cat: "ban", targetId: tid }, t)) break;
-                    await LOGCAT({ ...base, cat: "ban", title: "فك حظر عضو", details: CATCH_MARK.trim(), targetId: tid, targetTag: tagOf(e.target), data: { auditId: e.id, act: "unban", catchup: true } }); n++; break;
-                }
-                case A.BotAdd: {
-                    if (await alreadyLogged({ cat: "bot", targetId: tid }, t)) break;
-                    await raise({ ...base, cat: "bot", rule: "bot_added", key: "bot_added:" + tid, severity: "high", title: "إضافة بوت جديد للسيرفر",
-                        details: "البوت: " + (tagOf(e.target) || tid) + "\nأضافه: " + (tagOf(by) || "غير معروف") + CATCH_MARK, targetId: tid, targetTag: tagOf(e.target), data: { auditId: e.id, act: "bot_add", catchup: true },
-                        remedy: { type: "kick_member", label: "👢 طرد البوت", params: { userId: tid } } }); n++; break;
-                }
-                case A.RoleCreate: {
-                    if (await alreadyLogged({ cat: "role", targetId: tid }, t)) break;
-                    const nm = (changeOf(e, "name") || {}).new || (e.target && e.target.name) || tid;
-                    await LOGCAT({ ...base, cat: "role", title: "إنشاء رتبة", details: "الرتبة: " + nm + CATCH_MARK, targetId: tid, targetTag: nm, data: { auditId: e.id, act: "role_create", catchup: true } }); n++; break;
-                }
-                case A.RoleDelete: {
-                    if (await alreadyLogged({ cat: "role", targetId: tid }, t)) break;
-                    const nm = (changeOf(e, "name") || {}).old || (e.target && e.target.name) || tid;
-                    await LOGCAT({ ...base, cat: "role", title: "حذف رتبة", details: "الرتبة: " + nm + CATCH_MARK, targetId: tid, targetTag: nm, data: { auditId: e.id, act: "role_delete", catchup: true } }); n++; break;
-                }
-                case A.RoleUpdate: {
-                    const pc = changeOf(e, "permissions"); if (!pc) break;
-                    if (await alreadyLogged({ cat: "role", targetId: tid, actorId: byId }, t)) break;
-                    const bef = new PermissionsBitField(BigInt(pc.old || 0)).toArray(), aft = new PermissionsBitField(BigInt(pc.new || 0)).toArray();
-                    const added = aft.filter(x => !bef.includes(x)), removed = bef.filter(x => !aft.includes(x));
-                    const r = g.roles.cache.get(tid), nm = (r && r.name) || tid;
-                    await LOGCAT({ ...base, cat: "role", title: "تعديل صلاحيات رتبة",
-                        details: "الرتبة: " + nm + (added.length ? "\n➕ أضاف: " + added.map(x => PERM_AR[x] || x).join("، ") : "") + (removed.length ? "\n➖ سحب: " + removed.map(x => PERM_AR[x] || x).join("، ") : "") + CATCH_MARK,
-                        targetId: tid, targetTag: nm, data: { auditId: e.id, act: "role_perms", catchup: true } }); n++;
-                    const crit = dangerOf(added);
-                    if (crit.length && r) await raise({ ...base, cat: "role", rule: "dangerous_perm_grant", key: "dpg:" + tid, title: "منح صلاحيات خطيرة لرتبة",
-                        details: "الرتبة: " + nm + "\nالصلاحيات: " + crit.map(x => PERM_AR[x] || x).join("، ") + CATCH_MARK, targetId: tid, targetTag: nm,
-                        remedy: { type: "revoke_perms", label: "🔒 سحب الصلاحيات الخطيرة", params: { roleId: tid, perms: crit } } });
-                    break;
-                }
-                case A.MemberRoleUpdate: {
-                    const add = (changeOf(e, "$add") || {}).new || [], rem = (changeOf(e, "$remove") || {}).new || [];
-                    if (!add.length && !rem.length) break;
-                    if (await alreadyLogged({ cat: "role", targetId: tid, actorId: byId }, t)) break;
-                    await LOGCAT({ ...base, cat: "role", title: "تغيير رتب عضو",
-                        details: (add.length ? "➕ أُعطي: " + add.map(r => r.name).join("، ") : "") + (rem.length ? (add.length ? "\n" : "") + "➖ سُحب منه: " + rem.map(r => r.name).join("، ") : "") + CATCH_MARK,
-                        targetId: tid, targetTag: tagOf(e.target), data: { auditId: e.id, act: "member_roles", catchup: true } }); n++;
-                    for (const ar of add) {
-                        const r = g.roles.cache.get(ar.id); if (!r) continue;
-                        const crit = dangerOf(r.permissions.toArray());
-                        if (crit.length) await raise({ ...base, cat: "role", rule: "dangerous_role_assigned", key: "dra:" + tid + ":" + r.id, title: "إعطاء رتبة خطيرة لعضو",
-                            details: "العضو: " + (tagOf(e.target) || tid) + "\nالرتبة: " + r.name + "\nصلاحياتها الخطيرة: " + crit.map(x => PERM_AR[x] || x).join("، ") + CATCH_MARK,
-                            targetId: tid, targetTag: tagOf(e.target), remedy: { type: "remove_role", label: "➖ سحب الرتبة منه", params: { userId: tid, roleId: r.id } } });
-                    }
-                    break;
-                }
-                case A.ChannelCreate: {
-                    if (await alreadyLogged({ cat: "channel", targetId: tid }, t)) break;
-                    const nm = (changeOf(e, "name") || {}).new || (e.target && e.target.name) || tid;
-                    await LOGCAT({ ...base, cat: "channel", title: "إنشاء قناة", details: "القناة: " + nm + CATCH_MARK, targetId: tid, targetTag: nm, data: { auditId: e.id, act: "channel_create", catchup: true } }); n++; break;
-                }
-                case A.ChannelDelete: {
-                    if (await alreadyLogged({ cat: "channel", targetId: tid }, t)) break;
-                    const nm = (changeOf(e, "name") || {}).old || (e.target && e.target.name) || tid;
-                    await LOGCAT({ ...base, cat: "channel", title: "حذف قناة", details: "القناة: " + nm + CATCH_MARK, targetId: tid, targetTag: nm, data: { auditId: e.id, act: "channel_delete", catchup: true } }); n++; break;
-                }
-                case A.WebhookCreate: {
-                    if (await alreadyLogged({ cat: "webhook", targetId: tid }, t)) break;
-                    await raise({ ...base, cat: "webhook", rule: "webhook_created", key: "wh:" + tid, title: "إنشاء ويبهوك جديد",
-                        details: "الاسم: " + ((e.target && e.target.name) || "-") + CATCH_MARK, targetId: tid, data: { auditId: e.id, catchup: true },
-                        remedy: { type: "delete_webhook", label: "🗑️ حذف الويبهوك", params: { webhookId: tid } } }); n++; break;
-                }
-                case A.MessageDelete: {
-                    if (await alreadyLogged({ cat: "message", targetId: tid, actorId: byId }, t)) break;
-                    const chId = e.extra && e.extra.channel && e.extra.channel.id, cnt = (e.extra && e.extra.count) || 1;
-                    const chName = (chId && g.channels.cache.get(chId) && g.channels.cache.get(chId).name) || (e.extra && e.extra.channel && e.extra.channel.name) || chId || "؟";
-                    const probot = byId === CONFIG.PROBOT_ID;
-                    await LOGCAT({ ...base, cat: "message", title: probot ? "حذف رسالة عبر ProBot" : "حذف رسالة",
-                        details: "الروم: #" + chName + "\nصاحب الرسالة: " + (tagOf(e.target) || tid || "غير معروف") + "\nعدد الرسائل: " + cnt + "\nالمحتوى: (غير متوفر — انحذفت والبوت طافي، ديسكورد ما يحتفظ بنصها)" + CATCH_MARK,
-                        targetId: tid, targetTag: tagOf(e.target), count: cnt, data: { auditId: e.id, act: "msg_delete", probot, channel: chName, catchup: true } }); n++; break;
-                }
-                case A.MessageBulkDelete: {
-                    const cnt = (e.extra && e.extra.count) || 0;
-                    if (await alreadyLogged({ cat: "message", count: cnt, "data.act": "bulk_delete" }, t)) break;
-                    const chName = (g.channels.cache.get(tid) && g.channels.cache.get(tid).name) || (e.target && e.target.name) || tid;
-                    const probot = byId === CONFIG.PROBOT_ID;
-                    let msgs = [];
-                    try { msgs = await reconstructPurge(g, tid, t, cnt, claimed); } catch (err) { console.error("reconstruct:", err.message); }
-                    const cmd = msgs.find(x => x.authorId && x.authorId !== CONFIG.PROBOT_ID && /^[-!.\/]?(clear|purge|prune|مسح|امسح)(\s|$)/i.test(x.content || ""));
-                    const invId = (cmd && cmd.authorId) || byId, invTag = (cmd && cmd.authorTag) || tagOf(by);
-                    const lines = ["الروم: #" + chName];
-                    if (probot) lines.push("المنفّذ الفعلي: ProBot");
-                    if (cmd) lines.push("نفّذ أمر المسح: " + invTag);
-                    else if (probot) lines.push("من كتب أمر المسح: غير معروف (ديسكورد ما يسجّله ولا فيه نسخة محفوظة من أمره)");
-                    if (e.reason) lines.push("السبب: " + e.reason);
-                    lines.push(msgs.length ? "📄 تم استرجاع نص " + msgs.length + " رسالة من النسخة المحفوظة (تقديري — قد يشمل رسائل انحذفت قبل المسح)" : "نص الرسائل غير متوفر (انحذفت والبوت طافي ولا فيه نسخة محفوظة منها)");
-                    const trimmed = msgs.slice(0, 200).map(m => ({ id: m._id, authorId: m.authorId, authorTag: m.authorTag || "غير معروف", content: m.content || "", att: m.att || 0, at: m.at.getTime() }));
-                    await LOGCAT({ ...base, actorId: invId, actorTag: invTag, cat: "message", title: (probot ? "مسح رسائل عبر ProBot" : "حذف جماعي للرسائل") + " (" + cnt + " رسالة)",
-                        details: lines.join("\n") + CATCH_MARK, count: cnt, data: { auditId: e.id, act: "bulk_delete", probot, channel: chName, catchup: true, messages: trimmed } }); n++;
-                    if (cnt >= 30) await raise({ ...base, actorId: invId, actorTag: invTag, cat: "message", rule: "mass_msg_delete", key: "mmd:" + (invId || "x"), severity: "medium", title: "مسح رسائل ضخم (" + cnt + " رسالة)",
-                        details: "الروم: #" + chName + "\nالمنفّذ: " + (invTag || "غير معروف") + (probot ? " (عبر ProBot)" : "") + CATCH_MARK, count: cnt, data: { act: "mass_msg_delete", probot, channel: chName, catchup: true, messages: trimmed } });
-                    break;
-                }
-                case A.GuildUpdate: {
-                    if (!(e.changes || []).length) break;
-                    if (await alreadyLogged({ cat: "server", actorId: byId }, t)) break;
-                    await raise({ ...base, cat: "server", rule: "server_changed", key: "srv:" + (byId || "x"), severity: "medium", title: "تغيير إعدادات السيرفر",
-                        details: e.changes.map(c => "• " + c.key).join("\n") + CATCH_MARK, data: { auditId: e.id, catchup: true } }); n++; break;
-                }
-            }
-        } catch (err) { console.error("catchUp entry:", err.message); }
-    }
-    // قواعد التكرار (حظر/طرد/حذف جماعي...) على الفترة اللي فاتت
-    const ACT = { role_create: A.RoleCreate, role_delete: A.RoleDelete, channel_create: A.ChannelCreate, channel_delete: A.ChannelDelete, ban: A.MemberBanAdd, kick: A.MemberKick };
-    for (const [rk, R] of Object.entries(RULES)) {
-        const byActor = {};
-        entries.filter(e => e.action === ACT[R.action] && e.executor && !isSelf(e.executor.id)).forEach(e => (byActor[e.executor.id] = byActor[e.executor.id] || []).push(e));
-        for (const [uid, list] of Object.entries(byActor)) {
-            let grp = null;
-            for (let i = 0; i + R.limit - 1 < list.length; i++) {
-                if (list[i + R.limit - 1].createdTimestamp - list[i].createdTimestamp <= R.min * 60000) { grp = list.filter(x => x.createdTimestamp >= list[i].createdTimestamp && x.createdTimestamp - list[i].createdTimestamp <= R.min * 60000); break; }
-            }
-            if (!grp) continue;
-            const ids = grp.map(x => x.targetId || (x.target && x.target.id)).filter(Boolean);
-            const remedy = R.remedy === "delete_roles" ? { type: "delete_roles", label: "🗑️ حذف جميع الرتب (" + grp.length + ")", params: { roleIds: ids } }
-                : R.remedy === "delete_channels" ? { type: "delete_channels", label: "🗑️ حذف القنوات (" + grp.length + ")", params: { channelIds: ids } }
-                : { type: "strip_roles", label: "🚫 سحب جميع رتبه", params: { userId: uid } };
-            await raise({ rule: rk, key: rk + ":" + uid, cat: R.cat, title: R.title, severity: "high", details: "المنفذ نفّذ " + grp.length + " عملية متتالية" + CATCH_MARK,
-                actorId: uid, actorTag: tagOf(grp[0].executor), count: grp.length, remedy, createdAt: new Date(grp[grp.length - 1].createdTimestamp), data: { catchup: true } });
-            n++;
-        }
-    }
-    // أعضاء دخلوا وهو طافي (اللي لسا بالسيرفر — اللي دخل وطلع ما نقدر نعرفه)
-    for (const m of g.members.cache.values()) {
-        if (!m.joinedTimestamp || m.joinedTimestamp <= since || m.user.bot) continue;
-        try {
-            if (await alreadyLogged({ cat: "join", targetId: m.id }, m.joinedTimestamp)) continue;
-            const ageDays = Math.floor((m.joinedTimestamp - m.user.createdTimestamp) / 864e5);
-            const jb = { cat: "join", targetId: m.id, targetTag: tagOf(m.user), createdAt: new Date(m.joinedTimestamp), data: { act: "join", ageDays, created: m.user.createdTimestamp, bot: false, catchup: true } };
-            const lines = "📅 عمر الحساب وقت الدخول: " + ageDays + " يوم\n📨 الداعي: غير معروف" + CATCH_MARK;
-            if (ageDays < CONFIG.YOUNG_ACCOUNT_DAYS && now - m.joinedTimestamp < 7 * 864e5) await raise({ ...jb, rule: "new_account", key: "new_account:" + m.id, severity: "medium", title: "دخول حساب جديد (أقل من شهر)", details: lines, remedy: { type: "kick_member", label: "👢 طرد", params: { userId: m.id } } });
-            else await LOGCAT({ ...jb, title: "دخول عضو", details: lines });
-            n++;
-        } catch (err) { console.error("catchUp join:", err.message); }
-    }
-    if (!opts.manual && now - last >= 120000) {
-        await LOGCAT({ cat: "server", title: "البوت كان طافي", data: { act: "bot_downtime", catchup: true },
-            details: "من " + fmtTime(last) + " إلى " + fmtTime(now) + " (" + fmtDur(now - last) + ")\nتم استرجاع " + n + " عملية من سجل ديسكورد.\nملاحظة: الرسائل المحذوفة والمنشنات والدخول/الخروج العادي ما تنسترجع." });
-    }
-    console.log("⏱️ تعويض الفجوة: " + n + " عملية");
-    return n;
-}
+// ── استرجاع الفائت من سجل ديسكورد (البوت هو اللي يقرأ السجل) ──
 let catchRunning = false;
 app.post("/api/catchup", auth, full, wrap(async (req, res) => {
     let hours = parseInt(req.body.hours, 10) || 0;
@@ -1264,16 +477,9 @@ app.post("/api/catchup", auth, full, wrap(async (req, res) => {
     if (catchRunning) return res.status(409).json({ error: "فيه استرجاع شغّال الحين، انتظر يخلص" });
     catchRunning = true;
     try {
-        const runStart = new Date();
-        const n = await catchUpAudit(Date.now() - hours * 3600e3, { manual: true });
-        const list = await Event.find({ "data.catchup": true, updatedAt: { $gte: runStart } }).sort({ createdAt: -1 }).limit(300)
-            .select("kind cat title details severity resolved actorTag targetTag createdAt count data.act data.probot data.channel").lean();
-        const pbl = list.filter(e => e.data && e.data.probot), pbCh = {};
-        pbl.forEach(e => { const k = e.data.channel || "؟"; (pbCh[k] = pbCh[k] || { channel: k, ops: 0, messages: 0 }); pbCh[k].ops++; pbCh[k].messages += (e.count || 1); });
-        const probotSum = { ops: pbl.length, messages: pbl.reduce((a, e) => a + (e.count || 1), 0), byChannel: Object.values(pbCh).sort((x, y) => y.messages - x.messages) };
-        await panelLog(req, "استرجاع الفائت من سجل ديسكورد", "المدة: آخر " + hours + " ساعة\nالمسترجع: " + list.length + " عملية");
-        res.json({ ok: true, n: list.length, hours, probot: probotSum, events: list.map(e => ({ id: String(e._id), probot: !!(e.data && e.data.probot), hasMsgs: !!(e.data && e.data.act === "bulk_delete"), kind: e.kind, cat: e.cat, title: e.title, details: String(e.details || "").slice(0, 400),
-            severity: e.severity, resolved: !!e.resolved, actor: e.actorTag, target: e.targetTag, createdAt: e.createdAt })) });
+        const out = await callBot("catchup", { hours }, 600000);
+        await panelLog(req, "استرجاع الفائت من سجل ديسكورد", "المدة: آخر " + hours + " ساعة\nالمسترجع: " + out.n + " عملية");
+        res.json({ ok: true, n: out.n, hours, probot: out.probot, events: out.events });
     } finally { catchRunning = false; }
 }));
 
@@ -1289,160 +495,104 @@ app.get("/api/stats", auth, wrap(async (req, res) => {
         const d = days.find(x => x.d === dayKey(e.createdAt)); if (d) d.n++;
         byRule[e.rule || "other"] = (byRule[e.rule || "other"] || 0) + 1;
     });
-    const bots = await botList();
+    let bl;
+    try { bl = await callBot("bots"); }
+    catch (e) { bl = { bots: [], presence: await getPresence(), members: await liveMembers() }; }   // البوت طافي — نكمل بالباقي من القاعدة
+    const bots = bl.bots;
     const online = bots.filter(b => b.status !== "offline" && b.status !== "unknown");
     const offline = bots.filter(b => b.status === "offline");
-    const g = await getGuild();
     res.json({
         week: sus.length, unresolved: sus.filter(e => !e.resolved).length, resolved: sus.filter(e => e.resolved).length,
         today: (() => { const t = sus.filter(e => dayKey(e.createdAt) === dayKey(Date.now())); return { total: t.length, resolved: t.filter(e => e.resolved).length, unresolved: t.filter(e => !e.resolved).length }; })(),
-        days, byRule, members: g.memberCount, presence: PRESENCE_OK,
+        days, byRule, members: bl.members, presence: bl.presence,
         bots: { total: bots.length, online: online.map(b => ({ id: b.id, name: b.name, status: b.status })), offline: offline.map(b => ({ id: b.id, name: b.name })) },
     });
 }));
 
-// ── API: صلاحيات السيرفر ──
-app.get("/api/perms/meta", auth, (req, res) => res.json({ role: permMeta(ROLE_PERMS), channel: permMeta(CHANNEL_PERMS) }));
-app.get("/api/perms/roles", auth, wrap(async (req, res) => {
-    const g = await getGuild();
-    const roles = [...g.roles.cache.values()].sort((a, b) => b.position - a.position).map(r => {
-        const perms = r.permissions.toArray();
-        return { id: r.id, name: r.name, color: r.hexColor, members: r.members.size, perms, dang: perms.filter(isDanger), editable: r.editable && !r.managed, managed: r.managed, everyone: r.id === g.id };
-    });
-    res.json({ roles });
-}));
-app.get("/api/perms/roles/:id/members", auth, wrap(async (req, res) => {
-    const g = await getGuild();
-    const r = g.roles.cache.get(req.params.id);
-    if (!r) return res.status(404).json({ error: "الرتبة مو موجودة" });
-    await g.members.fetch().catch(() => {});
-    const all = r.id === g.id ? [...g.members.cache.values()] : [...g.members.cache.filter(m => m.roles.cache.has(r.id)).values()];
-    const members = all.sort((a, b) => (a.user.bot - b.user.bot) || (a.displayName || "").localeCompare(b.displayName || ""))
-        .slice(0, 5000).map(m => ({
-            id: m.id, name: m.displayName, tag: tagOf(m.user), avatar: m.user.displayAvatarURL({ size: 64 }), bot: m.user.bot,
-            username: m.user.username, global: m.user.globalName || m.user.username, nick: m.nickname || "", server: m.displayName || m.user.username,
-        }));
-    res.json({ role: { id: r.id, name: r.name }, total: all.length, members });
-}));
-app.put("/api/perms/roles/:id", auth, full, wrap(async (req, res) => {
-    const g = await getGuild();
-    const r = g.roles.cache.get(req.params.id);
-    if (!r) return res.status(404).json({ error: "الرتبة مو موجودة" });
-    if (!r.editable || r.managed) return res.status(400).json({ error: "ما أقدر أعدّل هذي الرتبة — أعلى من رتبة البوت أو رتبة بوت" });
-    const perms = (req.body.perms || []).filter(n => ROLE_PERMS.includes(n));
-    const before = r.permissions.toArray();
-    await r.setPermissions(new PermissionsBitField(perms.map(n => P[n])), "لوحة الأمن السيبراني — " + req.session.user.tag);
-    const add = perms.filter(n => !before.includes(n)), rem = before.filter(n => !perms.includes(n));
-    await panelLog(req, "تعديل صلاحيات رتبة", "الرتبة: " + r.name + (add.length ? "\n➕ " + add.map(n => PERM_AR[n] || n).join("، ") : "") + (rem.length ? "\n➖ " + rem.map(n => PERM_AR[n] || n).join("، ") : ""), { targetId: r.id, targetTag: r.name });
-    res.json({ ok: true });
-}));
-app.get("/api/perms/members", auth, wrap(async (req, res) => {
-    const g = await getGuild();
-    await g.members.fetch().catch(() => {});
-    const all = [...g.members.cache.values()].sort((a, b) => (b.roles.highest.position - a.roles.highest.position) || (a.displayName || "").localeCompare(b.displayName || ""));
-    const members = all.slice(0, 5000).map(m => ({
-        id: m.id, avatar: m.user.displayAvatarURL({ size: 64 }), bot: m.user.bot, tag: tagOf(m.user),
-        username: m.user.username, global: m.user.globalName || m.user.username, nick: m.nickname || "", server: m.displayName || m.user.username,
-        roles: [...m.roles.cache.keys()].filter(id => id !== g.id), editable: m.manageable,
-    }));
-    res.json({ members, total: all.length });
-}));
-app.put("/api/perms/members/:id/roles", auth, full, wrap(async (req, res) => {
-    const g = await getGuild();
-    const m = await g.members.fetch(req.params.id).catch(() => null);
-    if (!m) return res.status(404).json({ error: "العضو مو موجود بالسيرفر" });
-    if (!m.manageable) return res.status(400).json({ error: "ما أقدر أعدّل رتب هذا الشخص — رتبته أعلى من رتبة البوت أو هو مالك السيرفر" });
-    const ok = r => r && r.id !== g.id && r.editable && !r.managed;
-    const pick = ids => (Array.isArray(ids) ? ids : []).map(id => g.roles.cache.get(String(id))).filter(ok);
-    const add = pick(req.body.add).filter(r => !m.roles.cache.has(r.id));
-    const rem = pick(req.body.remove).filter(r => m.roles.cache.has(r.id));
-    if (!add.length && !rem.length) return res.status(400).json({ error: "ما فيه تغيير أو الرتب أعلى من رتبة البوت" });
-    const reason = "لوحة الأمن السيبراني — " + req.session.user.tag;
-    if (add.length) await m.roles.add(add, reason);
-    if (rem.length) await m.roles.remove(rem, reason);
-    roleCheck.delete(m.id);
-    await panelLog(req, "تعديل رتب عضو", "العضو: " + tagOf(m.user) + (add.length ? "\n➕ " + add.map(r => r.name).join("، ") : "") + (rem.length ? "\n➖ " + rem.map(r => r.name).join("، ") : ""), { targetId: m.id, targetTag: tagOf(m.user) });
-    res.json({ ok: true });
-}));
-const chIcon = t => ({ 0: "💬", 2: "🔊", 4: "📁", 5: "📢", 13: "🎙️", 15: "🗂️" }[t] || "#");
-app.get("/api/perms/channels", auth, wrap(async (req, res) => {
-    const g = await getGuild();
-    const chans = [...g.channels.cache.values()].filter(c => c.permissionOverwrites).sort((a, b) => a.rawPosition - b.rawPosition).map(c => {
-        const ov = [...c.permissionOverwrites.cache.values()].map(o => {
-            const allow = new PermissionsBitField(o.allow).toArray().filter(n => CHANNEL_PERMS.includes(n));
-            const deny = new PermissionsBitField(o.deny).toArray().filter(n => CHANNEL_PERMS.includes(n));
-            const name = o.type === 0 ? (g.roles.cache.get(o.id)?.name || o.id) : (g.members.cache.get(o.id)?.user.username || o.id);
-            return { id: o.id, type: o.type === 0 ? "role" : "member", name, allow, deny, dang: allow.filter(isDanger) };
-        }).sort((a, b) => b.dang.length - a.dang.length);
-        return { id: c.id, name: c.name, icon: chIcon(c.type), parent: c.parent?.name || null, overwrites: ov, hasDanger: ov.some(o => o.dang.length) };
-    });
-    res.json({ channels: chans });
-}));
-app.put("/api/perms/channels/:id/:tid", auth, full, wrap(async (req, res) => {
-    const g = await getGuild();
-    const c = g.channels.cache.get(req.params.id);
-    if (!c || !c.permissionOverwrites) return res.status(404).json({ error: "القناة مو موجودة" });
-    const allow = req.body.allow || [], deny = req.body.deny || [];
-    const obj = {};
-    CHANNEL_PERMS.forEach(n => { obj[n] = allow.includes(n) ? true : deny.includes(n) ? false : null; });
-    await c.permissionOverwrites.edit(req.params.tid, obj, { reason: "لوحة الأمن السيبراني — " + req.session.user.tag });
-    await panelLog(req, "تعديل صلاحيات قناة", "القناة: #" + c.name + "\nالهدف: " + (req.body.name || req.params.tid), { targetId: c.id, targetTag: c.name });
-    res.json({ ok: true });
-}));
 
+// ── API: صلاحيات السيرفر (القراءة والتعديل عن طريق البوت) ──
+app.get("/api/perms/meta", auth, (req, res) => res.json({ role: permMeta(ROLE_PERMS), channel: permMeta(CHANNEL_PERMS) }));
+app.get("/api/perms/roles", auth, wrap(async (req, res) => res.json(await callBot("roles"))));
+app.get("/api/perms/roles/:id/members", auth, wrap(async (req, res) => res.json(await callBot("role_members", { id: req.params.id }, 60000))));
+app.put("/api/perms/roles/:id", auth, full, wrap(async (req, res) => {
+    const r = await callBot("role_update", { id: req.params.id, perms: req.body.perms || [], who: req.session.user.tag });
+    await panelLog(req, "تعديل صلاحيات رتبة", "الرتبة: " + r.name + (r.add.length ? "\n➕ " + r.add.map(n => PERM_AR[n] || n).join("، ") : "") + (r.rem.length ? "\n➖ " + r.rem.map(n => PERM_AR[n] || n).join("، ") : ""), { targetId: r.id, targetTag: r.name });
+    res.json({ ok: true });
+}));
+app.get("/api/perms/members", auth, wrap(async (req, res) => res.json(await callBot("perm_members", {}, 60000))));
+app.put("/api/perms/members/:id/roles", auth, full, wrap(async (req, res) => {
+    const r = await callBot("member_roles", { id: req.params.id, add: req.body.add, remove: req.body.remove, who: req.session.user.tag });
+    roleCheck.delete(r.id);
+    await panelLog(req, "تعديل رتب عضو", "العضو: " + r.tag + (r.add.length ? "\n➕ " + r.add.join("، ") : "") + (r.rem.length ? "\n➖ " + r.rem.join("، ") : ""), { targetId: r.id, targetTag: r.tag });
+    res.json({ ok: true });
+}));
+app.get("/api/perms/channels", auth, wrap(async (req, res) => res.json(await callBot("channels", {}, 60000))));
+app.put("/api/perms/channels/:id/:tid", auth, full, wrap(async (req, res) => {
+    const r = await callBot("channel_edit", { id: req.params.id, tid: req.params.tid, allow: req.body.allow || [], deny: req.body.deny || [], who: req.session.user.tag });
+    await panelLog(req, "تعديل صلاحيات قناة", "القناة: #" + r.name + "\nالهدف: " + (req.body.name || req.params.tid), { targetId: r.id, targetTag: r.name });
+    res.json({ ok: true });
+}));
 app.delete("/api/perms/channels/:id/:tid", auth, full, wrap(async (req, res) => {
-    const g = await getGuild();
-    const c = g.channels.cache.get(req.params.id);
-    if (!c || !c.permissionOverwrites) return res.status(404).json({ error: "القناة مو موجودة" });
-    const ow = c.permissionOverwrites.cache.get(req.params.tid);
-    if (!ow) return res.status(404).json({ error: "ما فيه صلاحيات خاصة لهذا الهدف في القناة (يمكن انحذفت من قبل)" });
-    const isRole = ow.type === 0;
-    const name = isRole ? (g.roles.cache.get(ow.id)?.name || ow.id) : (g.members.cache.get(ow.id)?.user.username || ow.id);
-    try { await c.permissionOverwrites.delete(req.params.tid, "لوحة الأمن السيبراني — " + req.session.user.tag); }
-    catch (e) { return res.status(400).json({ error: "ما قدرت أحذفها — تأكد إن البوت عنده صلاحية إدارة القنوات والرتب ورتبته أعلى (" + e.message + ")" }); }
-    await panelLog(req, "حذف صلاحيات من قناة", "القناة: #" + c.name + "\nالمحذوف: " + name + (isRole ? " (رتبة)" : " (عضو)"), { targetId: c.id, targetTag: c.name });
+    const r = await callBot("channel_ow_delete", { id: req.params.id, tid: req.params.tid, who: req.session.user.tag });
+    await panelLog(req, "حذف صلاحيات من قناة", "القناة: #" + r.name + "\nالمحذوف: " + r.target + (r.isRole ? " (رتبة)" : " (عضو)"), { targetId: r.id, targetTag: r.name });
     res.json({ ok: true });
 }));
 
 // ── API: أعضاء الأمن السيبراني (للقائد والنائب فقط) ──
 app.get("/api/members", auth, full, wrap(async (req, res) => {
-    const g = await getGuild();
-    await g.members.fetch().catch(() => {});
-    const roleIds = [CONFIG.LEADER_ROLE_ID, CONFIG.DEPUTY_ROLE_ID, CONFIG.CYBER_ROLE_ID].filter(Boolean);
-    const list = g.members.cache.filter(m => !m.user.bot && roleIds.some(r => m.roles.cache.has(r)));
-    const panelDocs = await PanelMember.find({ _id: { $in: [...list.keys()] } }).lean();
+    const r = await callBot("members", { meId: req.session.user.id }, 60000);
+    const panelDocs = await PanelMember.find({ _id: { $in: r.members.map(m => m.id) } }).lean();
     const panelMap = {}; panelDocs.forEach(d => panelMap[d._id] = d);
-    const rankOf = m => (CONFIG.LEADER_ROLE_ID && m.roles.cache.has(CONFIG.LEADER_ROLE_ID)) ? "leader"
-        : (CONFIG.DEPUTY_ROLE_ID && m.roles.cache.has(CONFIG.DEPUTY_ROLE_ID)) ? "deputy" : "member";
-    const out = [...list.values()].map(m => {
+    const out = r.members.map(m => {
         const p = panelMap[m.id];
         const durationMin = (p && p.lastLoginAt && p.lastSeenAt) ? Math.max(1, Math.round((new Date(p.lastSeenAt) - new Date(p.lastLoginAt)) / 60000)) : null;
-        return {
-            id: m.id, tag: tagOf(m.user), avatar: m.user.displayAvatarURL({ size: 64 }), rank: rankOf(m),
-            lastLoginAt: p?.lastLoginAt || null, lastSeenAt: p?.lastSeenAt || null, durationMin,
-        };
+        return { id: m.id, tag: m.tag, avatar: m.avatar, rank: m.rank, lastLoginAt: p?.lastLoginAt || null, lastSeenAt: p?.lastSeenAt || null, durationMin };
     }).sort((a, b) => {
-        const w = r => r === "leader" ? 0 : r === "deputy" ? 1 : 2;
+        const w = x => x === "leader" ? 0 : x === "deputy" ? 1 : 2;
         return w(a.rank) - w(b.rank) || (b.lastLoginAt ? new Date(b.lastLoginAt).getTime() : 0) - (a.lastLoginAt ? new Date(a.lastLoginAt).getTime() : 0);
     });
-    const me = g.members.cache.get(req.session.user.id);
-    res.json({ members: out, meRank: me ? rankOf(me) : "member" });
+    res.json({ members: out, meRank: r.meRank });
 }));
 app.post("/api/members/:id/dismiss", auth, full, wrap(async (req, res) => {
     if (req.params.id === req.session.user.id) return res.status(400).json({ error: "ما تقدر تفصل نفسك" });
-    const g = await getGuild();
-    const m = await g.members.fetch(req.params.id).catch(() => null);
-    if (!m) return res.status(404).json({ error: "العضو مو موجود بالسيرفر" });
-    const toRemove = [CONFIG.CYBER_ROLE_ID, CONFIG.LEADER_ROLE_ID, CONFIG.DEPUTY_ROLE_ID].filter(id => id && m.roles.cache.has(id));
-    if (!toRemove.length) return res.status(400).json({ error: "ما عنده رتب الأمن السيبراني أصلاً" });
-    const actor = await g.members.fetch(req.session.user.id).catch(() => null);
-    const actorIsLeader = !!(actor && CONFIG.LEADER_ROLE_ID && actor.roles.cache.has(CONFIG.LEADER_ROLE_ID));
-    if (CONFIG.LEADER_ROLE_ID && m.roles.cache.has(CONFIG.LEADER_ROLE_ID) && !actorIsLeader) return res.status(403).json({ error: "النائب ما يقدر يفصل القائد" });
-    await m.roles.remove(toRemove, "فصل من الأمن السيبراني — لوحة الأمن السيبراني — " + req.session.user.tag);
-    applyAccess(m.id, null); // يظهر له فوراً إنه مفصول إذا كان فاتح الموقع
-    await panelLog(req, "فصل من الأمن السيبراني", "العضو: " + tagOf(m.user), { targetId: m.id, targetTag: tagOf(m.user) });
+    const r = await callBot("dismiss", { id: req.params.id, actorId: req.session.user.id, who: req.session.user.tag });
+    applyAccess(r.id, null); // يظهر له فوراً إنه مفصول إذا كان فاتح الموقع
+    await panelLog(req, "فصل من الأمن السيبراني", "العضو: " + r.tag, { targetId: r.id, targetTag: r.tag });
     res.json({ ok: true });
 }));
+
+// ══════════════════════════════════════════════════════════════════════════
+// مراقبة إشارات البوت من القاعدة: تحديث اللوق لحظياً + تغيّر صلاحيات الأعضاء
+// ══════════════════════════════════════════════════════════════════════════
+let sigInit = false, lastChanged = null, lastAccessPulse = null, sigBusy = false;
+const accessSeen = new Map();
+async function syncAccessFromDb() {
+    const docs = await Access.find().lean();
+    const now = new Map(docs.map(d => [d._id, d.level || null]));
+    if (sigInit) for (const [uid, lv] of now) { if ((accessSeen.has(uid) ? accessSeen.get(uid) : null) !== lv) applyAccess(uid, lv); }
+    accessSeen.clear(); now.forEach((v, k) => accessSeen.set(k, v));
+}
+async function pollBotSignals() {
+    if (sigBusy) return;
+    sigBusy = true;
+    try {
+        const ms = await StatMeta.find({ _id: { $in: ["changed", "accessChanged"] } }).lean();
+        const val = id => { const m = ms.find(x => x._id === id); return m ? m.value : null; };
+        const ch = val("changed"), ac = val("accessChanged");
+        if (sigInit && ch !== lastChanged) broadcastChanged();
+        lastChanged = ch;
+        if (!sigInit || ac !== lastAccessPulse) { lastAccessPulse = ac; await syncAccessFromDb(); }
+        sigInit = true;
+    } catch (e) { console.error("pollBotSignals:", e.message); }
+    finally { sigBusy = false; }
+}
+function startSiteJobs() {
+    setInterval(pollBotSignals, 1500);
+    pollBotSignals();
+    // أرشفة الأسابيع المكتملة (كانت تتم من البوت — الحين من الموقع)
+    setTimeout(archiveWeeks, 8000);
+    setInterval(archiveWeeks, 15 * 60 * 1000);
+}
 
 // ══════════════════════════════════════════════════════════════════════════
 // 6) الواجهة (نفس تصميم موقع فلاش: نفس الألوان والأزرار والخط)
@@ -2146,4 +1296,5 @@ app.use((err, req, res, next) => {
 process.on("unhandledRejection", e => console.error("❌ Unhandled Rejection:", e));
 process.on("uncaughtException", e => console.error("❌ Uncaught Exception:", e));
 
+startSiteJobs();
 app.listen(CONFIG.PORT, "0.0.0.0", () => console.log("🚀 " + CONFIG.SITE_NAME + " running on port " + CONFIG.PORT));
