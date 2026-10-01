@@ -307,6 +307,7 @@ function attachHandlers() {
         try {
             let last = await readLastAlive();
             if (!last) { const ne = await Event.findOne().sort({ createdAt: -1 }).select("createdAt").lean(); if (ne) last = new Date(ne.createdAt).getTime(); }
+            if (last && Date.now() - last >= 120000) await StatMeta.updateOne({ _id: "lastGap" }, { $set: { value: String(last) } }, { upsert: true }).catch(() => {});
             await beat();
             clearInterval(global.__beatTimer);
             global.__beatTimer = setInterval(beat, 30000);
@@ -752,8 +753,9 @@ app.get("/api/images/:id", auth, wrap(async (req, res) => {
 // ── API: اللوق ──
 const escRe = s => s.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
 app.get("/api/events", auth, wrap(async (req, res) => {
-    const { q, cat, unres, before } = req.query;
+    const { q, cat, unres, before, cu } = req.query;
     const f = {};
+    if (cu === "1") f["data.catchup"] = true;
     if (cat === "sus") f.kind = "suspicious";
     else if (cat === "newacc") f.rule = "new_account";
     else if (cat === "probot") f["data.probot"] = true;
@@ -1190,13 +1192,23 @@ async function catchUpAudit(last, opts = {}) {
 }
 let catchRunning = false;
 app.post("/api/catchup", auth, full, wrap(async (req, res) => {
-    const hours = Math.min(Math.max(parseInt(req.body.hours, 10) || 24, 1), 24 * 44);
+    let hours = parseInt(req.body.hours, 10) || 0;
+    if (!hours) {
+        hours = 24;
+        const gm = await StatMeta.findById("lastGap").lean(), gs = gm ? Number(gm.value) : 0;
+        if (gs && Date.now() - gs <= 7 * 864e5) hours = Math.max(hours, Math.ceil((Date.now() - gs) / 3600e3) + 1);
+    }
+    hours = Math.min(Math.max(hours, 1), 24 * 44);
     if (catchRunning) return res.status(409).json({ error: "فيه استرجاع شغّال الحين، انتظر يخلص" });
     catchRunning = true;
     try {
+        const runStart = new Date();
         const n = await catchUpAudit(Date.now() - hours * 3600e3, { manual: true });
-        await panelLog(req, "استرجاع الفائت من سجل ديسكورد", "المدة: آخر " + hours + " ساعة\nالمسترجع: " + n + " عملية");
-        res.json({ ok: true, n });
+        const list = await Event.find({ "data.catchup": true, updatedAt: { $gte: runStart } }).sort({ createdAt: -1 }).limit(300)
+            .select("kind cat title details severity resolved actorTag targetTag createdAt").lean();
+        await panelLog(req, "استرجاع الفائت من سجل ديسكورد", "المدة: آخر " + hours + " ساعة\nالمسترجع: " + list.length + " عملية");
+        res.json({ ok: true, n: list.length, hours, events: list.map(e => ({ kind: e.kind, cat: e.cat, title: e.title, details: String(e.details || "").slice(0, 400),
+            severity: e.severity, resolved: !!e.resolved, actor: e.actorTag, target: e.targetTag, createdAt: e.createdAt })) });
     } finally { catchRunning = false; }
 }));
 
@@ -1523,7 +1535,7 @@ function loginPage(mode) {
 
 const CLIENT = String.raw`
 var PAGES=[['logs','📜 اللوق'],['stats','📊 الإحصائيات'],['bots','🤖 البوتات'],['perms','🔐 صلاحيات السيرفر']];
-var S={page:'logs',q:'',cat:'',unres:false,events:[],sig:'',timer:null,permsTab:'roles',permsView:'danger',permsQ:'',meta:null,presence:true,level:'view',meId:null};
+var S={page:'logs',q:'',cat:'',unres:false,cu:false,events:[],sig:'',timer:null,permsTab:'roles',permsView:'danger',permsQ:'',meta:null,presence:true,level:'view',meId:null};
 var CATS=[['','الكل'],['sus','⚠️ العمليات المشبوهة'],['newacc','🆕 حسابات جديدة'],['join','دخول'],['leave','خروج'],['kick','طرد'],['ban','حظر'],['role','الرتب'],['channel','القنوات'],['voice','🎙️ الرومات الصوتية'],['message','الرسائل المحذوفة'],['probot','🧹 حذف عبر ProBot'],['bot','البوتات'],['webhook','ويبهوكس'],['everyone','منشن everyone'],['server','إعدادات السيرفر'],['panel','عمليات اللوحة']];
 var RULE_AR={new_account:'حساب جديد',mass_roles_created:'رتب جماعية',mass_role_delete:'حذف رتب',mass_channel_create:'إنشاء قنوات',mass_channel_delete:'حذف قنوات',mass_ban:'حظر جماعي',mass_kick:'طرد جماعي',dangerous_perm_grant:'صلاحيات خطيرة',dangerous_role_assigned:'رتبة خطيرة',bot_added:'بوت جديد',webhook_created:'ويبهوك',everyone_spam:'منشن everyone',mass_join:'غارة دخول',mass_msg_delete:'مسح ضخم',server_changed:'إعدادات السيرفر'};
 function $(id){return document.getElementById(id);}
@@ -1569,12 +1581,32 @@ function render(){var f={logs:pgLogs,stats:pgStats,bots:pgBots,perms:pgPerms,mem
 /* ══ اللوق ══ */
 function openBackfill(){
   modal('<h3>🔄 استرجاع الفائت من سجل ديسكورد</h3><p class="muted" style="line-height:1.9;font-size:13px">يقرأ سجل ديسكورد الرسمي ويضيف للوق اللي ما انسجّل وقت ما كان البوت طافي. اللي موجود أصلاً ما يتكرر.<br>⚠️ نص الرسائل المحذوفة ما يرجع (ديسكورد ما يحتفظ به)، لكن يتسجّل من حذف وفي أي روم وكم رسالة.</p>'
-   +'<div class="row" style="justify-content:flex-start;flex-wrap:wrap;margin-top:10px">'+[[6,'آخر 6 ساعات'],[12,'آخر 12 ساعة'],[24,'آخر 24 ساعة'],[72,'آخر 3 أيام'],[168,'آخر أسبوع'],[720,'آخر 30 يوم']].map(function(x){return '<button class="btn sm" onclick="runBackfill('+x[0]+')">'+x[1]+'</button>';}).join('')
+   +'<p style="margin:10px 0 6px;font-weight:bold">اختر المدة:</p><div class="row" style="justify-content:flex-start;flex-wrap:wrap">'
+   +[[6,'آخر 6 ساعات'],[12,'آخر 12 ساعة'],[24,'آخر 24 ساعة'],[72,'آخر 3 أيام'],[168,'آخر أسبوع'],[720,'آخر 30 يوم']].map(function(x){return '<button class="btn sm" onclick="runBackfill('+x[0]+')">'+x[1]+'</button>';}).join('')
    +'</div><div class="row" style="justify-content:flex-start;margin-top:14px"><button class="btn gray" onclick="closeModal()">إغلاق</button></div>');
 }
 async function runBackfill(h){
-  modal('<h3>🔄 جاري الاسترجاع...</h3><div class="card center muted">ممكن ياخذ دقيقة، لا تسكّر الصفحة</div>');
-  try{var j=await api('/api/catchup',{method:'POST',body:JSON.stringify({hours:h})});closeModal();toast('تم استرجاع '+j.n+' عملية');if(S.page==='logs')loadEvents();}catch(e){closeModal();toast(e.message);}
+  modal('<h3>🔄 جاري استرجاع الفائت...</h3><div class="card center muted">يقرأ سجل ديسكورد، ممكن ياخذ دقيقة — لا تسكّر الصفحة</div>');
+  try{
+    var j=await api('/api/catchup',{method:'POST',body:JSON.stringify({hours:h})});
+    var sevAr={high:'خطير',medium:'متوسط',low:'منخفض'};
+    var list=j.events.map(function(e){
+      return '<div class="card" style="margin:8px 0;padding:12px"><div class="log-title"><span>'+esc(e.title)+'</span>'
+       +(e.kind==='suspicious'?'<span class="badge '+esc(e.severity)+'">⚠️ مشبوهة — '+(sevAr[e.severity]||esc(e.severity))+'</span>':'')+'</div>'
+       +(e.details?'<div class="log-det">'+esc(e.details)+'</div>':'')
+       +'<div class="log-meta">🕒 '+fmt(e.createdAt)+(e.actor?' &nbsp;•&nbsp; 👤 '+esc(e.actor):'')+(e.target?' &nbsp;•&nbsp; 🎯 '+esc(e.target):'')+'</div></div>';
+    }).join('')||'<div class="card center muted">ما فيه شي ناقص — كل اللي في سجل ديسكورد مسجّل أصلاً.<br>اللي استرجعته قبل تقدر تشوفه من اللوق (فلتر 🔄 المسترجعة فقط).</div>';
+    modal('<h3>🔄 العمليات المسترجعة ('+j.n+')</h3><p class="muted" style="font-size:12px;margin-bottom:6px">المدة: آخر '+j.hours+' ساعة'+(j.n>=300?' — معروض أحدث 300':'')+'</p>'
+     +'<div style="max-height:58vh;overflow-y:auto">'+list+'</div>'
+     +'<div class="row" style="justify-content:flex-start;margin-top:14px"><button class="btn" onclick="showRecovered()">📜 إظهار في اللوق</button><button class="btn gray" onclick="closeModal()">إغلاق</button></div>');
+  }catch(e){closeModal();toast(e.message);}
+}
+function showRecovered(){
+  closeModal();
+  S.cu=true;S.unres=false;S.q='';S.cat='';
+  if(S.page!=='logs'){go('logs');return;}
+  var c=$('f-cu');if(c)c.checked=true;var u=$('f-un');if(u)u.checked=false;var fq=$('f-q');if(fq)fq.value='';var fc=$('f-cat');if(fc)fc.value='';
+  loadEvents();
 }
 function pgLogs(){
   var opts=CATS.map(function(c){return '<option value="'+c[0]+'"'+(S.cat===c[0]?' selected':'')+'>'+c[1]+'</option>';}).join('');
@@ -1582,15 +1614,17 @@ function pgLogs(){
    +'<input id="f-q" placeholder="🔎 فرز حسب الشخص (اسم أو آيدي)" value="'+esc(S.q)+'">'
    +'<select id="f-cat">'+opts+'</select>'
    +'<label class="chk"><input type="checkbox" id="f-un"'+(S.unres?' checked':'')+'> غير المحلولة فقط</label>'
+   +'<label class="chk"><input type="checkbox" id="f-cu"'+(S.cu?' checked':'')+'> 🔄 المسترجعة فقط</label>'
    +(S.level==='full'?'<button class="btn sm gray" onclick="openBackfill()">🔄 استرجاع الفائت</button>':'')+'</div></div>'
    +'<div id="evlist"><div class="card center muted">جاري التحميل...</div></div><div class="center"><button class="btn gray" id="more" style="display:none" onclick="moreEvents()">تحميل المزيد</button></div>';
   var t;$('f-q').oninput=function(){S.q=this.value;clearTimeout(t);t=setTimeout(loadEvents,350);};
   $('f-cat').onchange=function(){S.cat=this.value;loadEvents();};
   $('f-un').onchange=function(){S.unres=this.checked;loadEvents();};
+  $('f-cu').onchange=function(){S.cu=this.checked;loadEvents();};
   loadEvents();
   S.timer=setInterval(function(){if(!$('ov'))loadEvents(true);},6000);
 }
-function qs(before){return '/api/events?q='+encodeURIComponent(S.q)+'&cat='+encodeURIComponent(S.cat)+'&unres='+(S.unres?1:0)+(before?'&before='+before:'');}
+function qs(before){return '/api/events?q='+encodeURIComponent(S.q)+'&cat='+encodeURIComponent(S.cat)+'&unres='+(S.unres?1:0)+'&cu='+(S.cu?1:0)+(before?'&before='+before:'');}
 async function loadEvents(silent){
   try{
     var j=await api(qs());
