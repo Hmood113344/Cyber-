@@ -374,6 +374,28 @@ app.post("/api/bots/:id/kick", auth, full, wrap(async (req, res) => {
     res.json({ ok: true });
 }));
 
+// ── نشاط بوت معيّن آخر 7 أيام (من اللوق: أي عملية سواها البوت) ──
+app.get("/api/bots/:id/activity", auth, wrap(async (req, res) => {
+    const id = String(req.params.id || "");
+    if (!/^\d{5,25}$/.test(id)) return res.status(400).json({ error: "آيدي البوت غير صحيح" });
+    const today = dayKeyOf(Date.now()), from = addDays(today, -6);
+    const evs = await Event.find({ actorId: id, createdAt: { $gte: dayStart(from) } }).sort({ createdAt: -1 }).limit(1000)
+        .select("title details cat rule kind severity targetTag resolved resolvedBy createdAt actorTag").lean();
+    const days = [];
+    for (let k = from; k <= today; k = addDays(k, 1)) {
+        const l = evs.filter(e => dayKeyOf(e.createdAt) === k);
+        days.push({ d: k, total: l.length, sus: l.filter(e => e.kind === "suspicious").length });
+    }
+    const byCat = {}; evs.forEach(e => { const c = e.cat || "other"; byCat[c] = (byCat[c] || 0) + 1; });
+    res.json({
+        id, from, to: today, name: evs.length ? evs[0].actorTag : null,
+        total: evs.length, sus: evs.filter(e => e.kind === "suspicious").length, unresolved: evs.filter(e => e.kind === "suspicious" && !e.resolved).length,
+        days, byCat, truncated: evs.length >= 1000,
+        ops: evs.slice(0, 500).map(e => ({ id: String(e._id), title: e.title, details: String(e.details || "").slice(0, 400), cat: e.cat, rule: e.rule, sus: e.kind === "suspicious",
+            severity: e.severity, target: e.targetTag, resolved: !!e.resolved, resolvedBy: e.resolvedBy || null, createdAt: e.createdAt })),
+    });
+}));
+
 // ── إحصائيات: أيام / أسابيع / عدد الأعضاء ──
 const DAY = 864e5;
 const dayKeyOf = t => new Date(new Date(t).getTime() + 3 * 3600e3).toISOString().slice(0, 10);   // تاريخ اليوم بتوقيت الرياض
@@ -988,6 +1010,54 @@ function weeksHtml(w){
   return '<div class="card"><h3>🗓️ الأسابيع</h3><p class="muted" style="font-size:12px;margin-bottom:8px">كل أسبوع 7 أيام، وإذا خلص يتسجّل. اضغط على أسبوع لعرض عملياته.</p>'+rows+'</div>';
 }
 
+/* ══ نشاط بوت آخر 7 أيام ══ */
+var CAT_AR={join:'دخول',leave:'خروج',kick:'طرد',ban:'حظر',role:'الرتب',channel:'القنوات',voice:'الرومات الصوتية',message:'الرسائل',bot:'البوتات',webhook:'ويبهوكس',everyone:'منشن everyone',server:'إعدادات السيرفر',panel:'اللوحة',other:'أخرى'};
+S.botNames={};
+async function openBotAct(id){
+  var nm=S.botNames[id]||'بوت';
+  modal('<h3>🤖 نشاط '+esc(nm)+' — آخر 7 أيام</h3><div class="card center muted">جاري التحميل...</div><div class="row" style="justify-content:flex-start;margin-top:14px"><button class="btn gray" onclick="closeModal()">إغلاق</button></div>');
+  try{
+    var j=await api('/api/bots/'+id+'/activity');
+    S.ba={id:id,name:j.name||nm,j:j,f:'all',day:''};drawBotAct();
+  }catch(e){closeModal();toast(e.message);}
+}
+function setBaFilter(f){S.ba.f=f;drawBotAct();}
+function setBaDay(d){S.ba.day=(S.ba.day===d?'':d);drawBotAct();}
+function drawBotAct(){
+  var b=S.ba,j=b.j;
+  var max=Math.max.apply(null,j.days.map(function(d){return d.total;}).concat([1]));
+  var bars=j.days.map(function(d){
+    var dt=new Date(d.d+'T12:00:00Z');
+    return '<div class="bar" style="'+(b.day===d.d?'outline:2px solid #d4af37;border-radius:8px':'')+'" onclick="setBaDay(\''+d.d+'\')"><b>'+d.total+'</b><i style="height:'+Math.round(d.total/max*100)+'%'+(d.sus?';background:#ef4444':'')+'"></i>'+WD_AR[dt.getUTCDay()]+'</div>';
+  }).join('');
+  var tabs=[['all','📋 كل العمليات',j.total],['sus','⚠️ المشبوهة',j.sus]].map(function(t){
+    return '<button class="tab '+(b.f===t[0]?'active':'')+'" onclick="setBaFilter(\''+t[0]+'\')">'+t[1]+' ('+t[2]+')</button>';}).join('');
+  var cats=Object.keys(j.byCat).sort(function(a,c){return j.byCat[c]-j.byCat[a];}).map(function(k){
+    return '<div class="prow"><span>'+esc(CAT_AR[k]||k)+'</span><b>'+j.byCat[k]+'</b></div>';}).join('');
+  var sevAr={high:'خطير',medium:'متوسط',low:'منخفض'};
+  var list=j.ops.filter(function(e){
+    if(b.f==='sus'&&!e.sus)return false;
+    if(b.day&&dayKeyClient(e.createdAt)!==b.day)return false;
+    return true;
+  });
+  var ops=list.map(function(e){
+    return '<div class="card" style="margin:8px 0;padding:12px"><div class="log-title"><span>'+esc(e.title)+'</span>'
+     +(e.sus?'<span class="badge '+esc(e.severity)+'">⚠️ '+(sevAr[e.severity]||esc(e.severity))+'</span>':'')
+     +(e.sus?(e.resolved?'<span class="badge done">✅ محلولة</span>':'<span class="badge medium">⏳ غير محلولة</span>'):'')+'</div>'
+     +(e.details?'<div class="log-det">'+esc(e.details)+'</div>':'')
+     +'<div class="log-meta">🕒 '+fmt(e.createdAt)+' &nbsp;•&nbsp; '+esc(CAT_AR[e.cat]||e.cat||'')+(RULE_AR[e.rule]?' &nbsp;•&nbsp; '+esc(RULE_AR[e.rule]):'')+(e.target?' &nbsp;•&nbsp; 🎯 '+esc(e.target):'')+'</div></div>';
+  }).join('')||'<div class="card center muted">ما فيه عمليات'+(b.day||b.f!=='all'?' بهذا الفلتر':' للبوت آخر 7 أيام')+'</div>';
+  modal('<h3>🤖 نشاط '+esc(b.name)+' — آخر 7 أيام</h3>'
+   +'<p class="muted center" style="font-size:12px;margin-bottom:8px">من '+dayLabel(j.from)+' إلى '+dayLabel(j.to)+'</p>'
+   +'<div style="max-height:68vh;overflow-y:auto">'
+   +'<div class="card" style="margin:8px 0"><h3 style="font-size:14px;margin-bottom:6px">📅 العمليات حسب اليوم <span class="muted" style="font-size:11px;font-weight:400">(اضغط على يوم للتصفية)</span></h3><div class="bars">'+bars+'</div></div>'
+   +(cats?'<div class="card" style="margin:8px 0"><h3 style="font-size:14px;margin-bottom:6px">حسب النوع</h3>'+cats+'</div>':'')
+   +'<div class="tabs" style="margin-top:10px">'+tabs+'</div>'+ops
+   +(j.truncated?'<p class="muted center" style="font-size:12px">معروض أحدث العمليات فقط</p>':'')+'</div>'
+   +'<div class="row" style="justify-content:flex-start;margin-top:14px"><button class="btn gray" onclick="closeModal()">إغلاق</button></div>');
+}
+function dayKeyClient(t){return new Date(new Date(t).getTime()+3*3600e3).toISOString().slice(0,10);}
+
 /* ══ الإحصائيات ══ */
 async function pgStats(){
   $('main').innerHTML='<h2>📊 الإحصائيات</h2><div class="card center muted">جاري التحميل...</div>';
@@ -999,8 +1069,8 @@ async function pgStats(){
     var wd=['الأحد','الاثنين','الثلاثاء','الأربعاء','الخميس','الجمعة','السبت'];
     var bars=s.days.map(function(d){var dt=new Date(d.d+'T12:00:00Z');return '<div class="bar" onclick="openDay(\''+d.d+'\')"><b>'+d.n+'</b><i style="height:'+Math.round(d.n/max*100)+'%"></i>'+wd[dt.getUTCDay()]+'</div>';}).join('');
     var rules=Object.keys(s.byRule).sort(function(a,b){return s.byRule[b]-s.byRule[a];}).map(function(k){return '<div class="prow"><span>'+esc(RULE_AR[k]||k)+'</span><b>'+s.byRule[k]+'</b></div>';}).join('')||'<p class="muted center">ما فيه عمليات مشبوهة هذا الأسبوع 👌</p>';
-    var on=s.bots.online.map(function(b){return '<div class="prow"><span><i class="st '+b.status+'"></i>'+esc(b.name)+'</span></div>';}).join('')||'<p class="muted center">لا أحد</p>';
-    var off=s.bots.offline.map(function(b){return '<div class="prow"><span><i class="st offline"></i>'+esc(b.name)+'</span></div>';}).join('')||'<p class="muted center">لا أحد</p>';
+    var on=s.bots.online.map(function(b){S.botNames[b.id]=b.name;return '<div class="prow" style="cursor:pointer" onclick="openBotAct(\''+b.id+'\')"><span><i class="st '+b.status+'"></i>'+esc(b.name)+'</span><span class="muted" style="font-size:12px">📊 نشاطه</span></div>';}).join('')||'<p class="muted center">لا أحد</p>';
+    var off=s.bots.offline.map(function(b){S.botNames[b.id]=b.name;return '<div class="prow" style="cursor:pointer" onclick="openBotAct(\''+b.id+'\')"><span><i class="st offline"></i>'+esc(b.name)+'</span><span class="muted" style="font-size:12px">📊 نشاطه</span></div>';}).join('')||'<p class="muted center">لا أحد</p>';
     $('main').innerHTML='<h2>📊 الإحصائيات</h2>'
      +'<div class="grid4"><div class="stat red click" onclick="openToday(\'all\')"><div class="num">'+s.today.total+'</div><div class="lbl">عمليات مشبوهة اليوم</div><div class="lbl" style="font-size:11px">آخر 7 أيام: '+s.week+'</div></div>'
      +'<div class="stat amber click" onclick="openToday(\'unresolved\')"><div class="num">'+s.today.unresolved+'</div><div class="lbl">غير محلولة اليوم</div><div class="lbl" style="font-size:11px">آخر 7 أيام: '+s.unresolved+'</div></div>'
@@ -1024,13 +1094,15 @@ async function pgBots(){
     var stAr={online:'أونلاين',idle:'خامل',dnd:'مشغول',offline:'أوفلاين',unknown:'غير معروف'};
     var html='<h2>🤖 البوتات داخل السيرفر ('+j.bots.length+')</h2>'+(j.presence?'':'<div class="warn">⚠️ فعّل Presence Intent لتظهر الحالة الحقيقية للبوتات.</div>');
     html+=j.bots.map(function(b){
-      return '<div class="card"><div class="bot"><img src="'+esc(b.avatar)+'" alt=""><div style="flex:1;min-width:200px">'
+      S.botNames[b.id]=b.name;
+      return '<div class="card"><div class="bot"><img src="'+esc(b.avatar)+'" alt="" style="cursor:pointer" onclick="openBotAct(\''+b.id+'\')"><div style="flex:1;min-width:200px;cursor:pointer" onclick="openBotAct(\''+b.id+'\')">'
        +'<div class="log-title">'+esc(b.name)+' <span class="badge low"><i class="st '+b.status+'"></i>'+stAr[b.status]+'</span></div>'
        +'<div class="log-det">🧩 '+esc(b.desc)+'</div>'
        +(b.dang.length?'<div style="margin-top:6px">'+b.dang.map(function(d){return '<span class="chip '+d.level+'">'+esc(d.ar)+'</span>';}).join('')+'</div>':'')
        +(b.activity.length?'<div class="log-meta">⚙️ نشاطه آخر 24 ساعة: '+esc(b.activity.slice(0,4).join(' • '))+'</div>':'<div class="log-meta">⚙️ لا يوجد نشاط مسجّل آخر 24 ساعة</div>')
        +'<div class="log-meta">📥 دخل: '+(b.joinedAt?fmt(b.joinedAt):'-')+(b.addedBy?' • أضافه: '+esc(b.addedBy):'')+'</div></div>'
-       +(S.level==='full'?'<button class="btn sm danger" onclick="kickBot(\''+b.id+'\',\''+esc(b.name).replace(/'/g,'')+'\')">👢 طرد</button>':'')+'</div></div>';
+       +'<div style="display:flex;flex-direction:column;gap:6px"><button class="btn sm" onclick="openBotAct(\''+b.id+'\')">📊 نشاطه 7 أيام</button>'
+       +(S.level==='full'?'<button class="btn sm danger" onclick="kickBot(\''+b.id+'\',\''+esc(b.name).replace(/'/g,'')+'\')">👢 طرد</button>':'')+'</div></div></div>';
     }).join('')||'<div class="card center muted">ما فيه بوتات</div>';
     $('main').innerHTML=html;
   }catch(e){toast(e.message);}
