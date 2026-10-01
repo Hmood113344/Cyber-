@@ -1390,6 +1390,20 @@ app.put("/api/perms/channels/:id/:tid", auth, full, wrap(async (req, res) => {
     res.json({ ok: true });
 }));
 
+app.delete("/api/perms/channels/:id/:tid", auth, full, wrap(async (req, res) => {
+    const g = await getGuild();
+    const c = g.channels.cache.get(req.params.id);
+    if (!c || !c.permissionOverwrites) return res.status(404).json({ error: "القناة مو موجودة" });
+    const ow = c.permissionOverwrites.cache.get(req.params.tid);
+    if (!ow) return res.status(404).json({ error: "ما فيه صلاحيات خاصة لهذا الهدف في القناة (يمكن انحذفت من قبل)" });
+    const isRole = ow.type === 0;
+    const name = isRole ? (g.roles.cache.get(ow.id)?.name || ow.id) : (g.members.cache.get(ow.id)?.user.username || ow.id);
+    try { await c.permissionOverwrites.delete(req.params.tid, "لوحة الأمن السيبراني — " + req.session.user.tag); }
+    catch (e) { return res.status(400).json({ error: "ما قدرت أحذفها — تأكد إن البوت عنده صلاحية إدارة القنوات والرتب ورتبته أعلى (" + e.message + ")" }); }
+    await panelLog(req, "حذف صلاحيات من قناة", "القناة: #" + c.name + "\nالمحذوف: " + name + (isRole ? " (رتبة)" : " (عضو)"), { targetId: c.id, targetTag: c.name });
+    res.json({ ok: true });
+}));
+
 // ── API: أعضاء الأمن السيبراني (للقائد والنائب فقط) ──
 app.get("/api/members", auth, full, wrap(async (req, res) => {
     const g = await getGuild();
@@ -1885,7 +1899,8 @@ async function pgPerms(){
    +'<button class="tab '+(t==='channels'?'active':'')+'" onclick="S.permsTab=\'channels\';S.permsQ=\'\';pgPerms()">💬 قسم الشاتات</button>'
    +'<button class="tab '+(t==='members'?'active':'')+'" onclick="S.permsTab=\'members\';S.permsQ=\'\';pgPerms()">👤 قسم الأعضاء</button></div>'
    +(t==='members'?'':'<div class="tabs"><button class="tab '+(S.permsView==='danger'?'active':'')+'" onclick="S.permsView=\'danger\';pgPerms()">⚠️ الخطرة فقط</button>'
-   +'<button class="tab '+(S.permsView==='all'?'active':'')+'" onclick="S.permsView=\'all\';pgPerms()">📋 الكل</button></div>')
+   +'<button class="tab '+(S.permsView==='all'?'active':'')+'" onclick="S.permsView=\'all\';pgPerms()">📋 الكل</button>'
+   +((t==='channels'&&S.level==='full')?'<button id="chEditBtn" class="tab'+(S.chEdit?' active':'')+'" style="margin-inline-start:auto" onclick="toggleChEdit()">'+(S.chEdit?'✅ إنهاء التعديل':'✏️ تعديل')+'</button>':'')+'</div>')
    +'<input id="pq" placeholder="'+(t==='roles'?'🔎 ابحث عن رتبة':t==='channels'?'🔎 ابحث عن شات':'🔎 ابحث بيوزر، اسم البروفايل، اسم السيرفر، أو الآيدي')+'" value="'+esc(S.permsQ)+'" style="margin-bottom:14px"><div id="pbox"><div class="card center muted">جاري التحميل...</div></div>';
   $('pq').oninput=function(){S.permsQ=this.value;if(S.permsTab==='roles')drawRoles(true);else if(S.permsTab==='channels')drawChannels(true);else drawMembers(true);};
   try{ if(t==='roles')await drawRoles();else if(t==='channels')await drawChannels();else await drawMembers(); }catch(e){toast(e.message);}
@@ -2012,14 +2027,29 @@ async function drawChannels(nf){
   var view=q?'all':S.permsView;
   var list=view==='danger'?S.chans.filter(function(c){return c.hasDanger;}):S.chans.filter(function(c){return c.overwrites.length;});
   if(q)list=S.chans.filter(function(c){return c.name.toLowerCase().indexOf(q)>-1||(c.parent||'').toLowerCase().indexOf(q)>-1||c.overwrites.some(function(o){return o.name.toLowerCase().indexOf(q)>-1;});});
-  var html=list.map(function(c){
+  var editing=S.level==='full'&&!!S.chEdit;
+  var html=(editing?'<div class="warn">✏️ وضع التعديل شغّال لكل الشاتات: اضغط 🗑️ حذف جنب أي رتبة (أو عضو) لحذف كل صلاحياتها الخاصة من ذاك الشات.</div>':'')+list.map(function(c){
     var ovs=(view==='danger'?c.overwrites.filter(function(o){return o.dang.length;}):c.overwrites).map(function(o){
       return '<div class="prow"><span><b>'+(o.type==='role'?'👥 ':'👤 ')+esc(o.name)+'</b> '+(o.dang.length?permChips(o.dang,S.meta.channel):'<span class="chip safe">بدون صلاحيات خطيرة</span>')+'</span>'
-       +'<button class="btn sm '+(S.level==='full'?'':'gray')+'" onclick="editOv(\''+c.id+'\',\''+o.id+'\')">'+(S.level==='full'?'✏️ تعديل':'👁️ عرض')+'</button></div>';
+       +'<span style="display:flex;gap:6px;flex-wrap:wrap"><button class="btn sm '+(S.level==='full'?'':'gray')+'" onclick="editOv(\''+c.id+'\',\''+o.id+'\')">'+(S.level==='full'?'✏️ تعديل':'👁️ عرض')+'</button>'
+       +(editing?'<button class="btn sm danger" onclick="delOv(\''+c.id+'\',\''+o.id+'\')">🗑️ حذف</button>':'')+'</span></div>';
     }).join('');
-    return '<div class="card"><div class="log-title"><span>'+c.icon+' '+esc(c.name)+'</span>'+(c.parent?'<span class="muted" style="font-size:12px">'+esc(c.parent)+'</span>':'')+(c.hasDanger?'<span class="badge high">صلاحيات خطيرة</span>':'')+'</div>'+ovs+'</div>';
+    return '<div class="card"><div class="log-title"><span>'+c.icon+' '+esc(c.name)+'</span>'+(c.parent?'<span class="muted" style="font-size:12px">'+esc(c.parent)+'</span>':'')+(c.hasDanger?'<span class="badge high">صلاحيات خطيرة</span>':'')
+     +'</div>'+ovs+'</div>';
   }).join('')||(q?'<div class="card center muted">ما لقيت شات بهذا الاسم</div>':'<div class="card center muted">ما فيه قنوات بصلاحيات خطيرة 👌</div>');
   if($('pbox'))$('pbox').innerHTML=html;
+}
+function toggleChEdit(){
+  S.chEdit=!S.chEdit;
+  var b=$('chEditBtn');if(b){b.className='tab'+(S.chEdit?' active':'');b.textContent=S.chEdit?'✅ إنهاء التعديل':'✏️ تعديل';}
+  drawChannels(true);
+}
+async function delOv(cid,tid){
+  var c=S.chans.find(function(x){return x.id===cid;});var o=c.overwrites.find(function(x){return x.id===tid;});
+  var msg='تحذف كل الصلاحيات الخاصة بـ «'+o.name+'» ('+(o.type==='role'?'رتبة':'عضو')+') من شات #'+c.name+'؟\nترجع للإعدادات الافتراضية للشات، وما تقدر تتراجع بسهولة.';
+  if(o.name==='@everyone')msg+='\n\n⚠️ هذي رتبة @everyone — حذفها ممكن يغيّر مين يشوف الشات ويكتب فيه!';
+  if(!(await ask(msg)))return;
+  try{await api('/api/perms/channels/'+cid+'/'+tid,{method:'DELETE'});toast('تم حذف الصلاحيات من الشات');drawChannels();}catch(e){toast(e.message);}
 }
 function editOv(cid,tid){
   var c=S.chans.find(function(x){return x.id===cid;});var o=c.overwrites.find(function(x){return x.id===tid;});
@@ -2030,7 +2060,7 @@ function editOv(cid,tid){
      +'<div class="tri"><button class="a '+(st==='a'?'on':'')+'"'+(canEdit?' onclick="setTri(this,\'a\')"':' disabled')+'>✓</button><button class="n '+(st==='n'?'on':'')+'"'+(canEdit?' onclick="setTri(this,\'n\')"':' disabled')+'>—</button><button class="d '+(st==='d'?'on':'')+'"'+(canEdit?' onclick="setTri(this,\'d\')"':' disabled')+'>✗</button></div></div>';
   }).join('');
   modal('<h3>'+esc(c.name)+' — '+esc(o.name)+'</h3>'+(canEdit?'<p class="muted center" style="font-size:12px;margin-bottom:8px">✓ سماح &nbsp; — افتراضي &nbsp; ✗ منع</p>':'<div class="warn">ماعندك صلاحية التعديل — عرض فقط.</div>')+'<div style="max-height:60vh;overflow-y:auto">'+rows+'</div>'
-   +'<div class="row" style="justify-content:flex-start;margin-top:14px">'+(canEdit?'<button class="btn" id="os">💾 حفظ</button>':'')+'<button class="btn gray" onclick="closeModal()">إغلاق</button></div>');
+   +'<div class="row" style="justify-content:flex-start;margin-top:14px">'+(canEdit?'<button class="btn" id="os">💾 حفظ</button><button class="btn danger" onclick="delOv(\''+cid+'\',\''+tid+'\')">🗑️ حذف من الشات</button>':'')+'<button class="btn gray" onclick="closeModal()">إغلاق</button></div>');
   if(canEdit)$('os').onclick=async function(){
     var allow=[],deny=[];
     document.querySelectorAll('.modal .prow[data-k]').forEach(function(r){var s=r.getAttribute('data-s');if(s==='a')allow.push(r.getAttribute('data-k'));if(s==='d')deny.push(r.getAttribute('data-k'));});
