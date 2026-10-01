@@ -619,6 +619,20 @@ async function stillAuthorized(uid) {
     roleCheck.set(uid, { ...res, t: Date.now() });
     return res;
 }
+const levelOfMember = m => {
+    const isFull = (CONFIG.LEADER_ROLE_ID && m.roles.cache.has(CONFIG.LEADER_ROLE_ID)) || (CONFIG.DEPUTY_ROLE_ID && m.roles.cache.has(CONFIG.DEPUTY_ROLE_ID));
+    const isMember = CONFIG.CYBER_ROLE_ID && m.roles.cache.has(CONFIG.CYBER_ROLE_ID);
+    return isFull ? "full" : isMember ? "view" : null;
+};
+// يرسل حدث فوري لكل صفحات هذا الشخص المفتوحة (فصل أو تغيّر صلاحيته)
+function pushToUser(uid, event, data) {
+    const line = "event: " + event + "\ndata: " + JSON.stringify(data || {}) + "\n\n";
+    for (const res of sseClients) { if (res._uid === uid) { try { res.write(line); } catch { sseClients.delete(res); } } }
+}
+function applyAccess(uid, level) {
+    roleCheck.set(uid, { ok: !!level, level, t: Date.now() });
+    if (level) pushToUser(uid, "access", { level }); else pushToUser(uid, "dismissed");
+}
 const seenThrottle = new Map();
 const auth = wrap(async (req, res, next) => {
     const u = req.session.user;
@@ -688,6 +702,7 @@ app.get("/api/events/stream", wrap(async (req, res) => {
     res.set({ "Content-Type": "text/event-stream; charset=utf-8", "Cache-Control": "no-cache, no-transform", Connection: "keep-alive", "X-Accel-Buffering": "no" });
     res.flushHeaders?.();
     res.write("retry: 3000\n\n");
+    res._uid = u.id;
     sseClients.add(res);
     const hb = setInterval(() => { try { res.write(": ping\n\n"); } catch { } }, 25000);
     req.on("close", () => { clearInterval(hb); sseClients.delete(res); });
@@ -996,7 +1011,8 @@ app.get("/api/members", auth, full, wrap(async (req, res) => {
         const w = r => r === "leader" ? 0 : r === "deputy" ? 1 : 2;
         return w(a.rank) - w(b.rank) || (b.lastLoginAt ? new Date(b.lastLoginAt).getTime() : 0) - (a.lastLoginAt ? new Date(a.lastLoginAt).getTime() : 0);
     });
-    res.json({ members: out });
+    const me = g.members.cache.get(req.session.user.id);
+    res.json({ members: out, meRank: me ? rankOf(me) : "member" });
 }));
 app.post("/api/members/:id/dismiss", auth, full, wrap(async (req, res) => {
     if (req.params.id === req.session.user.id) return res.status(400).json({ error: "ما تقدر تفصل نفسك" });
@@ -1005,11 +1021,24 @@ app.post("/api/members/:id/dismiss", auth, full, wrap(async (req, res) => {
     if (!m) return res.status(404).json({ error: "العضو مو موجود بالسيرفر" });
     const toRemove = [CONFIG.CYBER_ROLE_ID, CONFIG.LEADER_ROLE_ID, CONFIG.DEPUTY_ROLE_ID].filter(id => id && m.roles.cache.has(id));
     if (!toRemove.length) return res.status(400).json({ error: "ما عنده رتب الأمن السيبراني أصلاً" });
+    const actor = await g.members.fetch(req.session.user.id).catch(() => null);
+    const actorIsLeader = !!(actor && CONFIG.LEADER_ROLE_ID && actor.roles.cache.has(CONFIG.LEADER_ROLE_ID));
+    if (CONFIG.LEADER_ROLE_ID && m.roles.cache.has(CONFIG.LEADER_ROLE_ID) && !actorIsLeader) return res.status(403).json({ error: "النائب ما يقدر يفصل القائد" });
     await m.roles.remove(toRemove, "فصل من الأمن السيبراني — لوحة الأمن السيبراني — " + req.session.user.tag);
-    roleCheck.delete(m.id);
+    applyAccess(m.id, null); // يظهر له فوراً إنه مفصول إذا كان فاتح الموقع
     await panelLog(req, "فصل من الأمن السيبراني", "العضو: " + tagOf(m.user), { targetId: m.id, targetTag: tagOf(m.user) });
     res.json({ ok: true });
 }));
+
+// إذا انسحبت رتبة الأمن السيبراني من ديسكورد مباشرة (مو من اللوحة) يتحدث عنده فوراً
+client.on("guildMemberUpdate", (o, n) => {
+    try {
+        if (n.guild.id !== CONFIG.GUILD_ID) return;
+        const ids = [CONFIG.CYBER_ROLE_ID, CONFIG.LEADER_ROLE_ID, CONFIG.DEPUTY_ROLE_ID].filter(Boolean);
+        if (!o.roles || !ids.some(id => o.roles.cache.has(id) !== n.roles.cache.has(id))) return;
+        applyAccess(n.id, levelOfMember(n));
+    } catch (e) { console.error("access update:", e.message); }
+});
 
 // ══════════════════════════════════════════════════════════════════════════
 // 6) الواجهة (نفس تصميم موقع فلاش: نفس الألوان والأزرار والخط)
@@ -1190,10 +1219,22 @@ function fmt(d){try{return new Date(d).toLocaleString('ar-SA',{timeZone:'Asia/Ri
 function ago(d){var s=Math.floor((Date.now()-new Date(d).getTime())/1000);if(s<60)return 'الحين';if(s<3600)return 'قبل '+Math.floor(s/60)+' دقيقة';if(s<86400)return 'قبل '+Math.floor(s/3600)+' ساعة';return 'قبل '+Math.floor(s/86400)+' يوم';}
 async function api(url,opt){
   var r=await fetch(url,Object.assign({headers:{'Content-Type':'application/json'}},opt||{}));
-  if(r.status===401){location.href='/';throw new Error('غير مصرح');}
   var j=await r.json().catch(function(){return {};});
+  if(r.status===401){
+    if(j.error==='تم سحب صلاحيتك'){showDismissed();throw new Error(j.error);}
+    location.href='/';throw new Error('غير مصرح');
+  }
   if(!r.ok)throw new Error(j.error||'صار خطأ');
   return j;
+}
+function showDismissed(){
+  try{if(S.es)S.es.close();}catch(e){}
+  clearInterval(S.timer);closeModal();
+  if($('dismissed'))return;
+  var o=document.createElement('div');o.id='dismissed';
+  o.style.cssText='position:fixed;top:0;left:0;right:0;bottom:0;z-index:99999;background:#050d1a;display:flex;align-items:center;justify-content:center;padding:20px;overflow:auto';
+  o.innerHTML='<div class="auth-card deny"><div class="ico">🚫</div><h1>تم فصلك</h1><p>تم فصلك من الأمن السيبراني وسُحبت رتبتك.<br>ما تقدر تستخدم اللوحة بعد الحين.</p><a class="btn gray" href="/auth/logout">خروج</a></div>';
+  document.body.appendChild(o);
 }
 function modal(html){closeModal();var o=document.createElement('div');o.className='ov';o.id='ov';o.innerHTML='<div class="modal">'+html+'</div>';o.addEventListener('mousedown',function(e){if(e.target===o)closeModal();});document.body.appendChild(o);}
 function closeModal(){var o=$('ov');if(o)o.remove();}
@@ -1505,16 +1546,17 @@ async function pgMembers(){
   $('main').innerHTML='<h2>👥 أعضاء الأمن السيبراني</h2><div class="card center muted">جاري التحميل...</div>';
   try{
     var j=await api('/api/members');if(S.page!=='members')return;
+    S.meRank=j.meRank;
     var html='<h2>👥 أعضاء الأمن السيبراني ('+j.members.length+')</h2>';
     html+=j.members.map(function(m){
       var last=m.lastLoginAt?fmt(m.lastLoginAt):'لم يسجّل الدخول للوحة بعد';
       var dur=(m.durationMin!=null)?'⏱️ قعد آخر مرة: '+m.durationMin+' دقيقة':'';
-      var canDismiss=m.id!==S.meId;
+      var canDismiss=m.id!==S.meId&&!(m.rank==='leader'&&S.meRank!=='leader');
       return '<div class="card"><div class="bot"><img src="'+esc(m.avatar)+'" alt=""><div style="flex:1;min-width:200px">'
         +'<div class="log-title">'+esc(m.tag)+' <span class="badge '+(m.rank==='leader'?'high':m.rank==='deputy'?'medium':'low')+'">'+RANK_AR[m.rank]+'</span></div>'
         +'<div class="log-meta">🕒 آخر دخول للوحة: '+last+'</div>'
         +(dur?'<div class="log-meta">'+dur+'</div>':'')+'</div>'
-        +(canDismiss?'<button class="btn sm danger" onclick="dismissMember(\''+m.id+'\',\''+esc(m.tag).replace(/'/g,'')+'\')">🚫 فصل</button>':'<span class="muted" style="font-size:12px">أنت</span>')+'</div></div>';
+        +(canDismiss?'<button class="btn sm danger" onclick="dismissMember(\''+m.id+'\',\''+esc(m.tag).replace(/'/g,'')+'\')">🚫 فصل</button>':'<span class="muted" style="font-size:12px">'+(m.id===S.meId?'أنت':'🔒 القائد')+'</span>')+'</div></div>';
     }).join('')||'<div class="card center muted">ما فيه أعضاء بعد</div>';
     $('main').innerHTML=html;
   }catch(e){toast(e.message);}
@@ -1531,8 +1573,14 @@ async function dismissMember(id,name){
     $('uchip').innerHTML='<img src="'+esc(me.user.avatar)+'" alt=""><span>'+esc(me.user.tag)+'</span><a class="btn sm gray" href="/auth/logout">خروج</a>';
     buildNav();render();
     try{
-      var es=new EventSource('/api/events/stream');
+      var es=S.es=new EventSource('/api/events/stream');
       es.addEventListener('changed',function(){ if(S.page==='logs')loadEvents(true); });
+      es.addEventListener('dismissed',function(){showDismissed();});
+      es.addEventListener('access',function(e){
+        try{var d=JSON.parse(e.data);
+          if(d.level&&d.level!==S.level){S.level=d.level;if(S.page==='members'&&d.level!=='full')S.page='logs';closeModal();buildNav();render();toast(d.level==='full'?'تمت ترقيتك — صارت عندك صلاحية التعديل':'تغيّرت صلاحيتك إلى عرض فقط');}
+        }catch(x){}
+      });
     }catch(e){}
   }catch(e){}
 })();
