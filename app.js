@@ -767,6 +767,10 @@ app.get("/api/members", auth, full, wrap(async (req, res) => {
     });
     res.json({ members: out, meRank: r.meRank });
 }));
+app.get("/api/members/:id/activity", auth, full, wrap(async (req, res) => {
+    if (!/^\d{5,25}$/.test(req.params.id)) return res.status(400).json({ error: "آيدي غير صالح" });
+    res.json(await callBot("member_activity", { id: req.params.id }, 30000));
+}));
 app.post("/api/members/:id/dismiss", auth, full, wrap(async (req, res) => {
     if (req.params.id === req.session.user.id) return res.status(400).json({ error: "ما تقدر تفصل نفسك" });
     const r = await callBot("dismiss", { id: req.params.id, actorId: req.session.user.id, who: req.session.user.tag });
@@ -958,6 +962,9 @@ nav { height:auto; min-height:62px; padding-top:env(safe-area-inset-top,0px); }
   .stat .num { font-size:22px; }
   .auth-card { padding:28px 20px; border-radius:20px; }
 }
+/* ══ نوافذ ما تتحرك ══ */
+.ov { overscroll-behavior:contain; -webkit-overflow-scrolling:touch; }
+.modal { margin:0 auto; }
 `;
 
 const HEAD = (title) => `<!DOCTYPE html>
@@ -1007,8 +1014,20 @@ function showDismissed(){
   o.innerHTML='<div class="auth-card deny"><div class="ico">🚫</div><h1>تم فصلك</h1><p>تم فصلك من الأمن السيبراني وسُحبت رتبتك.<br>ما تقدر تستخدم اللوحة بعد الحين.</p><a class="btn gray" href="/auth/logout">خروج</a></div>';
   document.body.appendChild(o);
 }
-function modal(html){closeModal();var o=document.createElement('div');o.className='ov';o.id='ov';o.innerHTML='<div class="modal">'+html+'</div>';o.addEventListener('mousedown',function(e){if(e.target===o)closeModal();});document.body.appendChild(o);}
-function closeModal(){var o=$('ov');if(o)o.remove();}
+function lockScroll(){
+  if(S.locked)return;
+  S.locked=true;S.lockY=window.pageYOffset||document.documentElement.scrollTop||0;
+  var b=document.body;b.style.position='fixed';b.style.top='-'+S.lockY+'px';b.style.left='0';b.style.right='0';b.style.width='100%';
+}
+function unlockScroll(){
+  if(!S.locked)return;
+  if($('ov'))return;
+  S.locked=false;
+  var b=document.body;b.style.position='';b.style.top='';b.style.left='';b.style.right='';b.style.width='';
+  window.scrollTo(0,S.lockY||0);
+}
+function modal(html){var old=$('ov');if(old)old.remove();var o=document.createElement('div');o.className='ov';o.id='ov';o.innerHTML='<div class="modal">'+html+'</div>';o.addEventListener('mousedown',function(e){if(e.target===o)closeModal();});document.body.appendChild(o);lockScroll();}
+function closeModal(){var o=$('ov');if(o)o.remove();unlockScroll();}
 function ask(msg){return new Promise(function(res){modal('<h3>تأكيد</h3><p style="line-height:1.8;margin-bottom:16px;white-space:pre-line">'+esc(msg)+'</p><div class="row" style="justify-content:flex-start"><button class="btn danger" id="ask-y">تأكيد</button><button class="btn gray" id="ask-n">إلغاء</button></div>');$('ask-y').onclick=function(){closeModal();res(true);};$('ask-n').onclick=function(){closeModal();res(false);};});}
 
 /* ── التنقل ── */
@@ -1078,7 +1097,7 @@ function pgLogs(){
     var it=ev.target.closest('.log-item');if(it&&it.getAttribute('data-id'))openEv(it.getAttribute('data-id'));
   };
   loadEvents();
-  S.timer=setInterval(function(){if(!$('ov'))loadEvents(true);},6000);
+  S.timer=setInterval(function(){loadEvents(true);},6000);
 }
 function qs(before){return '/api/events?q='+encodeURIComponent(S.q)+'&cat='+encodeURIComponent(S.cat)+'&unres='+(S.unres?1:0)+'&cu='+(S.cu?1:0)+(before?'&before='+before:'');}
 async function loadEvents(silent){
@@ -1601,20 +1620,68 @@ async function pgMembers(){
   $('main').innerHTML='<h2>👥 أعضاء الأمن السيبراني</h2><div class="card center muted">جاري التحميل...</div>';
   try{
     var j=await api('/api/members');if(S.page!=='members')return;
-    S.meRank=j.meRank;
-    var html='<h2>👥 أعضاء الأمن السيبراني ('+j.members.length+')</h2>';
+    S.meRank=j.meRank;S.memMap={};
+    var html='<h2>👥 أعضاء الأمن السيبراني ('+j.members.length+')</h2><div class="muted" style="font-size:12px;margin:-4px 0 8px">👆 اضغط على بطاقة العضو لعرض آخر نشاط له في السيرفر</div>';
     html+=j.members.map(function(m){
+      S.memMap[m.id]=m;
       var last=m.lastLoginAt?fmt(m.lastLoginAt):'لم يسجّل الدخول للوحة بعد';
       var dur=(m.durationMin!=null)?'⏱️ قعد آخر مرة: '+m.durationMin+' دقيقة':'';
       var canDismiss=m.id!==S.meId&&!(m.rank==='leader'&&S.meRank!=='leader');
-      return '<div class="card"><div class="bot"><img src="'+esc(m.avatar)+'" alt=""><div style="flex:1;min-width:200px">'
+      return '<div class="card" data-mid="'+esc(m.id)+'" style="cursor:pointer"><div class="bot"><img src="'+esc(m.avatar)+'" alt=""><div style="flex:1;min-width:200px">'
         +'<div class="log-title">'+esc(m.tag)+' <span class="badge '+(m.rank==='leader'?'high':m.rank==='deputy'?'medium':'low')+'">'+RANK_AR[m.rank]+'</span></div>'
         +'<div class="log-meta">🕒 آخر دخول للوحة: '+last+'</div>'
-        +(dur?'<div class="log-meta">'+dur+'</div>':'')+'</div>'
+        +(dur?'<div class="log-meta">'+dur+'</div>':'')
+        +'<div class="log-meta" style="color:#60a5fa">🕵️ اضغط لعرض نشاطه في السيرفر</div></div>'
         +(canDismiss?'<button class="btn sm danger" onclick="dismissMember(\''+m.id+'\',\''+esc(m.tag).replace(/'/g,'')+'\')">🚫 فصل</button>':'<span class="muted" style="font-size:12px">'+(m.id===S.meId?'أنت':'🔒 القائد')+'</span>')+'</div></div>';
     }).join('')||'<div class="card center muted">ما فيه أعضاء بعد</div>';
     $('main').innerHTML=html;
+    $('main').onclick=function(ev){
+      if(ev.target.closest('button,a'))return;
+      if(window.getSelection&&String(window.getSelection()))return;
+      var c=ev.target.closest('[data-mid]');if(c)openAct(c.getAttribute('data-mid'));
+    };
   }catch(e){toast(e.message);}
+}
+var ST_AR={online:'🟢 أونلاين',idle:'🌙 خامل',dnd:'⛔ مشغول',offline:'⚫ أوفلاين',invisible:'⚫ أوفلاين',unknown:'❔ غير معروف'};
+function actHead(b,id){
+  return '<div class="card" style="margin:8px 0;padding:12px"><div class="mlist" style="border:none;padding:0;align-items:flex-start">'+(b.avatar?'<img src="'+esc(b.avatar)+'" alt="">':'')
+    +'<div style="flex:1;min-width:0"><b>'+esc(b.tag||id)+'</b>'+(b.rank&&RANK_AR[b.rank]?' <span class="badge '+(b.rank==='leader'?'high':b.rank==='deputy'?'medium':'low')+'">'+RANK_AR[b.rank]+'</span>':'')
+    +(b.name?'<div class="log-meta">🏷️ اسمه في السيرفر: '+esc(b.name)+'</div>':'')
+    +'<div class="log-meta">🆔 '+esc(id)+cpb(id,'تم نسخ الآيدي','نسخ الآيدي')+'</div></div></div></div>';
+}
+async function openAct(id){
+  S.actId=id;var b=(S.memMap||{})[id]||{};
+  modal('<div id="actinfo" style="max-height:70vh;overflow-y:auto"><h3>🕵️ نشاط العضو</h3>'+actHead(b,id)+'<div class="card center muted">جاري التحميل...</div></div><div class="row" style="justify-content:flex-start;margin-top:14px"><button class="btn gray" onclick="closeModal()">إغلاق</button></div>');
+  try{
+    var j=await api('/api/members/'+id+'/activity');
+    if(S.actId!==id||!$('actinfo'))return;
+    drawAct(j,b);
+  }catch(e){if(S.actId===id&&$('actinfo'))$('actinfo').innerHTML='<h3>🕵️ نشاط العضو</h3>'+actHead(b,id)+'<div class="card center muted">'+esc(e.message)+'</div>';}
+}
+function drawAct(a,b){
+  var box=$('actinfo');if(!box)return;
+  var hb={tag:a.tag||b.tag,avatar:a.avatar||b.avatar,rank:b.rank,name:a.name};
+  var on=a.presenceOk&&a.status&&a.status!=='offline'&&a.status!=='unknown';
+  var stTxt=a.presenceOk?(ST_AR[a.status]||ST_AR.unknown):'⚠️ تتبّع الحالة غير مفعّل (Presence Intent)';
+  var since=a.trackedSince?fmt(Number(a.trackedSince)):'';
+  var lastOn;
+  if(on)lastOn='<b>الحين</b> <span class="muted" style="font-size:11px">(متصل)</span>';
+  else if(a.lastOnlineAt)lastOn='<b>'+esc(fmt(a.lastOnlineAt))+'</b> <span class="muted" style="font-size:11px">('+ago(a.lastOnlineAt)+')</span>';
+  else lastOn='<span class="muted">ما سجّلنا له أونلاين'+(since?' من بدأ التتبّع ('+esc(since)+')':'')+'</span>';
+  var joined=a.joinedAt?'<b>'+esc(fmt(a.joinedAt))+'</b> <span class="muted" style="font-size:11px">('+ago(a.joinedAt)+')</span>':'<span class="muted">'+(a.inServer?'غير معروف':'⚠️ مو موجود بالسيرفر')+'</span>';
+  var rows='<div class="card" style="margin:8px 0;padding:6px 12px">'
+    +'<div class="prow"><span class="muted">📶 الحالة الحين</span><b>'+stTxt+'</b></div>'
+    +'<div class="prow"><span class="muted">🕒 آخر مرة أونلاين</span><span style="text-align:left">'+lastOn+'</span></div>'
+    +'<div class="prow" style="border:none"><span class="muted">📥 دخل السيرفر</span><span style="text-align:left">'+joined+'</span></div></div>';
+  var lm=a.lastMsg,msg;
+  if(lm){
+    msg='<div class="card" style="margin:8px 0;padding:12px"><div class="muted" style="font-size:12px;margin-bottom:4px">💬 آخر رسالة له في السيرفر</div>'
+      +'<div class="log-meta">🕒 '+esc(fmt(lm.at))+' <span class="muted">('+ago(lm.at)+')</span>'+(lm.channel?' &nbsp;•&nbsp; #'+esc(lm.channel):'')+'</div>'
+      +'<div class="log-det" style="margin-top:6px;white-space:pre-wrap">'+(lm.content?esc(lm.content):'<span class="muted">(بدون نص)</span>')+'</div>'
+      +(lm.att?'<div class="log-meta">📎 '+lm.att+' مرفق</div>':'')
+      +(lm.url&&/^https:\/\/discord\.com\//.test(lm.url)?'<div style="margin-top:8px"><a class="btn sm gray" href="'+esc(lm.url)+'" target="_blank" rel="noopener">🔗 فتح الرسالة في ديسكورد</a></div>':'')+'</div>';
+  }else msg='<div class="card" style="margin:8px 0;padding:12px"><div class="muted" style="font-size:12px;margin-bottom:4px">💬 آخر رسالة له في السيرفر</div><span class="muted">ما لقينا له رسالة'+(since?' من بدأ التتبّع ('+esc(since)+')':'')+'</span></div>';
+  box.innerHTML='<h3>🕵️ نشاط العضو</h3>'+actHead(hb,a.id)+rows+msg;
 }
 async function dismissMember(id,name){
   if(!(await ask('متأكد تبي تفصل '+name+' من الأمن السيبراني؟\nراح تنسحب رتبته من ديسكورد وما يقدر يدخل اللوحة إلا إذا ترجعت له الرتبة.')))return;
