@@ -767,7 +767,7 @@ app.get("/api/members", auth, full, wrap(async (req, res) => {
     });
     res.json({ members: out, meRank: r.meRank });
 }));
-app.get("/api/members/:id/activity", auth, full, wrap(async (req, res) => {
+app.get("/api/members/:id/activity", auth, wrap(async (req, res) => {
     if (!/^\d{5,25}$/.test(req.params.id)) return res.status(400).json({ error: "آيدي غير صالح" });
     res.json(await callBot("member_activity", { id: req.params.id }, 30000));
 }));
@@ -1513,25 +1513,34 @@ function editRole(id){
 }
 async function drawMembers(nf){
   if(!nf){
-    var j=await api('/api/perms/members');S.mem2=j.members;S.memTotal=j.total;
+    var j=await api('/api/perms/members');S.mem2=j.members;S.memTotal=j.total;S.memOk=j.presenceOk;
     var rj=await api('/api/perms/roles');S.roles=rj.roles;
   }
   var q=(S.permsQ||'').trim().toLowerCase(),SHOW=100;
   var f=q?S.mem2.filter(function(m){return [m.username,m.global,m.nick,m.server,m.tag,m.id].some(function(v){return (v||'').toLowerCase().indexOf(q)>-1;});}):S.mem2;
-  var info='<div class="muted" style="font-size:12px;margin-bottom:8px">'+(q?('النتائج: '+f.length+' من '+S.mem2.length):('👤 '+S.memTotal+' عضو'+(f.length>SHOW?' — معروض أول '+SHOW+'، استخدم البحث للباقي':'')))+'</div>';
+  var info='<div class="muted" style="font-size:12px;margin-bottom:8px">'+(q?('النتائج: '+f.length+' من '+S.mem2.length):('👤 '+S.memTotal+' عضو'+(f.length>SHOW?' — معروض أول '+SHOW+'، استخدم البحث للباقي':'')+' — 👆 اضغط على بطاقة العضو لعرض نشاطه'))+'</div>';
   var html=info+f.slice(0,SHOW).map(function(m){
     var set={};m.roles.forEach(function(x){set[x]=1;});
     var chips=S.roles.filter(function(r){return set[r.id];}).map(function(r){
       return '<span class="chip '+(r.dang.length?'high':'safe')+'"><i class="dot" style="background:'+(r.color&&r.color!=='#000000'?r.color:'#64748b')+'"></i>'+esc(r.name)+'</span>';
     }).join('')||'<span class="muted" style="font-size:12px">بدون رتب</span>';
     var canEdit=S.level==='full'&&m.editable;
-    return '<div class="card"><div class="bot"><img src="'+esc(m.avatar)+'" alt=""><div style="flex:1;min-width:200px">'
+    S.memMap=S.memMap||{};S.memMap[m.id]={tag:m.tag,avatar:m.avatar,name:m.server};
+    var stx=(S.memOk&&m.status)?' &nbsp;•&nbsp; '+(ST_AR[m.status]||ST_AR.unknown):'';
+    return '<div class="card" data-mid="'+esc(m.id)+'" style="cursor:pointer"><div class="bot"><img src="'+esc(m.avatar)+'" alt=""><div style="flex:1;min-width:200px">'
      +'<div class="log-title"><b>'+esc(m.server)+'</b>'+(m.bot?' <span class="badge low">بوت</span>':'')+'</div>'
-     +'<div class="log-meta">🏷️ اسمه في السيرفر: '+esc(m.server)+' &nbsp;•&nbsp; 👤 البروفايل: '+esc(m.global)+' &nbsp;•&nbsp; 🔖 @'+esc(m.username)+cpb(m.username,'تم نسخ اليوزر','نسخ اليوزر')+'</div>'
+     +'<div class="log-meta">🏷️ اسمه في السيرفر: '+esc(m.server)+' &nbsp;•&nbsp; 👤 البروفايل: '+esc(m.global)+' &nbsp;•&nbsp; 🔖 @'+esc(m.username)+cpb(m.username,'تم نسخ اليوزر','نسخ اليوزر')+stx+'</div>'
      +'<div style="margin-top:8px">'+chips+'</div></div>'
      +'<button class="btn sm '+(canEdit?'':'gray')+'" onclick="editMember(\''+m.id+'\')">'+(canEdit?'✏️ عرض وتعديل':'👁️ عرض فقط')+'</button></div></div>';
   }).join('')||'<div class="card center muted">'+(q?'ما لقيت أحد بهذا الاسم':'ما فيه أعضاء')+'</div>';
-  if($('pbox'))$('pbox').innerHTML=html;
+  if($('pbox')){
+    $('pbox').innerHTML=html;
+    $('pbox').onclick=function(ev){
+      if(ev.target.closest('button,a'))return;
+      if(window.getSelection&&String(window.getSelection()))return;
+      var c=ev.target.closest('[data-mid]');if(c)openAct(c.getAttribute('data-mid'));
+    };
+  }
 }
 function editMember(id){
   var m=S.mem2.find(function(x){return x.id===id;});
