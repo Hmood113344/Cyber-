@@ -440,7 +440,7 @@ async function getMemberMap() {
     return memInflight;
 }
 app.get("/api/events", auth, wrap(async (req, res) => {
-    const { q, cat, unres, before, cu } = req.query;
+    const { q, cat, unres, before, cu, from, to } = req.query;
     const f = {};
     if (cu === "1") f["data.catchup"] = true;
     if (cat === "sus") f.kind = "suspicious";
@@ -448,7 +448,13 @@ app.get("/api/events", auth, wrap(async (req, res) => {
     else if (cat === "probot") f["data.probot"] = true;
     else if (cat) f.cat = cat;
     if (unres === "1") { f.kind = "suspicious"; f.resolved = false; }
-    if (before) f.createdAt = { $lt: new Date(Number(before)) };
+    // فلتر الوقت (من/إلى) — مباشرة على createdAt من قاعدة البيانات، القيم بالـ ms
+    const ca = {}, fromN = Number(from), toN = Number(to);
+    if (from && isFinite(fromN)) ca.$gte = new Date(fromN);
+    let lt = (to && isFinite(toN)) ? toN : null;
+    if (before) lt = lt == null ? Number(before) : Math.min(lt, Number(before));
+    if (lt != null) ca.$lt = new Date(lt);
+    if (Object.keys(ca).length) f.createdAt = ca;
     if (q && String(q).trim()) {
         const t = String(q).trim(), w = parseWhen(t);
         if (w.conds.length) f.$expr = { $and: w.conds };          // بحث بالوقت / التاريخ
@@ -860,6 +866,18 @@ input:focus, select:focus { outline:none; border-color:var(--gold-soft); }
 @media (max-width:640px) { .filters { grid-template-columns:1fr; } }
 .chk { display:flex; align-items:center; gap:8px; font-size:13px; color:#94a3b8; cursor:pointer; white-space:nowrap; }
 .chk input { width:auto; }
+.tfbar:empty { display:none; }
+.tfbar { margin:10px 0 2px; }
+.tfpill { display:inline-flex; align-items:center; gap:10px; background:rgba(59,130,246,0.15); border:1px solid #3b82f6; color:#bfdbfe; border-radius:999px; padding:5px 8px 5px 14px; font-size:13px; font-weight:700; max-width:100%; }
+.tfpill span { overflow-wrap:anywhere; }
+.tfpill button { background:rgba(255,255,255,0.12); border:none; color:#fff; width:24px; height:24px; border-radius:50%; cursor:pointer; font-size:13px; line-height:1; flex:none; }
+.tfpill button:hover { background:#ef4444; }
+.tfchips { display:flex; flex-wrap:wrap; gap:8px; margin:8px 0 14px; }
+.tftabs { display:flex; gap:8px; margin:6px 0 12px; }
+.tftabs .btn { flex:1; text-align:center; }
+.tfgrid { display:grid; grid-template-columns:1fr 1fr; gap:8px 10px; align-items:center; }
+.tfgrid .tfl { grid-column:1 / -1; font-size:12px; color:#94a3b8; margin-top:6px; }
+.tfpr { display:flex; flex-wrap:wrap; gap:8px; margin-top:8px; }
 .log-item { background:rgba(255,255,255,0.02); border:1px solid rgba(59,130,246,0.2); border-radius:10px; padding:12px 15px; margin-bottom:9px; display:flex; justify-content:space-between; align-items:flex-start; gap:12px; font-size:0.88rem; flex-wrap:wrap; }
 .log-item.sus { border-color:rgba(239,68,68,0.55); background:rgba(239,68,68,0.06); }
 .log-item.sus.medium { border-color:rgba(234,179,8,0.55); background:rgba(234,179,8,0.05); }
@@ -987,7 +1005,7 @@ function loginPage(mode) {
 
 const CLIENT = String.raw`
 var PAGES=[['logs','📜 اللوق'],['stats','📊 الإحصائيات'],['bots','🤖 البوتات'],['perms','🔐 صلاحيات السيرفر']];
-var S={page:'logs',q:'',cat:'',unres:false,cu:false,events:[],sig:'',timer:null,permsTab:'roles',permsView:'danger',permsQ:'',meta:null,presence:true,level:'view',meId:null};
+var S={page:'logs',q:'',cat:'',unres:false,cu:false,events:[],sig:'',timer:null,permsTab:'roles',permsView:'danger',permsQ:'',meta:null,presence:true,level:'view',meId:null,tf:null};
 var CATS=[['','الكل'],['sus','⚠️ العمليات المشبوهة'],['newacc','🆕 حسابات جديدة'],['join','دخول'],['leave','خروج'],['kick','طرد'],['ban','حظر'],['role','الرتب'],['inquiry','📩 استفسارات الرتب'],['channel','القنوات'],['voice','🎙️ الرومات الصوتية'],['message','الرسائل المحذوفة'],['probot','🧹 حذف عبر ProBot'],['bot','البوتات'],['webhook','ويبهوكس'],['everyone','منشن everyone'],['server','إعدادات السيرفر'],['panel','عمليات اللوحة']];
 var RULE_AR={new_account:'حساب جديد',mass_roles_created:'رتب جماعية',mass_role_delete:'حذف رتب',mass_channel_create:'إنشاء قنوات',mass_channel_delete:'حذف قنوات',mass_ban:'حظر جماعي',mass_kick:'طرد جماعي',dangerous_perm_grant:'صلاحيات خطيرة',dangerous_role_assigned:'رتبة خطيرة',bot_added:'بوت جديد',webhook_created:'ويبهوك',everyone_spam:'منشن everyone',mass_join:'غارة دخول',mass_msg_delete:'مسح ضخم',server_changed:'إعدادات السيرفر'};
 function $(id){return document.getElementById(id);}
@@ -1073,10 +1091,10 @@ async function runBackfill(h){
 }
 function showRecovered(){
   closeModal();
-  S.cu=true;S.unres=false;S.q='';S.cat='';
+  S.cu=true;S.unres=false;S.q='';S.cat='';S.tf=null;
   if(S.page!=='logs'){go('logs');return;}
   var c=$('f-cu');if(c)c.checked=true;var u=$('f-un');if(u)u.checked=false;var fq=$('f-q');if(fq)fq.value='';var fc=$('f-cat');if(fc)fc.value='';
-  loadEvents();
+  renderTf();loadEvents();
 }
 function pgLogs(){
   var opts=CATS.map(function(c){return '<option value="'+c[0]+'"'+(S.cat===c[0]?' selected':'')+'>'+c[1]+'</option>';}).join('');
@@ -1085,8 +1103,9 @@ function pgLogs(){
    +'<select id="f-cat">'+opts+'</select>'
    +'<label class="chk"><input type="checkbox" id="f-un"'+(S.unres?' checked':'')+'> غير المحلولة فقط</label>'
    +'<label class="chk"><input type="checkbox" id="f-cu"'+(S.cu?' checked':'')+'> 🔄 المسترجعة فقط</label>'
-   +(S.level==='full'?'<button class="btn sm gray" onclick="openBackfill()">🔄 استرجاع الفائت</button>':'')+'</div><div class="muted" style="font-size:11px;margin-top:8px;line-height:1.8">💡 تقدر تبحث بالوقت والتاريخ بالعربي أو الإنجليزي، وتدمجه مع الاسم: <b>اليوم</b> • <b>أمس</b> • <b>10:30 م</b> • <b>3 مساء</b> • <b>5 أكتوبر</b> • <b>2026-10-01</b> • <b>الخميس</b> • <b>today</b> • <b>yesterday</b> • <b>9pm</b> • <b>ahmed أمس</b></div></div>'
+   +(S.level==='full'?'<button class="btn sm gray" onclick="openBackfill()">🔄 استرجاع الفائت</button>':'')+'</div><div style="margin-top:10px"><button class="btn sm gray" onclick="openTf()">🕒 فلتر الوقت</button></div></div><div class="tfbar" id="tfbar"></div>'
    +'<div id="evlist"><div class="card center muted">جاري التحميل...</div></div><div class="center"><button class="btn gray" id="more" style="display:none" onclick="moreEvents()">تحميل المزيد</button></div>';
+  renderTf();
   var t;$('f-q').oninput=function(){S.q=this.value;clearTimeout(t);t=setTimeout(loadEvents,350);};
   $('f-cat').onchange=function(){S.cat=this.value;loadEvents();};
   $('f-un').onchange=function(){S.unres=this.checked;loadEvents();};
@@ -1099,7 +1118,95 @@ function pgLogs(){
   loadEvents();
   S.timer=setInterval(function(){loadEvents(true);},6000);
 }
-function qs(before){return '/api/events?q='+encodeURIComponent(S.q)+'&cat='+encodeURIComponent(S.cat)+'&unres='+(S.unres?1:0)+'&cu='+(S.cu?1:0)+(before?'&before='+before:'');}
+// ── فلتر الوقت (بتوقيت الرياض) ──
+var RY=10800000,DAYMS=86400000,TFQ=[['h1','⏱️ آخر ساعة'],['h6','⏱️ آخر 6 ساعات'],['today','📅 اليوم'],['yest','📅 أمس'],['d3','📅 آخر 3 أيام'],['week','📅 هذا الأسبوع']],tfMode='r',tfPR=15;
+function pad2(n){return (n<10?'0':'')+n;}
+function ryStart(ms){return Math.floor((ms+RY)/DAYMS)*DAYMS-RY;}
+function ryDate(ms){return new Date(ms+RY).toISOString().slice(0,10);}
+function ryMs(d,h,m){return new Date(d+'T'+pad2(h)+':'+pad2(m)+':00+03:00').getTime();}
+function tl(ms){try{return new Date(ms).toLocaleTimeString('ar-SA-u-nu-latn',{timeZone:'Asia/Riyadh',hour12:true,hour:'numeric',minute:'2-digit'});}catch(e){return new Date(ms).toLocaleTimeString();}}
+function dayWord(d){
+  if(d===ryDate(Date.now()))return 'اليوم';
+  if(d===ryDate(Date.now()-DAYMS))return 'أمس';
+  try{return new Date(d+'T12:00:00+03:00').toLocaleDateString('ar-SA-u-ca-gregory-nu-latn',{timeZone:'Asia/Riyadh',day:'numeric',month:'long'});}catch(e){return d;}
+}
+function tfRange(){
+  var t=S.tf;if(!t)return null;
+  var n=Date.now(),s=ryStart(n);
+  if(t.k==='h1')return {from:n-3600000};
+  if(t.k==='h6')return {from:n-21600000};
+  if(t.k==='today')return {from:s};
+  if(t.k==='yest')return {from:s-DAYMS,to:s};
+  if(t.k==='d3')return {from:s-2*DAYMS};
+  if(t.k==='week')return {from:s-new Date(n+RY).getUTCDay()*DAYMS};
+  return {from:t.from,to:t.to};
+}
+function renderTf(){
+  var b=$('tfbar');if(!b)return;
+  b.innerHTML=S.tf?'<div class="tfpill"><span>'+esc(S.tf.label)+'</span><button onclick="clearTf()" aria-label="إزالة الفلتر">✕</button></div>':'';
+}
+function clearTf(){S.tf=null;renderTf();loadEvents();}
+function setTf(o){S.tf=o;closeModal();renderTf();loadEvents();}
+function hrOpts(none,sel){
+  var h='';if(none)h+='<option value="">بدون</option>';
+  for(var i=0;i<24;i++)h+='<option value="'+i+'"'+(sel===i?' selected':'')+'>'+((i%12)||12)+(i<12?' ص':' م')+'</option>';
+  return h;
+}
+function minOpts(sel){var h='';for(var i=0;i<60;i+=5)h+='<option value="'+i+'"'+(sel===i?' selected':'')+'>'+pad2(i)+'</option>';return h;}
+function openTf(){
+  var now=Date.now(),td=ryDate(now),rh=new Date(now+RY).getUTCHours(),rm=Math.floor(new Date(now+RY).getUTCMinutes()/5)*5;
+  tfMode='r';tfPR=15;
+  var chips=TFQ.map(function(c,i){return '<button class="btn sm gray" onclick="tfQuick('+i+')">'+c[1]+'</button>';}).join('');
+  modal('<h3>🕒 فلتر الوقت</h3><div class="muted" style="font-size:12px;text-align:center">بتوقيت السعودية</div>'
+   +'<div class="tfchips">'+chips+'</div>'
+   +'<div class="tftabs"><button class="btn sm" id="tft-r" onclick="tfTab(\'r\')">📆 من – إلى</button><button class="btn sm gray" id="tft-p" onclick="tfTab(\'p\')">🎯 ساعة محددة</button></div>'
+   +'<div id="tf-r" class="tfgrid">'
+     +'<div class="tfl">من يوم</div><input type="date" id="tf-d1" value="'+td+'" style="grid-column:1 / -1">'
+     +'<div class="tfl">من الساعة</div><select id="tf-h1h">'+hrOpts(true,null)+'</select><select id="tf-h1m">'+minOpts(0)+'</select>'
+     +'<div class="tfl">إلى يوم</div><input type="date" id="tf-d2" value="'+td+'" style="grid-column:1 / -1">'
+     +'<div class="tfl">إلى الساعة</div><select id="tf-h2h">'+hrOpts(true,null)+'</select><select id="tf-h2m">'+minOpts(55)+'</select>'
+   +'</div>'
+   +'<div id="tf-p" class="tfgrid" style="display:none">'
+     +'<div class="tfl">اليوم</div><input type="date" id="tf-pd" value="'+td+'" style="grid-column:1 / -1">'
+     +'<div class="tfl">الساعة</div><select id="tf-ph">'+hrOpts(false,rh)+'</select><select id="tf-pm">'+minOpts(rm)+'</select>'
+     +'<div class="tfl">المدى حولها</div><div class="tfpr" style="grid-column:1 / -1" id="tf-pr">'
+       +[[5,'± 5 دقائق'],[15,'± 15 دقيقة'],[30,'± 30 دقيقة'],[60,'± ساعة']].map(function(x){return '<button class="btn sm '+(x[0]===15?'':'gray')+'" data-m="'+x[0]+'" onclick="tfPick(this)">'+x[1]+'</button>';}).join('')
+     +'</div>'
+   +'</div>'
+   +'<div class="row" style="justify-content:flex-start;margin-top:16px"><button class="btn" onclick="tfApply()">تطبيق</button><button class="btn gray" onclick="closeModal()">إلغاء</button></div>');
+}
+function tfQuick(i){var c=TFQ[i];setTf({k:c[0],label:c[1]});}
+function tfTab(m){
+  tfMode=m;
+  $('tf-r').style.display=m==='r'?'grid':'none';$('tf-p').style.display=m==='p'?'grid':'none';
+  $('tft-r').className='btn sm'+(m==='r'?'':' gray');$('tft-p').className='btn sm'+(m==='p'?'':' gray');
+}
+function tfPick(b){
+  tfPR=+b.getAttribute('data-m');
+  [].slice.call($('tf-pr').querySelectorAll('button')).forEach(function(x){x.className='btn sm'+(x===b?'':' gray');});
+}
+function tfApply(){
+  if(tfMode==='p'){
+    var d=$('tf-pd').value;if(!d){toast('اختر اليوم');return;}
+    var t=ryMs(d,+$('tf-ph').value,+$('tf-pm').value),r=tfPR*60000;
+    var f=t-r,e=t+r;
+    var lb=ryDate(f)===ryDate(e)?'📅 '+dayWord(ryDate(f))+' • '+tl(f)+' – '+tl(e):'📅 '+dayWord(ryDate(f))+' '+tl(f)+' إلى '+dayWord(ryDate(e))+' '+tl(e);
+    setTf({k:'custom',from:f,to:e+60000,label:lb});return;
+  }
+  var d1=$('tf-d1').value,d2=$('tf-d2').value;if(!d1||!d2){toast('اختر التاريخ');return;}
+  var h1=$('tf-h1h').value,h2=$('tf-h2h').value;
+  var from=h1===''?ryMs(d1,0,0):ryMs(d1,+h1,+$('tf-h1m').value);
+  var to=h2===''?ryMs(d2,0,0)+DAYMS:ryMs(d2,+h2,+$('tf-h2m').value)+60000;
+  if(to<=from){toast('النهاية لازم تكون بعد البداية');return;}
+  var lb;
+  if(h1===''&&h2==='')lb=d1===d2?'📅 '+dayWord(d1):'📅 من '+dayWord(d1)+' إلى '+dayWord(d2);
+  else{
+    var a=h1===''?'12:00 ص':tl(from),b=h2===''?'11:59 م':tl(to-60000);
+    lb=d1===d2?'📅 '+dayWord(d1)+' • '+a+' – '+b:'📅 '+dayWord(d1)+' '+a+' إلى '+dayWord(d2)+' '+b;
+  }
+  setTf({k:'custom',from:from,to:to,label:lb});
+}
+function qs(before){var r=tfRange()||{};return '/api/events?q='+encodeURIComponent(S.q)+'&cat='+encodeURIComponent(S.cat)+'&unres='+(S.unres?1:0)+'&cu='+(S.cu?1:0)+(r.from?'&from='+r.from:'')+(r.to?'&to='+r.to:'')+(before?'&before='+before:'');}
 async function loadEvents(silent){
   try{
     var j=await api(qs());
