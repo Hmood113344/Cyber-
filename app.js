@@ -1152,9 +1152,10 @@ function hrOpts(none,sel){
   for(var i=0;i<24;i++)h+='<option value="'+i+'"'+(sel===i?' selected':'')+'>'+((i%12)||12)+(i<12?' ص':' م')+'</option>';
   return h;
 }
-function minOpts(sel){var h='';for(var i=0;i<60;i+=5)h+='<option value="'+i+'"'+(sel===i?' selected':'')+'>'+pad2(i)+'</option>';return h;}
+function minIn(id,v){return '<input type="number" id="'+id+'" min="0" max="59" step="1" inputmode="numeric" placeholder="دقيقة" value="'+v+'" onfocus="this.select()">';}
+function mv(id){var n=parseInt($(id).value,10);return isNaN(n)?0:Math.max(0,Math.min(59,n));}
 function openTf(){
-  var now=Date.now(),td=ryDate(now),rh=new Date(now+RY).getUTCHours(),rm=Math.floor(new Date(now+RY).getUTCMinutes()/5)*5;
+  var now=Date.now(),td=ryDate(now),rh=new Date(now+RY).getUTCHours(),rm=new Date(now+RY).getUTCMinutes();
   tfMode='r';tfPR=15;
   var chips=TFQ.map(function(c,i){return '<button class="btn sm gray" onclick="tfQuick('+i+')">'+c[1]+'</button>';}).join('');
   modal('<h3>🕒 فلتر الوقت</h3><div class="muted" style="font-size:12px;text-align:center">بتوقيت السعودية</div>'
@@ -1162,13 +1163,13 @@ function openTf(){
    +'<div class="tftabs"><button class="btn sm" id="tft-r" onclick="tfTab(\'r\')">📆 من – إلى</button><button class="btn sm gray" id="tft-p" onclick="tfTab(\'p\')">🎯 ساعة محددة</button></div>'
    +'<div id="tf-r" class="tfgrid">'
      +'<div class="tfl">من يوم</div><input type="date" id="tf-d1" value="'+td+'" style="grid-column:1 / -1">'
-     +'<div class="tfl">من الساعة</div><select id="tf-h1h">'+hrOpts(true,null)+'</select><select id="tf-h1m">'+minOpts(0)+'</select>'
+     +'<div class="tfl">من الساعة</div><select id="tf-h1h">'+hrOpts(true,null)+'</select>'+minIn('tf-h1m',0)+''
      +'<div class="tfl">إلى يوم</div><input type="date" id="tf-d2" value="'+td+'" style="grid-column:1 / -1">'
-     +'<div class="tfl">إلى الساعة</div><select id="tf-h2h">'+hrOpts(true,null)+'</select><select id="tf-h2m">'+minOpts(55)+'</select>'
+     +'<div class="tfl">إلى الساعة</div><select id="tf-h2h">'+hrOpts(true,null)+'</select>'+minIn('tf-h2m',59)+''
    +'</div>'
    +'<div id="tf-p" class="tfgrid" style="display:none">'
      +'<div class="tfl">اليوم</div><input type="date" id="tf-pd" value="'+td+'" style="grid-column:1 / -1">'
-     +'<div class="tfl">الساعة</div><select id="tf-ph">'+hrOpts(false,rh)+'</select><select id="tf-pm">'+minOpts(rm)+'</select>'
+     +'<div class="tfl">الساعة</div><select id="tf-ph">'+hrOpts(false,rh)+'</select>'+minIn('tf-pm',rm)+''
      +'<div class="tfl">المدى حولها</div><div class="tfpr" style="grid-column:1 / -1" id="tf-pr">'
        +[[5,'± 5 دقائق'],[15,'± 15 دقيقة'],[30,'± 30 دقيقة'],[60,'± ساعة']].map(function(x){return '<button class="btn sm '+(x[0]===15?'':'gray')+'" data-m="'+x[0]+'" onclick="tfPick(this)">'+x[1]+'</button>';}).join('')
      +'</div>'
@@ -1188,15 +1189,15 @@ function tfPick(b){
 function tfApply(){
   if(tfMode==='p'){
     var d=$('tf-pd').value;if(!d){toast('اختر اليوم');return;}
-    var t=ryMs(d,+$('tf-ph').value,+$('tf-pm').value),r=tfPR*60000;
+    var t=ryMs(d,+$('tf-ph').value,mv('tf-pm')),r=tfPR*60000;
     var f=t-r,e=t+r;
     var lb=ryDate(f)===ryDate(e)?'📅 '+dayWord(ryDate(f))+' • '+tl(f)+' – '+tl(e):'📅 '+dayWord(ryDate(f))+' '+tl(f)+' إلى '+dayWord(ryDate(e))+' '+tl(e);
     setTf({k:'custom',from:f,to:e+60000,label:lb});return;
   }
   var d1=$('tf-d1').value,d2=$('tf-d2').value;if(!d1||!d2){toast('اختر التاريخ');return;}
   var h1=$('tf-h1h').value,h2=$('tf-h2h').value;
-  var from=h1===''?ryMs(d1,0,0):ryMs(d1,+h1,+$('tf-h1m').value);
-  var to=h2===''?ryMs(d2,0,0)+DAYMS:ryMs(d2,+h2,+$('tf-h2m').value)+60000;
+  var from=h1===''?ryMs(d1,0,0):ryMs(d1,+h1,mv('tf-h1m'));
+  var to=h2===''?ryMs(d2,0,0)+DAYMS:ryMs(d2,+h2,mv('tf-h2m'))+60000;
   if(to<=from){toast('النهاية لازم تكون بعد البداية');return;}
   var lb;
   if(h1===''&&h2==='')lb=d1===d2?'📅 '+dayWord(d1):'📅 من '+dayWord(d1)+' إلى '+dayWord(d2);
