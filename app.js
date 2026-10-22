@@ -3727,7 +3727,7 @@ function vrFrames(u, mono) {
 function vrSub(s, u) {
     if (s.closing || u.closed || u.stream || !VR.receiver) return;
     try {
-        const stream = VR.receiver.subscribe(u.uid, { end: { behavior: VoiceLib.EndBehavior.Manual } });
+        const stream = VR.receiver.subscribe(u.uid, { end: { behavior: VoiceLib.EndBehaviorType.Manual } });
         u.stream = stream;
         stream.on("data", pkt => {
             if (s.closing) return;
