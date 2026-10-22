@@ -3663,7 +3663,7 @@ async function vrEnsureConnected() {
         const ch = await vrChannel();
         if (!ch || !ch.isVoiceBased()) { console.log("⚠️ روم التسجيل غير موجود أو مو صوتي:", vrCh()); return; }
         const g = await getGuild();
-        const conn = VoiceLib.joinVoiceChannel({ channelId: ch.id, guildId: g.id, adapterCreator: g.voiceAdapterCreator, selfDeaf: false, selfMute: true });
+        const conn = VoiceLib.joinVoiceChannel({ channelId: ch.id, guildId: g.id, adapterCreator: g.voiceAdapterCreator, selfDeaf: false, selfMute: true, decryptionFailureTolerance: 100 });
         VR.conn = conn;
         conn.on("error", e => console.log("voice conn error:", e.message));
         conn.on(VoiceConnectionStatus.Disconnected, async () => {
@@ -3710,18 +3710,15 @@ function vrFrames(u, mono) {
     u.acc = o ? a.slice(o) : a;
 }
 
-function vrAddUser(s, m) {
-    const uid = m.id;
-    if (s.users.has(uid)) return;
-    const now = Date.now();
-    s.stays.push({ uid, name: m.displayName || m.user.username, tag: tagOf(m.user), avatar: m.user.displayAvatarURL ? m.user.displayAvatarURL({ size: 64, extension: "png" }) : null, start: now, end: null });
-    const u = { uid, dec: new OpusScript(48000, 2, OpusScript.Application.AUDIO), q: [], acc: new Int16Array(0), stream: null, talking: false };
+function vrSub(s, u) {
+    if (s.closing || u.closed || u.stream || !VR.receiver) return;
     try {
-        const stream = VR.receiver.subscribe(uid, { end: { behavior: VoiceLib.EndBehavior.Manual } });
+        const stream = VR.receiver.subscribe(u.uid, { end: { behavior: VoiceLib.EndBehavior.Manual } });
+        u.stream = stream;
         stream.on("data", pkt => {
             if (s.closing) return;
             s.pkts++;
-            if (!u.got) { u.got = true; console.log("🎤 وصلت أول حزمة صوت من", uid, "حجمها", pkt.length); }
+            if (!u.got) { u.got = true; console.log("🎤 وصلت أول حزمة صوت من", u.uid, "حجمها", pkt.length); }
             try {
                 const pcm = Buffer.from(u.dec.decode(pkt));
                 const n = Math.floor(pcm.length / 4);
@@ -3731,10 +3728,25 @@ function vrAddUser(s, m) {
                 vrFrames(u, mono);
             } catch (e) { if (!s.decErr) { s.decErr = String(e.message || e).slice(0, 120); console.log("❌ فشل فك ترميز الصوت:", s.decErr); } }
         });
-        stream.on("error", e => console.log("voice stream error:", e.message));
-        u.stream = stream;
+        stream.on("error", e => {
+            s.errs = (s.errs || 0) + 1; s.lastErr = String(e.message || e).slice(0, 100);
+            if (s.errs === 1 || s.errs % 50 === 0) console.log("voice stream error (" + s.errs + "):", s.lastErr);
+        });
+        stream.on("close", () => {
+            if (u.stream === stream) u.stream = null;
+            if (!u.closed && !s.closing && (u.resubs = (u.resubs || 0) + 1) < 400) setTimeout(() => vrSub(s, u), 150);
+        });
     } catch (e) { console.log("voice subscribe failed:", e.message); }
+}
+
+function vrAddUser(s, m) {
+    const uid = m.id;
+    if (s.users.has(uid)) return;
+    const now = Date.now();
+    s.stays.push({ uid, name: m.displayName || m.user.username, tag: tagOf(m.user), avatar: m.user.displayAvatarURL ? m.user.displayAvatarURL({ size: 64, extension: "png" }) : null, start: now, end: null });
+    const u = { uid, dec: new OpusScript(48000, 2, OpusScript.Application.AUDIO), q: [], acc: new Int16Array(0), stream: null, talking: false };
     s.users.set(uid, u);
+    vrSub(s, u);
 }
 
 function vrCloseUser(s, uid) {
@@ -3742,6 +3754,7 @@ function vrCloseUser(s, uid) {
     for (let i = s.stays.length - 1; i >= 0; i--) { if (s.stays[i].uid === uid && !s.stays[i].end) { s.stays[i].end = now; break; } }
     const u = s.users.get(uid);
     if (!u) return;
+    u.closed = true;
     if (u.talking) vrSpeak(uid, 0);
     try { if (u.stream) u.stream.destroy(); } catch {}
     try { if (u.dec && u.dec.delete) u.dec.delete(); } catch {}
@@ -3752,7 +3765,9 @@ function vrSpeak(uid, on) {
     const s = VR.sess;
     if (!s || s.closing) return;
     const u = s.users.get(uid);
-    if (!u || u.talking === !!on) return;
+    if (!u) return;
+    if (on && !u.stream) vrSub(s, u);
+    if (u.talking === !!on) return;
     u.talking = !!on;
     if (s.speechTotal >= VR.MAX_SPEECH) return;
     s.speechBuf.push([uid, on ? 1 : 0, Math.max(0, Date.now() - s.startedAt)]);
@@ -3798,7 +3813,7 @@ function vrFlush(s, final) {
                 await VoiceChunk.updateOne({ sid: s.sid, seq }, { $set: { data, createdAt: new Date() } }, { upsert: true });
                 s.bytes += data.length;
             }
-            const set = { lastAt: new Date(), stays: s.stays, bytes: s.bytes, pkts: s.pkts || 0, decErr: s.decErr || null };
+            const set = { lastAt: new Date(), stays: s.stays, bytes: s.bytes, pkts: s.pkts || 0, decErr: s.decErr || (s.errs ? ("stream: " + s.lastErr + " ×" + s.errs) : null) };
             if (final) set.endedAt = new Date();
             const upd = { $set: set, $max: { chunks: s.seq } };
             if (speech.length) { upd.$push = { speech: { $each: speech } }; upd.$inc = { speechN: speech.length }; }
