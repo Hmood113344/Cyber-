@@ -118,13 +118,15 @@ const VoiceSess = mongoose.model("CyberVoiceSess", new mongoose.Schema({
     speech: { type: [mongoose.Schema.Types.Mixed], default: [] }, speechN: { type: Number, default: 0 },
     pkts: { type: Number, default: 0 }, decErr: { type: String, default: null },
     dbg: { type: String, default: null }, dep: { type: String, default: null },
+    tracks: { type: mongoose.Schema.Types.Mixed, default: {} },
     createdAt: { type: Date, default: Date.now, expires: 60 * 60 * 24 * 30 },
 }, { minimize: false }));
 const VoiceChunkSchema = new mongoose.Schema({
-    sid: String, seq: Number, data: Buffer,
+    sid: String, uid: { type: String, default: null }, seq: Number, data: Buffer,
     createdAt: { type: Date, default: Date.now, expires: 60 * 60 * 24 * 30 },
 });
 VoiceChunkSchema.index({ sid: 1, seq: 1 });
+VoiceChunkSchema.index({ sid: 1, uid: 1, seq: 1 });
 const VoiceChunk = mongoose.model("CyberVoiceChunk", VoiceChunkSchema);
 
 // ── بث فوري للوحة (Server-Sent Events) — بدون أي تحديث كامل للصفحة ──
@@ -348,14 +350,15 @@ app.get("/api/images/:id", auth, wrap(async (req, res) => {
 
 // ── تسجيل الروم الصوتي: بيانات الجلسة + الصوت (للقائد والنائب فقط) ──
 const voiceCache = new Map();
-async function voiceBuffer(sid, ended) {
-    const c = voiceCache.get(sid);
+async function voiceBuffer(sid, ended, uid) {
+    const ck = sid + "|" + (uid || "");
+    const c = voiceCache.get(ck);
     if (ended && c && Date.now() - c.t < 10 * 60 * 1000) return c.buf;
-    const parts = await VoiceChunk.find({ sid }).sort({ seq: 1 }).select("data").lean();
+    const parts = await VoiceChunk.find({ sid, uid: uid || null }).sort({ seq: 1 }).select("data").lean();
     const buf = Buffer.concat(parts.map(x => Buffer.isBuffer(x.data) ? x.data : Buffer.from(x.data?.buffer || x.data || [])));
     if (ended && buf.length) {
-        voiceCache.set(sid, { buf, t: Date.now() });
-        while (voiceCache.size > 2) voiceCache.delete(voiceCache.keys().next().value);
+        voiceCache.set(ck, { buf, t: Date.now() });
+        while (voiceCache.size > 6) voiceCache.delete(voiceCache.keys().next().value);
     }
     return buf;
 }
@@ -368,7 +371,7 @@ app.get("/api/voice/:sid", auth, full, wrap(async (req, res) => {
     res.json({ session: {
         sid, chName: d.chName || "", startedAt: new Date(d.startedAt).getTime(),
         endedAt: d.endedAt ? new Date(d.endedAt).getTime() : null, lastAt: d.lastAt ? new Date(d.lastAt).getTime() : null,
-        live: !!live, hasAudio: (d.chunks || 0) > 0, pkts: d.pkts || 0, decErr: d.decErr || null, dbg: d.dbg || "", dep: d.dep || "",
+        live: !!live, hasAudio: (d.chunks || 0) > 0, pkts: d.pkts || 0, decErr: d.decErr || null, dbg: d.dbg || "", dep: d.dep || "", tracks: d.tracks || {},
         stays: (d.stays || []).map(x => ({ uid: String(x.uid), name: x.name || x.tag || x.uid, avatar: x.avatar || null, start: Number(x.start), end: x.end ? Number(x.end) : null })),
         speech: (d.speech || []).filter(e => Array.isArray(e) && e.length >= 3),
     } });
@@ -378,7 +381,9 @@ app.get("/api/voice/:sid/audio", auth, full, wrap(async (req, res) => {
     if (!/^[\w-]{4,60}$/.test(sid)) return res.status(400).end();
     const d = await VoiceSess.findOne({ sid }).select("endedAt").lean();
     if (!d) return res.status(404).end();
-    const buf = await voiceBuffer(sid, !!d.endedAt);
+    const uidq = String(req.query.u || "");
+    if (uidq && !/^\d{5,25}$/.test(uidq)) return res.status(400).end();
+    const buf = await voiceBuffer(sid, !!d.endedAt, uidq || null);
     if (!buf.length) return res.status(404).end();
     const total = buf.length;
     res.set({ "Content-Type": "audio/ogg", "Accept-Ranges": "bytes", "Cache-Control": d.endedAt ? "private, max-age=300" : "no-store" });
@@ -1062,6 +1067,11 @@ nav { height:auto; min-height:62px; padding-top:env(safe-area-inset-top,0px); }
 .rp-mic.live { color:#4ade80; animation:rpPulse .9s ease-in-out infinite; }
 @keyframes rpPulse { 0%,100% { opacity:1; } 50% { opacity:.45; } }
 .rp-feed { max-height:120px; overflow-y:auto; font-size:12px; color:#cbd5e1; margin-top:8px; line-height:1.9; }
+.vr-lane { margin-bottom:8px; }
+.vr-lh { direction:rtl; font-size:12px; display:flex; justify-content:space-between; align-items:center; gap:6px; margin-bottom:3px; }
+.vr-bar { position:relative; height:18px; background:rgba(255,255,255,0.05); border-radius:5px; overflow:hidden; cursor:pointer; }
+.vr-pres { position:absolute; top:0; bottom:0; background:rgba(148,163,184,0.22); }
+.vr-sp { position:absolute; top:3px; bottom:3px; border-radius:3px; }
 `;
 
 const HEAD = (title) => `<!DOCTYPE html>
@@ -1092,31 +1102,33 @@ function esc(s){return String(s==null?'':s).replace(/&/g,'&amp;').replace(/</g,'
 function toast(m){var t=$('toast');t.textContent=m;t.style.display='block';clearTimeout(t._t);t._t=setTimeout(function(){t.style.display='none';},3200);}
 function fmt(d){try{return new Date(d).toLocaleString('ar-SA',{timeZone:'Asia/Riyadh',hour12:true,dateStyle:'medium',timeStyle:'short'});}catch(e){return new Date(d).toLocaleString();}}
 function ago(d){var s=Math.floor((Date.now()-new Date(d).getTime())/1000);if(s<60)return 'الحين';if(s<3600)return 'قبل '+Math.floor(s/60)+' دقيقة';if(s<86400)return 'قبل '+Math.floor(s/3600)+' ساعة';return 'قبل '+Math.floor(s/86400)+' يوم';}
-/* ══ تسجيل الروم الصوتي: تسجيل توضيحي (دخول/خروج + مايك) + الصوت ══ */
+/* ══ تسجيل الروم الصوتي: شريط صوت + مسارات كل شخص + اختيار مقطع ══ */
 var VR=null;
+var VR_COL=['#38bdf8','#4ade80','#f472b6','#fbbf24','#a78bfa','#fb923c','#2dd4bf','#f87171','#a3e635','#e879f9'];
 function vrT(ms){try{return new Date(ms).toLocaleTimeString('ar-SA-u-nu-latn',{timeZone:'Asia/Riyadh',hour12:true,hour:'numeric',minute:'2-digit',second:'2-digit'});}catch(e){return new Date(ms).toLocaleTimeString();}}
 function vrDur(ms){var s=Math.max(0,Math.round(ms/1000)),h=Math.floor(s/3600),m=Math.floor((s%3600)/60),x=s%60;return h?h+' س '+m+' د':(m?m+' د '+x+' ث':x+' ث');}
+function vrMS(ms){var s=Math.max(0,Math.floor(ms/1000)),h=Math.floor(s/3600),m=Math.floor((s%3600)/60),x=s%60;return (h?h+':'+(m<10?'0':'')+m:m)+':'+(x<10?'0':'')+x;}
+function vrParse(t){t=String(t||'').trim();if(!t)return null;var p=t.split(':'),n=0;for(var i=0;i<p.length;i++){var v=parseFloat(p[i]);if(isNaN(v))return null;n=n*60+v;}return Math.round(n*1000);}
 function vrStop(){
-  if(VR&&VR.timer)clearInterval(VR.timer);
-  if(VR&&VR.audio){try{VR.audio.pause();VR.audio.removeAttribute('src');}catch(e){}}
+  if(VR){
+    if(VR.timer)clearInterval(VR.timer);
+    for(var k in VR.els){try{VR.els[k].pause();VR.els[k].removeAttribute('src');}catch(e){}}
+  }
   VR=null;
 }
 function vrClose(){vrStop();closeModal();}
 function vrDiag(s){
   var sup='';try{sup=new Audio().canPlayType('audio/ogg; codecs=opus');}catch(e){}
   var starts=(s.speech||[]).filter(function(e){return e[1]===1;}).length;
-  var o='<div class="card" style="margin:8px 0;padding:6px 12px;font-size:12px">'
-    +'<div class="prow"><span class="muted">📦 حزم الصوت المستلمة</span><b>'+(s.pkts||0)+'</b></div>'
-    +'<div class="prow"><span class="muted">🎤 مرات بدء التحدث</span><b>'+starts+'</b></div>'
-    +'<div class="prow" style="border:none"><span class="muted">🔊 المتصفح يشغّل الصيغة</span><b>'+(sup?'نعم':'لا')+'</b></div></div>';
   var w='';
   if(!sup)w='⚠️ متصفحك ما يشغّل صيغة Ogg Opus، جرّب Chrome أو حدّث النظام.';
-  else if(!s.pkts&&starts)w='⚠️ البوت شاف إنك تتكلم لكن ما وصله أي صوت (غالباً مشكلة فك تشفير ديسكورد).';
+  else if(!s.pkts&&starts)w='⚠️ البوت شاف إنك تتكلم لكن ما وصله أي صوت.';
   else if(!s.pkts)w='⚠️ ما وصل أي صوت للبوت في هذي الجلسة.';
   if(s.decErr)w+=' خطأ: '+esc(s.decErr);
+  if(!w)return '';
   var det='';
   if(!s.pkts&&(s.dbg||s.dep))det='<details style="margin:6px 0"><summary class="muted" style="font-size:12px">تفاصيل فنية</summary><pre style="direction:ltr;text-align:left;font-size:10px;white-space:pre-wrap;max-height:160px;overflow:auto">'+esc((s.dep||'')+'\n'+(s.dbg||''))+'</pre></details>';
-  return o+(w?'<p style="font-size:12px;color:#fbbf24;line-height:1.8">'+w+'</p>':'')+det;
+  return '<p style="font-size:12px;color:#fbbf24;line-height:1.8">'+w+'</p>'+det;
 }
 async function vrOpen(sid){
   vrStop();
@@ -1125,142 +1137,257 @@ async function vrOpen(sid){
   try{j=await api('/api/voice/'+encodeURIComponent(sid));}
   catch(e){closeModal();toast(e.message);return;}
   var s=j.session;
+  s.tracks=s.tracks||{};
   var E=s.endedAt||s.lastAt||Date.now();
   var span=Math.max(1000,E-s.startedAt);
-  var evs=[];
-  s.stays.forEach(function(st,k){
-    evs.push({t:st.start,k:k,a:'join'});
-    if(st.end)evs.push({t:st.end,k:k,a:'leave'});
-    st.ongoing=!st.end&&s.live;
+  var att=[],seen={};
+  s.stays.forEach(function(st){
+    if(!seen[st.uid]){seen[st.uid]={uid:st.uid,name:st.name,col:VR_COL[att.length%VR_COL.length],stays:[]};att.push(seen[st.uid]);}
+    seen[st.uid].stays.push(st);
   });
-  evs.sort(function(x,y){return x.t-y.t;});
-  var sp={};
-  s.speech.forEach(function(e){(sp[e[0]]=sp[e[0]]||[]).push([s.startedAt+Number(e[2]),e[1]]);});
-  Object.keys(sp).forEach(function(u){sp[u].sort(function(a,b){return a[0]-b[0];});});
-  VR={s:s,E:E,span:span,evs:evs,sp:sp,T:0,mult:1,rate:1,playing:true,timer:null,base:Math.max(1,span/30000),states:{},passed:-1,audio:null,sid:sid};
-  var uniq={};s.stays.forEach(function(st){uniq[st.uid]=1;});
+  var ev={};
+  s.speech.forEach(function(e){(ev[e[0]]=ev[e[0]]||[]).push([Number(e[2]),e[1]]);});
+  var iv={};
+  Object.keys(ev).forEach(function(u){
+    var arr=ev[u].sort(function(a,b){return a[0]-b[0];}),cur=null;iv[u]=[];
+    arr.forEach(function(x){if(x[1]===1){if(cur===null)cur=x[0];}else if(cur!==null){iv[u].push([cur,Math.max(cur+200,x[0])]);cur=null;}});
+    if(cur!==null)iv[u].push([cur,Math.min(span,cur+1500)]);
+  });
+  VR={s:s,E:E,span:span,att:att,iv:iv,T:0,playing:false,rate:1,sel:{},els:{},r0:null,r1:null,clip:false,drag:false,last:Date.now(),timer:null,sid:sid,wait:0};
+  var hasTracks=Object.keys(s.tracks).length>0;
   var h='<h3>🎬 تسجيل توضيحي — '+esc(s.chName||'الروم المسجّل')+'</h3>'
     +'<div style="text-align:center;margin:14px 0"><div style="font-size:46px">'+(s.hasAudio?'🎧':'🎬')+'</div>'
-    +'<p class="muted" style="font-size:13px;line-height:1.9;margin:8px 0 0">'+(s.hasAudio?'هذي الجلسة فيها تسجيل صوتي. اضغط تشغيل ويشتغل الصوت مع الخط الزمني، وجنب اسم اللي يتكلم يطلع المايك.':'هذي الجلسة بدون صوت. اضغط تشغيل لإعادة الدخول والخروج.')+'</p></div>'
+    +'<p class="muted" style="font-size:13px;line-height:1.9;margin:8px 0 0">'+(s.hasAudio?'شريط صوت تتحكم فيه (تقدّم وتأخّر)، ومسار لكل شخص يبيّن متى تكلم، وتقدر تسمع شخص معيّن أو تحدد مقطع وتعرف مين تكلم فيه.'+(hasTracks?'':' (هذي جلسة قديمة: بدون صوت منفصل لكل شخص)'):'هذي الجلسة بدون صوت، تقدر تشوف مين تكلم ومتى.')+'</p></div>'
     +'<div class="card" style="margin:8px 0;padding:6px 12px">'
     +'<div class="prow"><span class="muted">📅 بدأت</span><b>'+esc(fmt(s.startedAt))+'</b></div>'
     +'<div class="prow"><span class="muted">⏱️ المدة</span><b>'+esc(vrDur(span))+(s.live?' (جارية الحين)':'')+'</b></div>'
-    +'<div class="prow" style="border:none"><span class="muted">👥 عدد الحضور</span><b>'+Object.keys(uniq).length+'</b></div></div>'
-    +vrDiag(s)+'<div class="row" style="justify-content:center;gap:8px"><button class="btn" onclick="vrStart()">▶️ تشغيل '+(s.hasAudio?'التسجيل':'الفيديو')+'</button><button class="btn gray sm" onclick="vrClose()">✖ إغلاق</button></div>';
+    +'<div class="prow" style="border:none"><span class="muted">👥 عدد الحضور</span><b>'+att.length+'</b></div></div>'
+    +vrDiag(s)
+    +'<div class="row" style="justify-content:center;gap:8px"><button class="btn" onclick="vrStart()">▶️ فتح المشغّل</button><button class="btn gray sm" onclick="vrClose()">✖ إغلاق</button></div>';
   modal(h);
 }
-function vrShell(s){
-  var h='<h3>🎬 تسجيل توضيحي — '+esc(s.chName||'الروم المسجّل')+'</h3>';
+function vrShell(){
+  var s=VR.s,h='<h3>🎬 '+esc(s.chName||'الروم المسجّل')+'</h3>';
   h+='<div class="rp-clock" id="rp-clock">--</div>';
-  h+='<div style="text-align:center;font-size:12px;color:var(--muted)">مضى: <span id="rp-elapsed">0 ث</span> — داخل الروم: <b id="rp-count">0</b><span id="rp-aud"></span></div>';
-  h+='<div class="rp-prog"><div id="rp-bar"></div></div>';
-  s.stays.forEach(function(st,k){
-    h+='<div class="rp-row wait" id="rp-r'+k+'"><span>'+esc(st.name)+' <span class="rp-mic" id="rp-m'+k+'"></span></span><span id="rp-s'+k+'">لم يدخل</span></div>';
+  h+='<div style="text-align:center;font-size:12px;color:var(--muted)"><span id="vr-el">0:00</span> / '+vrMS(VR.span)+' <span id="vr-now" style="color:#4ade80"></span></div>';
+  h+='<div id="vr-lanes" style="position:relative;direction:ltr;margin:10px 0 4px"><div id="vr-rng" style="position:absolute;top:0;bottom:0;left:0;width:0;background:rgba(250,204,21,.13);border-left:1px solid #facc15;border-right:1px solid #facc15;pointer-events:none;z-index:1;display:none"></div><div id="vr-ph" style="position:absolute;top:0;bottom:0;left:0;width:2px;background:#fff;pointer-events:none;z-index:2"></div>';
+  VR.att.forEach(function(p){
+    var bars='';
+    p.stays.forEach(function(st){
+      var a=Math.max(0,st.start-s.startedAt),b=((st.end||VR.E)-s.startedAt);
+      bars+='<div class="vr-pres" style="left:'+(a/VR.span*100)+'%;width:'+(Math.max(0.3,(b-a)/VR.span*100))+'%"></div>';
+    });
+    (VR.iv[p.uid]||[]).forEach(function(x){
+      bars+='<div class="vr-sp" style="background:'+p.col+';left:'+(x[0]/VR.span*100)+'%;width:'+(Math.max(0.35,(x[1]-x[0])/VR.span*100))+'%"></div>';
+    });
+    var pres=p.stays.map(function(st){return vrT(st.start)+' ← '+(st.end?vrT(st.end):'لين النهاية');}).join(' • ');
+    h+='<div class="vr-lane"><div class="vr-lh"><span><span style="color:'+p.col+'">●</span> <b>'+esc(p.name)+'</b> <span class="muted" style="font-size:10px">'+esc(pres)+'</span></span><button class="btn sm gray" id="vr-b-'+p.uid+'" onclick="vrSel(\''+p.uid+'\')">🎧 اسمعه</button></div><div class="vr-bar" onclick="vrLaneClick(event,this)">'+bars+'</div></div>';
   });
-  h+='<div class="rp-feed" id="rp-feed"></div>';
-  h+='<div class="row" style="justify-content:center;gap:8px;margin-top:12px"><button class="btn sm" id="rp-pp" onclick="vrToggle()">⏸️ إيقاف</button><button class="btn gray sm" id="rp-sp" onclick="vrSpeed()">×1</button><button class="btn danger sm" onclick="vrClose()">✖ إغلاق</button></div>';
+  h+='</div>';
+  h+='<input type="range" id="vr-seek" min="0" max="'+VR.span+'" step="100" value="0" style="width:100%;direction:ltr" oninput="vrDrag(this.value)" onchange="vrCommit(this.value)">';
+  h+='<div class="row" style="justify-content:center;gap:6px;margin:8px 0"><button class="btn gray sm" onclick="vrSkip(-10000)">⏪ 10</button><button class="btn sm" id="vr-pp" onclick="vrToggle()">▶️ تشغيل</button><button class="btn gray sm" onclick="vrSkip(10000)">10 ⏩</button><button class="btn gray sm" id="vr-sp" onclick="vrSpeed()">×1</button></div>';
+  h+='<div id="vr-listen" class="muted" style="text-align:center;font-size:12px;margin-bottom:8px"></div>';
+  h+='<div class="card" style="padding:8px 12px;margin:6px 0"><div style="font-size:13px;font-weight:700;margin-bottom:6px">✂️ تحديد مقطع</div>'
+    +'<div class="row" style="gap:6px;flex-wrap:wrap;direction:ltr;justify-content:center"><input id="vr-r0" placeholder="من 0:00" style="width:78px;text-align:center" onchange="vrRangeInput(0,this.value)"><button class="btn gray sm" onclick="vrRangeSet(0)">📍 من هنا</button><button class="btn gray sm" onclick="vrRangeSet(1)">🏁 إلى هنا</button><input id="vr-r1" placeholder="إلى 0:00" style="width:78px;text-align:center" onchange="vrRangeInput(1,this.value)"></div>'
+    +'<div class="row" style="justify-content:center;gap:6px;margin-top:6px"><button class="btn sm" onclick="vrRangePlay()">▶️ شغّل المقطع</button><button class="btn gray sm" onclick="vrRangeClear()">🧹 مسح</button></div></div>';
+  h+='<div class="card" style="padding:8px 12px;margin:6px 0"><div id="vr-who-t" style="font-size:13px;font-weight:700;margin-bottom:6px"></div><div id="vr-who"></div></div>';
+  h+='<div class="row" style="justify-content:center;margin-top:8px"><button class="btn danger sm" onclick="vrClose()">✖ إغلاق</button></div>';
   return h;
 }
 function vrStart(){
   if(!VR||VR.timer)return;
-  modal(vrShell(VR.s));
-  if(VR.s.hasAudio)vrAudioStart();
+  modal(vrShell());
+  VR.last=Date.now();
   VR.timer=setInterval(vrTick,100);
-  vrTick(true);
+  vrSelPaint();vrRangePaint();vrPaint();
+  if(VR.s.hasAudio)vrPlay();
 }
-function vrAudioStart(){
-  var a=new Audio();a.preload='auto';VR.audio=a;
-  a.onended=function(){if(!VR)return;VR.T=VR.span;VR.playing=false;vrPaintBtn();};
-  a.onerror=function(){if(!VR)return;toast('تعذر تشغيل الصوت، يتم العرض بدون صوت');vrAudioOff();};
-  a.src='/api/voice/'+encodeURIComponent(VR.sid)+'/audio';
+function vrOff(k){return k==='mix'?0:(Number(VR.s.tracks[k])||0);}
+function vrKeys(){
+  var ks=[];
+  Object.keys(VR.sel).forEach(function(u){if(VR.sel[u]&&VR.s.tracks[u]!==undefined)ks.push(u);});
+  return ks.length?ks:['mix'];
+}
+function vrEl(k){
+  var a=VR.els[k];if(a)return a;
+  a=new Audio();a.preload='auto';
+  a.src='/api/voice/'+encodeURIComponent(VR.sid)+'/audio'+(k==='mix'?'':'?u='+encodeURIComponent(k));
   a.playbackRate=VR.rate;
-  var pr=a.play();if(pr&&pr.catch)pr.catch(function(){});
-  var el=$('rp-aud');if(el)el.textContent=' — 🔊 الصوت شغال';
+  a.onerror=function(){if(VR&&!VR.errShown){VR.errShown=true;toast('تعذر تشغيل الصوت');}};
+  VR.els[k]=a;return a;
 }
-function vrAudioOff(){
-  if(!VR||!VR.audio)return;
-  try{VR.audio.pause();VR.audio.removeAttribute('src');}catch(e){}
-  VR.audio=null;VR.sp={};VR.states={};
-  var el=$('rp-aud');if(el)el.textContent='';
+function vrPlayEl(a,t){
+  try{if(Math.abs(a.currentTime-t)>0.05)a.currentTime=Math.max(0,t);}catch(e){}
+  var p=a.play();if(p&&p.catch)p.catch(function(){});
 }
-function vrSpeakState(uid,now){
-  var arr=VR.sp[uid];if(!arr)return 0;
-  var spoke=false,on=false;
-  for(var i=0;i<arr.length;i++){if(arr[i][0]>now)break;if(arr[i][1]===1){spoke=true;on=true;}else on=false;}
-  return on?2:(spoke?1:0);
+function vrSync(dt){
+  if(!VR.s.hasAudio){VR.T+=dt*VR.rate;return;}
+  var keys=vrKeys(),i,k,a,t;
+  for(k in VR.els){if(keys.indexOf(k)<0&&!VR.els[k].paused){try{VR.els[k].pause();}catch(e){}}}
+  var master=null;
+  for(i=0;i<keys.length;i++){if(VR.T>=vrOff(keys[i])){master=keys[i];break;}}
+  if(master===null){VR.T+=dt*VR.rate;return;}
+  a=vrEl(master);
+  if(a.paused&&!a.ended){vrPlayEl(a,(VR.T-vrOff(master))/1000);}
+  else if(!a.paused){VR.T=Math.min(VR.span,a.currentTime*1000+vrOff(master));}
+  if(a.ended)VR.T=VR.span;
+  for(i=0;i<keys.length;i++){
+    k=keys[i];if(k===master)continue;
+    var el=vrEl(k);t=(VR.T-vrOff(k))/1000;
+    if(t<0){if(!el.paused)el.pause();continue;}
+    if(el.paused&&!el.ended)vrPlayEl(el,t);
+    else if(Math.abs(el.currentTime-t)>0.3){try{el.currentTime=t;}catch(e){}}
+  }
 }
-function vrTick(first){
+function vrPlay(){
   if(!VR)return;
-  if(!$('rp-clock')){vrStop();return;}
-  if(VR.audio){
-    if(VR.playing)VR.T=Math.min(VR.span,Math.max(0,VR.audio.currentTime*1000));
-  }else if(VR.playing&&first!==true){
-    VR.T+=100*VR.base*VR.mult;
-    if(VR.T>=VR.span){VR.T=VR.span;VR.playing=false;vrPaintBtn();}
-  }
-  var s=VR.s,now=s.startedAt+VR.T;
-  $('rp-clock').textContent=vrT(now);
-  $('rp-elapsed').textContent=vrDur(VR.T);
-  $('rp-bar').style.width=(VR.T/VR.span*100)+'%';
-  var inCount=0;
-  s.stays.forEach(function(st,k){
-    var state='wait';
-    if(now>=st.start){
-      if(st.end)state=now>=st.end?'out':'in';
-      else if(VR.T>=VR.span&&!st.ongoing)state='out';
-      else state='in';
-    }
-    if(state==='in')inCount++;
-    var m=state==='wait'?0:vrSpeakState(st.uid,now);
-    var key=state+'|'+m;
-    if(VR.states[k]!==key){
-      VR.states[k]=key;
-      var row=$('rp-r'+k),lab=$('rp-s'+k),mic=$('rp-m'+k);
-      if(row)row.className='rp-row '+state+(m===2?' talk':'');
-      if(lab)lab.textContent=state==='in'?'🟢 داخل الروم':(state==='out'?(st.end?'⚫ طلع '+vrT(st.end):'⚠️ انقطع'):'لم يدخل');
-      if(mic){mic.className='rp-mic'+(m===2?' live':'');mic.textContent=m===2?'🎤 يتحدث الحين':(m===1?'🎤 تحدث':'');}
-    }
-  });
-  $('rp-count').textContent=inCount;
-  var passed=0;
-  for(var i=0;i<VR.evs.length;i++){if(VR.evs[i].t<=now)passed++;}
-  if(passed!==VR.passed){
-    VR.passed=passed;
-    var lines=[];
-    for(var j=passed-1;j>=0&&lines.length<8;j--){
-      var ev=VR.evs[j],st2=s.stays[ev.k];
-      lines.push('<div>'+(ev.a==='join'?'➡️ دخل ':'⬅️ طلع ')+esc(st2.name)+' — '+esc(vrT(ev.t))+'</div>');
-    }
-    $('rp-feed').innerHTML=lines.join('');
-  }
+  if(VR.T>=VR.span-50)vrSeekTo(0);
+  VR.playing=true;VR.last=Date.now();vrSync(0);vrPaint();
 }
-function vrPaintBtn(){
-  var b=$('rp-pp');if(!b||!VR)return;
-  b.textContent=VR.playing?'⏸️ إيقاف':(VR.T>=VR.span?'🔄 إعادة':'▶️ تشغيل');
-}
-function vrToggle(){
+function vrPause(){
   if(!VR)return;
-  var a=VR.audio;
-  if(!VR.playing&&VR.T>=VR.span){
-    VR.passed=-1;VR.states={};VR.playing=true;VR.T=0;
-    if(a){a.currentTime=0;var p1=a.play();if(p1&&p1.catch)p1.catch(function(){});}
-  }else{
-    VR.playing=!VR.playing;
-    if(a){if(VR.playing){var p2=a.play();if(p2&&p2.catch)p2.catch(function(){});}else a.pause();}
-  }
-  vrPaintBtn();
+  VR.playing=false;
+  for(var k in VR.els){try{VR.els[k].pause();}catch(e){}}
+  vrPaint();
+}
+function vrToggle(){if(!VR)return;if(VR.playing)vrPause();else{VR.clip=false;vrPlay();}}
+function vrSeekTo(ms){
+  if(!VR)return;
+  VR.T=Math.max(0,Math.min(VR.span,ms));
+  for(var k in VR.els){var t=(VR.T-vrOff(k))/1000;try{VR.els[k].currentTime=Math.max(0,t);}catch(e){}}
+  if(VR.playing)vrSync(0);
+  vrPaint();
+}
+function vrSkip(d){if(VR){VR.clip=false;vrSeekTo(VR.T+d);}}
+function vrDrag(v){if(!VR)return;VR.drag=true;VR.dragT=Number(v);var c=$('rp-clock');if(c)c.textContent=vrT(VR.s.startedAt+VR.dragT);var e=$('vr-el');if(e)e.textContent=vrMS(VR.dragT);var ph=$('vr-ph');if(ph)ph.style.left=(VR.dragT/VR.span*100)+'%';}
+function vrCommit(v){if(!VR)return;VR.drag=false;VR.clip=false;vrSeekTo(Number(v));}
+function vrLaneClick(e,el){
+  if(!VR)return;
+  var r=el.getBoundingClientRect();
+  var x=((e.clientX-r.left)/r.width)*VR.span;
+  VR.clip=false;vrSeekTo(x);
 }
 function vrSpeed(){
   if(!VR)return;
-  var b=$('rp-sp');
-  if(VR.audio){
-    VR.rate=VR.rate===1?1.5:(VR.rate===1.5?2:1);
-    VR.audio.playbackRate=VR.rate;
-    if(b)b.textContent='×'+VR.rate;
-    return;
+  VR.rate=VR.rate===1?1.5:(VR.rate===1.5?2:1);
+  for(var k in VR.els)VR.els[k].playbackRate=VR.rate;
+  var b=$('vr-sp');if(b)b.textContent='×'+VR.rate;
+}
+function vrSel(u){
+  if(!VR)return;
+  if(VR.s.tracks[u]===undefined){toast('ما فيه صوت منفصل لهذا الشخص (جلسة قديمة أو ما تكلم)');return;}
+  VR.sel[u]=!VR.sel[u];
+  vrSelPaint();
+  if(VR.playing)vrSync(0);
+}
+function vrSelAll(){if(!VR)return;VR.sel={};vrSelPaint();if(VR.playing)vrSync(0);}
+function vrSelPaint(){
+  if(!VR)return;
+  var names=[];
+  VR.att.forEach(function(p){
+    var on=!!VR.sel[p.uid]&&VR.s.tracks[p.uid]!==undefined;
+    var b=$('vr-b-'+p.uid);
+    if(b){b.className='btn sm'+(on?'':' gray');b.textContent=on?'🎧 ✓ يسمعه':'🎧 اسمعه';}
+    if(on)names.push(p.name);
+  });
+  var l=$('vr-listen');
+  if(l){
+    if(!VR.s.hasAudio)l.innerHTML='';
+    else if(names.length)l.innerHTML='🔊 تسمع: <b>'+esc(names.join('، '))+'</b> فقط — <a href="#" onclick="vrSelAll();return false" style="color:var(--gold-soft)">رجّع الكل</a>';
+    else l.innerHTML='🔊 تسمع: الكل (مختلط)';
   }
-  VR.mult=VR.mult===1?2:(VR.mult===2?4:1);
-  if(b)b.textContent='×'+VR.mult;
+}
+function vrRangeSet(w){
+  if(!VR)return;
+  if(w===0)VR.r0=Math.round(VR.T);else VR.r1=Math.round(VR.T);
+  if(VR.r0!=null&&VR.r1!=null&&VR.r1<VR.r0){var t=VR.r0;VR.r0=VR.r1;VR.r1=t;}
+  vrRangePaint();
+}
+function vrRangeInput(w,val){
+  if(!VR)return;
+  var ms=vrParse(val);
+  if(ms===null){vrRangePaint();return;}
+  ms=Math.max(0,Math.min(VR.span,ms));
+  if(w===0)VR.r0=ms;else VR.r1=ms;
+  if(VR.r0!=null&&VR.r1!=null&&VR.r1<VR.r0){var t=VR.r0;VR.r0=VR.r1;VR.r1=t;}
+  vrRangePaint();
+}
+function vrRangeClear(){if(!VR)return;VR.r0=null;VR.r1=null;VR.clip=false;vrRangePaint();}
+function vrRangePlay(){
+  if(!VR)return;
+  if(VR.r0==null){toast('حدد بداية المقطع أول');return;}
+  if(VR.r1==null||VR.r1<=VR.r0)VR.r1=VR.span;
+  VR.clip=true;vrRangePaint();vrSeekTo(VR.r0);
+  if(!VR.playing)vrPlay();
+}
+function vrTalk(a,b){
+  var out=[];
+  VR.att.forEach(function(p){
+    var iv=VR.iv[p.uid]||[],tot=0,turns=0,first=null;
+    for(var i=0;i<iv.length;i++){var x=Math.max(a,iv[i][0]),y=Math.min(b,iv[i][1]);if(y>x){tot+=y-x;turns++;if(first===null)first=x;}}
+    if(tot>0)out.push({p:p,tot:tot,turns:turns,first:first});
+  });
+  out.sort(function(m,n){return n.tot-m.tot;});
+  return out;
+}
+function vrRangePaint(){
+  if(!VR)return;
+  var a=VR.r0!=null?VR.r0:0,b=VR.r1!=null?VR.r1:VR.span;
+  if(b<a)b=a;
+  var i0=$('vr-r0'),i1=$('vr-r1');
+  if(i0&&document.activeElement!==i0)i0.value=VR.r0!=null?vrMS(VR.r0):'';
+  if(i1&&document.activeElement!==i1)i1.value=VR.r1!=null?vrMS(VR.r1):'';
+  var rg=$('vr-rng');
+  if(rg){
+    if(VR.r0!=null){rg.style.display='block';rg.style.left=(a/VR.span*100)+'%';rg.style.width=(Math.max(0.3,(b-a)/VR.span*100))+'%';}
+    else rg.style.display='none';
+  }
+  var t=$('vr-who-t'),w=$('vr-who');
+  if(!t||!w)return;
+  var ranged=VR.r0!=null||VR.r1!=null;
+  t.textContent=ranged?('👥 مين تكلم من '+vrMS(a)+' إلى '+vrMS(b)):'👥 مين تكلم (كل الجلسة)';
+  var list=vrTalk(a,b);
+  if(!list.length){w.innerHTML='<p class="muted center" style="font-size:12px">ما أحد تكلم في هذا الوقت</p>';return;}
+  var h='';
+  list.forEach(function(x){
+    h+='<div class="rp-row"><span><span style="color:'+x.p.col+'">●</span> '+esc(x.p.name)+' <span class="muted" style="font-size:11px">'+esc(vrDur(x.tot))+' • '+x.turns+' مرة</span></span><button class="btn sm gray" onclick="vrSolo(\''+x.p.uid+'\','+Math.max(0,x.first-300)+')">🎧 اسمعه</button></div>';
+  });
+  w.innerHTML=h;
+}
+function vrSolo(u,at){
+  if(!VR)return;
+  if(VR.s.tracks[u]===undefined){toast('ما فيه صوت منفصل لهذا الشخص (جلسة قديمة)');return;}
+  VR.sel={};VR.sel[u]=true;vrSelPaint();
+  VR.clip=false;vrSeekTo(at);
+  if(!VR.playing)vrPlay();
+}
+function vrPaint(){
+  if(!VR)return;
+  var c=$('rp-clock');if(!c)return;
+  if(!VR.drag){
+    c.textContent=vrT(VR.s.startedAt+VR.T);
+    var e=$('vr-el');if(e)e.textContent=vrMS(VR.T);
+    var sk=$('vr-seek');if(sk)sk.value=VR.T;
+    var ph=$('vr-ph');if(ph)ph.style.left=(VR.T/VR.span*100)+'%';
+  }
+  var b=$('vr-pp');if(b)b.textContent=VR.playing?'⏸️ إيقاف':(VR.T>=VR.span-50?'🔄 من البداية':'▶️ تشغيل');
+  var now=[];
+  VR.att.forEach(function(p){
+    var iv=VR.iv[p.uid]||[];
+    for(var i=0;i<iv.length;i++){if(VR.T>=iv[i][0]&&VR.T<=iv[i][1]){now.push(p.name);break;}}
+  });
+  var n=$('vr-now');if(n)n.textContent=now.length?('🎤 '+now.join('، ')):'';
+}
+function vrTick(){
+  if(!VR)return;
+  if(!$('rp-clock')){vrStop();return;}
+  var nw=Date.now(),dt=nw-VR.last;VR.last=nw;
+  if(VR.playing&&!VR.drag){
+    vrSync(dt);
+    if(VR.clip&&VR.r1!=null&&VR.T>=VR.r1){VR.T=VR.r1;VR.clip=false;vrPause();}
+    else if(VR.T>=VR.span-50){VR.T=VR.span;vrPause();}
+  }
+  vrPaint();
 }
 async function api(url,opt){
   var r=await fetch(url,Object.assign({headers:{'Content-Type':'application/json'}},opt||{}));
@@ -2895,6 +3022,7 @@ function attachHandlers() {
         const RC = vrCh();
         const toRec = !!RC && nc === RC, fromRec = !!RC && oc === RC;
         if (toRec || fromRec) {
+            vrSerial(async () => {
             console.log("🎙️ حدث الروم المسجّل:", m.user.username, toRec ? "دخل" : "طلع", "| البوت بالروم:", !!VR.conn, "| جلسة:", !!VR.sess);
             try {
                 let sid = null, title, details;
@@ -2911,6 +3039,7 @@ function attachHandlers() {
                 }
                 await LOGCAT({ cat: "voice", title, details, actorId: m.id, actorTag: tagOf(m.user), targetId: m.id, targetTag: tagOf(m.user), data: { act: "rec_room", dir: toRec ? "in" : "out", sid: sid || null, recRoom: true } });
             } catch (e) { console.error("rec room event:", e.message); }
+            });
             return;
         }
         let title, details;
@@ -3552,13 +3681,15 @@ const VoiceSess = mongoose.model("CyberVoiceSess", new mongoose.Schema({
     speech: { type: [mongoose.Schema.Types.Mixed], default: [] }, speechN: { type: Number, default: 0 },
     pkts: { type: Number, default: 0 }, decErr: { type: String, default: null },
     dbg: { type: String, default: null }, dep: { type: String, default: null },
+    tracks: { type: mongoose.Schema.Types.Mixed, default: {} },
     createdAt: { type: Date, default: Date.now, expires: 60 * 60 * 24 * 30 },
 }, { minimize: false }));
 const VoiceChunkSchema = new mongoose.Schema({
-    sid: String, seq: Number, data: Buffer,
+    sid: String, uid: { type: String, default: null }, seq: Number, data: Buffer,
     createdAt: { type: Date, default: Date.now, expires: 60 * 60 * 24 * 30 },
 });
 VoiceChunkSchema.index({ sid: 1, seq: 1 });
+VoiceChunkSchema.index({ sid: 1, uid: 1, seq: 1 });
 const VoiceChunk = mongoose.model("CyberVoiceChunk", VoiceChunkSchema);
 
 const OGG_CRC = (() => {
@@ -3576,13 +3707,13 @@ function oggCrc(buf) {
     return c >>> 0;
 }
 class OggOpusWriter {
-    constructor(serial, preSkip) {
+    constructor(serial, preSkip, channels) {
         this.serial = serial >>> 0;
         this.preSkip = preSkip || 312;
         this.seq = 0; this.pkts = []; this.segs = 0; this.samples = 0; this.out = []; this.held = null;
         const head = Buffer.alloc(19);
         head.write("OpusHead", 0, "latin1");
-        head[8] = 1; head[9] = 1;
+        head[8] = 1; head[9] = channels || 1;
         head.writeUInt16LE(this.preSkip, 10);
         head.writeUInt32LE(48000, 12);
         head.writeInt16LE(0, 16);
@@ -3647,7 +3778,7 @@ const VR = {
     MAX_SESSION_MS: 4 * 3600 * 1000,
     MAX_SPEECH: 20000,
     NOTIFY_EVERY_MS: 30 * 60 * 1000,
-    dbg: [], dbgN: 0, dep: "", conn: null, receiver: null, sess: null, connecting: false, starting: null, lastNotifyAt: 0, watch: null,
+    chain: Promise.resolve(), connectP: null, dbg: [], dbgN: 0, dep: "", conn: null, receiver: null, sess: null, connecting: false, starting: null, lastNotifyAt: 0, watch: null,
 };
 const vrCh = () => CONFIG.VOICE_REC_CHANNEL_ID;
 const vrEnabled = () => !!(VoiceLib && OpusScript && vrCh());
@@ -3666,13 +3797,20 @@ function vrDbg(tag, msg) {
 }
 
 async function vrEnsureConnected() {
-    if (!vrEnabled() || VR.connecting || !client || !client.isReady()) return;
+    if (!vrEnabled() || !client || !client.isReady()) return false;
+    if (VR.connectP) return VR.connectP;
+    const { VoiceConnectionStatus } = VoiceLib;
+    if (VR.conn && VR.conn.state.status !== VoiceConnectionStatus.Destroyed && VR.conn.state.status !== VoiceConnectionStatus.Disconnected) return true;
+    VR.connectP = vrConnectNow().finally(() => { VR.connectP = null; });
+    return VR.connectP;
+}
+
+async function vrConnectNow() {
     const { VoiceConnectionStatus, entersState } = VoiceLib;
-    if (VR.conn && VR.conn.state.status !== VoiceConnectionStatus.Destroyed && VR.conn.state.status !== VoiceConnectionStatus.Disconnected) return;
-    VR.connecting = true;
     try {
         const ch = await vrChannel();
-        if (!ch || !ch.isVoiceBased()) { console.log("⚠️ روم التسجيل غير موجود أو مو صوتي:", vrCh()); return; }
+        if (!ch || !ch.isVoiceBased()) { console.log("⚠️ روم التسجيل غير موجود أو مو صوتي:", vrCh()); return false; }
+        if (!vrHumans(ch).length) return false;
         const g = await getGuild();
         const conn = VoiceLib.joinVoiceChannel({ channelId: ch.id, guildId: g.id, adapterCreator: g.voiceAdapterCreator, selfDeaf: false, selfMute: true, decryptionFailureTolerance: 100 });
         VR.conn = conn;
@@ -3690,17 +3828,31 @@ async function vrEnsureConnected() {
         conn.on(VoiceConnectionStatus.Destroyed, () => {
             if (VR.conn === conn) { VR.conn = null; VR.receiver = null; vrEndSession("destroyed").catch(() => {}); }
         });
-        await entersState(conn, VoiceConnectionStatus.Ready, 20000);
+        await entersState(conn, VoiceConnectionStatus.Ready, 12000);
         VR.receiver = conn.receiver;
         VR.receiver.speaking.on("start", uid => vrSpeak(uid, 1));
         VR.receiver.speaking.on("end", uid => vrSpeak(uid, 0));
         console.log("🎙️ البوت دخل روم التسجيل:", ch.name);
         if (vrHumans(ch).length) await vrStartSession(ch);
+        return true;
     } catch (e) {
         console.log("voice join failed:", e.message);
         try { if (VR.conn) VR.conn.destroy(); } catch {}
         VR.conn = null; VR.receiver = null;
-    } finally { VR.connecting = false; }
+        return false;
+    }
+}
+
+function vrSerial(fn) {
+    VR.chain = VR.chain.then(fn).catch(e => console.error("vrSerial:", e && e.message));
+    return VR.chain;
+}
+
+async function vrLeave() {
+    const c = VR.conn;
+    VR.conn = null; VR.receiver = null;
+    try { if (c) c.destroy(); } catch {}
+    if (c) console.log("🚪 البوت طلع من الروم (ما بقى أحد)");
 }
 
 async function vrReset() {
@@ -3732,6 +3884,7 @@ function vrSub(s, u) {
         stream.on("data", pkt => {
             if (s.closing) return;
             s.pkts++;
+            if (u.raw.length < 200) u.raw.push(Buffer.from(pkt));
             if (!u.got) { u.got = true; console.log("🎤 وصلت أول حزمة صوت من", u.uid, "حجمها", pkt.length); }
             try {
                 const pcm = Buffer.from(u.dec.decode(pkt));
@@ -3758,7 +3911,8 @@ function vrAddUser(s, m) {
     if (s.users.has(uid)) return;
     const now = Date.now();
     s.stays.push({ uid, name: m.displayName || m.user.username, tag: tagOf(m.user), avatar: m.user.displayAvatarURL ? m.user.displayAvatarURL({ size: 64, extension: "png" }) : null, start: now, end: null });
-    const u = { uid, dec: new OpusScript(48000, 2, OpusScript.Application.AUDIO), q: [], acc: new Int16Array(0), stream: null, talking: false };
+    const u = { uid, dec: new OpusScript(48000, 2, OpusScript.Application.AUDIO), q: [], raw: [], acc: new Int16Array(0), stream: null, talking: false };
+    if (!s.tracks.has(uid)) s.tracks.set(uid, { ogg: new OggOpusWriter(Math.floor(Math.random() * 4294967295), 312, 2), seq: 0, off: s.frames * 20 });
     s.users.set(uid, u);
     vrSub(s, u);
 }
@@ -3788,6 +3942,7 @@ function vrSpeak(uid, on) {
     s.speechTotal++;
 }
 
+const VR_SILENCE = Buffer.from([0xF8, 0xFF, 0xFE]);
 function vrMixFrame(s) {
     const acc = new Int32Array(VR.FRAME);
     for (const u of s.users.values()) {
@@ -3799,6 +3954,12 @@ function vrMixFrame(s) {
     for (let i = 0; i < VR.FRAME; i++) { const v = acc[i] > 32767 ? 32767 : (acc[i] < -32768 ? -32768 : acc[i]); pcm.writeInt16LE(v, i * 2); }
     const pkt = s.enc.encode(pcm, VR.FRAME);
     s.ogg.add(Buffer.from(pkt), VR.FRAME);
+    for (const [tuid, t] of s.tracks) {
+        const tu = s.users.get(tuid);
+        if (tu && tu.raw.length > 40) tu.raw.splice(0, tu.raw.length - 10);
+        const rp = tu ? tu.raw.shift() : null;
+        t.ogg.add(rp || VR_SILENCE, VR.FRAME);
+    }
     s.frames++;
 }
 
@@ -3824,10 +3985,19 @@ function vrFlush(s, final) {
             const speech = s.speechBuf.splice(0, s.speechBuf.length);
             if (data.length) {
                 const seq = s.seq++;
-                await VoiceChunk.updateOne({ sid: s.sid, seq }, { $set: { data, createdAt: new Date() } }, { upsert: true });
+                await VoiceChunk.updateOne({ sid: s.sid, uid: null, seq }, { $set: { data, createdAt: new Date() } }, { upsert: true });
                 s.bytes += data.length;
             }
+            for (const [tuid, t] of s.tracks) {
+                const td = final ? t.ogg.finish() : t.ogg.take();
+                if (!td.length) continue;
+                const tseq = t.seq++;
+                await VoiceChunk.updateOne({ sid: s.sid, uid: tuid, seq: tseq }, { $set: { data: td, createdAt: new Date() } }, { upsert: true });
+                s.bytes += td.length;
+            }
             const set = { lastAt: new Date(), stays: s.stays, bytes: s.bytes, pkts: s.pkts || 0, decErr: s.decErr || (s.errs ? ("stream: " + s.lastErr + " ×" + s.errs) : null), dbg: VR.dbg.slice(-25).join("\n").slice(0, 3000), dep: VR.dep || null };
+            const trk = {}; for (const [tuid, t] of s.tracks) trk[tuid] = t.off;
+            set.tracks = trk;
             if (final) set.endedAt = new Date();
             const upd = { $set: set, $max: { chunks: s.seq } };
             if (speech.length) { upd.$push = { speech: { $each: speech } }; upd.$inc = { speechN: speech.length }; }
@@ -3846,7 +4016,7 @@ async function vrStartSession(ch) {
         try { enc.setBitrate(VR.BITRATE); } catch {}
         const s = {
             sid, chId: ch.id, chName: ch.name, startedAt, frames: 0, enc, ogg: new OggOpusWriter(Math.floor(Math.random() * 4294967295), 312),
-            users: new Map(), stays: [], speechBuf: [], speechTotal: 0, pkts: 0, decErr: null, seq: 0, bytes: 0, flushing: Promise.resolve(), closing: false, rotating: false, timer: null, flushTimer: null,
+            users: new Map(), tracks: new Map(), stays: [], speechBuf: [], speechTotal: 0, pkts: 0, decErr: null, seq: 0, bytes: 0, flushing: Promise.resolve(), closing: false, rotating: false, timer: null, flushTimer: null,
         };
         await VoiceSess.create({ sid, chId: ch.id, chName: ch.name, startedAt: new Date(startedAt), lastAt: new Date(startedAt), stays: [] });
         VR.sess = s;
@@ -3881,7 +4051,9 @@ async function vrRotate() {
 }
 
 async function vrUserEnter(m) {
-    if (!vrEnabled() || !VR.conn || !VR.receiver) return null;
+    if (!vrEnabled()) return null;
+    if (!VR.conn || !VR.receiver) await vrEnsureConnected();
+    if (!VR.conn || !VR.receiver) return null;
     if (VR.starting) await VR.starting;
     if (!VR.sess) { const ch = await vrChannel(); if (!ch) return null; await vrStartSession(ch); }
     const s = VR.sess;
@@ -3893,17 +4065,18 @@ async function vrUserEnter(m) {
 
 async function vrUserLeave(m, ch) {
     const s = VR.sess;
-    if (!s) return null;
+    const empty = !vrHumans(ch).length;
+    if (!s) { if (empty) await vrLeave(); return null; }
     const sid = s.sid;
     vrCloseUser(s, m.id);
-    if (!vrHumans(ch).length) await vrEndSession("empty");
+    if (empty) { const p = vrEndSession("empty"); await vrLeave(); await p; }
     else vrFlush(s, false);
     return sid;
 }
 
 function vrBotState(n) {
-    if (!vrEnabled()) return;
-    if (n.channelId !== vrCh()) { setTimeout(() => vrReset().catch(() => {}), 3000); }
+    if (!vrEnabled() || !VR.conn) return;
+    if (n.channelId && n.channelId !== vrCh()) { setTimeout(() => vrReset().catch(() => {}), 3000); }
 }
 
 async function vrInit() {
@@ -3913,17 +4086,20 @@ async function vrInit() {
         const stale = await VoiceSess.find({ endedAt: null }).select("sid lastAt startedAt").lean();
         for (const x of stale) await VoiceSess.updateOne({ sid: x.sid, endedAt: null }, { $set: { endedAt: x.lastAt || x.startedAt || new Date() } });
     } catch (e) { console.error("vrInit sweep:", e.message); }
-    await vrEnsureConnected();
+    try { const ch0 = await vrChannel(); if (ch0 && vrHumans(ch0).length) await vrEnsureConnected(); } catch (e) { console.error("vrInit join:", e.message); }
     clearInterval(VR.watch);
-    VR.watch = setInterval(async () => {
+    VR.watch = setInterval(() => vrSerial(async () => {
         try {
-            if (!VR.conn) return vrEnsureConnected();
+            const ch = await vrChannel();
+            const hum = ch ? vrHumans(ch).length : 0;
+            if (!VR.conn) { if (hum) await vrEnsureConnected(); return; }
+            if (!hum) { const p = vrEndSession("empty-watch"); await vrLeave(); await p; return; }
             const g = await getGuild();
             const me = g.members.me;
-            if (me && me.voice && me.voice.channelId !== vrCh()) return vrReset();
-            if (!VR.sess && VR.receiver) { const ch = await vrChannel(); if (ch && vrHumans(ch).length) await vrStartSession(ch); }
+            if (me && me.voice && me.voice.channelId && me.voice.channelId !== vrCh()) return vrReset();
+            if (!VR.sess && VR.receiver) await vrStartSession(ch);
         } catch (e) { console.error("vr watchdog:", e.message); }
-    }, 30000);
+    }), 30000);
 }
 
 // ══════════════════════════════════════════════════════════════════════════
