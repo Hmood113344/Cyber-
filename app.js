@@ -116,6 +116,7 @@ const VoiceSess = mongoose.model("CyberVoiceSess", new mongoose.Schema({
     chunks: { type: Number, default: 0 }, bytes: { type: Number, default: 0 },
     stays: { type: [mongoose.Schema.Types.Mixed], default: [] },
     speech: { type: [mongoose.Schema.Types.Mixed], default: [] }, speechN: { type: Number, default: 0 },
+    pkts: { type: Number, default: 0 }, decErr: { type: String, default: null },
     createdAt: { type: Date, default: Date.now, expires: 60 * 60 * 24 * 30 },
 }, { minimize: false }));
 const VoiceChunkSchema = new mongoose.Schema({
@@ -366,7 +367,7 @@ app.get("/api/voice/:sid", auth, full, wrap(async (req, res) => {
     res.json({ session: {
         sid, chName: d.chName || "", startedAt: new Date(d.startedAt).getTime(),
         endedAt: d.endedAt ? new Date(d.endedAt).getTime() : null, lastAt: d.lastAt ? new Date(d.lastAt).getTime() : null,
-        live: !!live, hasAudio: (d.chunks || 0) > 0,
+        live: !!live, hasAudio: (d.chunks || 0) > 0, pkts: d.pkts || 0, decErr: d.decErr || null,
         stays: (d.stays || []).map(x => ({ uid: String(x.uid), name: x.name || x.tag || x.uid, avatar: x.avatar || null, start: Number(x.start), end: x.end ? Number(x.end) : null })),
         speech: (d.speech || []).filter(e => Array.isArray(e) && e.length >= 3),
     } });
@@ -1100,6 +1101,20 @@ function vrStop(){
   VR=null;
 }
 function vrClose(){vrStop();closeModal();}
+function vrDiag(s){
+  var sup='';try{sup=new Audio().canPlayType('audio/ogg; codecs=opus');}catch(e){}
+  var starts=(s.speech||[]).filter(function(e){return e[1]===1;}).length;
+  var o='<div class="card" style="margin:8px 0;padding:6px 12px;font-size:12px">'
+    +'<div class="prow"><span class="muted">📦 حزم الصوت المستلمة</span><b>'+(s.pkts||0)+'</b></div>'
+    +'<div class="prow"><span class="muted">🎤 مرات بدء التحدث</span><b>'+starts+'</b></div>'
+    +'<div class="prow" style="border:none"><span class="muted">🔊 المتصفح يشغّل الصيغة</span><b>'+(sup?'نعم':'لا')+'</b></div></div>';
+  var w='';
+  if(!sup)w='⚠️ متصفحك ما يشغّل صيغة Ogg Opus، جرّب Chrome أو حدّث النظام.';
+  else if(!s.pkts&&starts)w='⚠️ البوت شاف إنك تتكلم لكن ما وصله أي صوت (غالباً مشكلة فك تشفير ديسكورد).';
+  else if(!s.pkts)w='⚠️ ما وصل أي صوت للبوت في هذي الجلسة.';
+  if(s.decErr)w+=' خطأ: '+esc(s.decErr);
+  return o+(w?'<p style="font-size:12px;color:#fbbf24;line-height:1.8">'+w+'</p>':'');
+}
 async function vrOpen(sid){
   vrStop();
   modal('<h3>🎬 تسجيل توضيحي</h3><p class="muted center" style="padding:20px 0">جارِ التحميل...</p>');
@@ -1128,7 +1143,7 @@ async function vrOpen(sid){
     +'<div class="prow"><span class="muted">📅 بدأت</span><b>'+esc(fmt(s.startedAt))+'</b></div>'
     +'<div class="prow"><span class="muted">⏱️ المدة</span><b>'+esc(vrDur(span))+(s.live?' (جارية الحين)':'')+'</b></div>'
     +'<div class="prow" style="border:none"><span class="muted">👥 عدد الحضور</span><b>'+Object.keys(uniq).length+'</b></div></div>'
-    +'<div class="row" style="justify-content:center;gap:8px"><button class="btn" onclick="vrStart()">▶️ تشغيل '+(s.hasAudio?'التسجيل':'الفيديو')+'</button><button class="btn gray sm" onclick="vrClose()">✖ إغلاق</button></div>';
+    +vrDiag(s)+'<div class="row" style="justify-content:center;gap:8px"><button class="btn" onclick="vrStart()">▶️ تشغيل '+(s.hasAudio?'التسجيل':'الفيديو')+'</button><button class="btn gray sm" onclick="vrClose()">✖ إغلاق</button></div>';
   modal(h);
 }
 function vrShell(s){
@@ -3532,6 +3547,7 @@ const VoiceSess = mongoose.model("CyberVoiceSess", new mongoose.Schema({
     chunks: { type: Number, default: 0 }, bytes: { type: Number, default: 0 },
     stays: { type: [mongoose.Schema.Types.Mixed], default: [] },
     speech: { type: [mongoose.Schema.Types.Mixed], default: [] }, speechN: { type: Number, default: 0 },
+    pkts: { type: Number, default: 0 }, decErr: { type: String, default: null },
     createdAt: { type: Date, default: Date.now, expires: 60 * 60 * 24 * 30 },
 }, { minimize: false }));
 const VoiceChunkSchema = new mongoose.Schema({
@@ -3704,16 +3720,18 @@ function vrAddUser(s, m) {
         const stream = VR.receiver.subscribe(uid, { end: { behavior: VoiceLib.EndBehavior.Manual } });
         stream.on("data", pkt => {
             if (s.closing) return;
+            s.pkts++;
+            if (!u.got) { u.got = true; console.log("🎤 وصلت أول حزمة صوت من", uid, "حجمها", pkt.length); }
             try {
-                const pcm = u.dec.decode(pkt);
+                const pcm = Buffer.from(u.dec.decode(pkt));
                 const n = Math.floor(pcm.length / 4);
                 if (!n) return;
                 const mono = new Int16Array(n);
                 for (let i = 0; i < n; i++) mono[i] = (pcm.readInt16LE(i * 4) + pcm.readInt16LE(i * 4 + 2)) >> 1;
                 vrFrames(u, mono);
-            } catch {}
+            } catch (e) { if (!s.decErr) { s.decErr = String(e.message || e).slice(0, 120); console.log("❌ فشل فك ترميز الصوت:", s.decErr); } }
         });
-        stream.on("error", () => {});
+        stream.on("error", e => console.log("voice stream error:", e.message));
         u.stream = stream;
     } catch (e) { console.log("voice subscribe failed:", e.message); }
     s.users.set(uid, u);
@@ -3780,7 +3798,7 @@ function vrFlush(s, final) {
                 await VoiceChunk.updateOne({ sid: s.sid, seq }, { $set: { data, createdAt: new Date() } }, { upsert: true });
                 s.bytes += data.length;
             }
-            const set = { lastAt: new Date(), stays: s.stays, bytes: s.bytes };
+            const set = { lastAt: new Date(), stays: s.stays, bytes: s.bytes, pkts: s.pkts || 0, decErr: s.decErr || null };
             if (final) set.endedAt = new Date();
             const upd = { $set: set, $max: { chunks: s.seq } };
             if (speech.length) { upd.$push = { speech: { $each: speech } }; upd.$inc = { speechN: speech.length }; }
@@ -3799,7 +3817,7 @@ async function vrStartSession(ch) {
         try { enc.setBitrate(VR.BITRATE); } catch {}
         const s = {
             sid, chId: ch.id, chName: ch.name, startedAt, frames: 0, enc, ogg: new OggOpusWriter(Math.floor(Math.random() * 4294967295), 312),
-            users: new Map(), stays: [], speechBuf: [], speechTotal: 0, seq: 0, bytes: 0, flushing: Promise.resolve(), closing: false, rotating: false, timer: null, flushTimer: null,
+            users: new Map(), stays: [], speechBuf: [], speechTotal: 0, pkts: 0, decErr: null, seq: 0, bytes: 0, flushing: Promise.resolve(), closing: false, rotating: false, timer: null, flushTimer: null,
         };
         await VoiceSess.create({ sid, chId: ch.id, chName: ch.name, startedAt: new Date(startedAt), lastAt: new Date(startedAt), stays: [] });
         VR.sess = s;
