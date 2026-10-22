@@ -108,6 +108,22 @@ const Inquiry = mongoose.model("CyberInquiry", new mongoose.Schema({
     createdAt: { type: Date, default: Date.now, expires: 60 * 60 * 24 * 60 },
 }));
 const Access = mongoose.model("CyberAccess", new mongoose.Schema({ _id: String, level: { type: String, default: null }, updatedAt: Date }));
+// تسجيل الروم الصوتي: البوت يكتب الجلسات والقطع الصوتية، والموقع يقرأها (نفس التعريف بالضبط بملف البوت)
+const VoiceSess = mongoose.model("CyberVoiceSess", new mongoose.Schema({
+    sid: { type: String, unique: true }, chId: String, chName: String,
+    startedAt: Date, endedAt: { type: Date, default: null }, lastAt: Date,
+    mime: { type: String, default: "audio/ogg; codecs=opus" },
+    chunks: { type: Number, default: 0 }, bytes: { type: Number, default: 0 },
+    stays: { type: [mongoose.Schema.Types.Mixed], default: [] },
+    speech: { type: [mongoose.Schema.Types.Mixed], default: [] }, speechN: { type: Number, default: 0 },
+    createdAt: { type: Date, default: Date.now, expires: 60 * 60 * 24 * 30 },
+}, { minimize: false }));
+const VoiceChunkSchema = new mongoose.Schema({
+    sid: String, seq: Number, data: Buffer,
+    createdAt: { type: Date, default: Date.now, expires: 60 * 60 * 24 * 30 },
+});
+VoiceChunkSchema.index({ sid: 1, seq: 1 });
+const VoiceChunk = mongoose.model("CyberVoiceChunk", VoiceChunkSchema);
 
 // ── بث فوري للوحة (Server-Sent Events) — بدون أي تحديث كامل للصفحة ──
 const sseClients = new Set();
@@ -328,6 +344,53 @@ app.get("/api/images/:id", auth, wrap(async (req, res) => {
     res.send(bin);
 }));
 
+// ── تسجيل الروم الصوتي: بيانات الجلسة + الصوت (للقائد والنائب فقط) ──
+const voiceCache = new Map();
+async function voiceBuffer(sid, ended) {
+    const c = voiceCache.get(sid);
+    if (ended && c && Date.now() - c.t < 10 * 60 * 1000) return c.buf;
+    const parts = await VoiceChunk.find({ sid }).sort({ seq: 1 }).select("data").lean();
+    const buf = Buffer.concat(parts.map(x => Buffer.isBuffer(x.data) ? x.data : Buffer.from(x.data?.buffer || x.data || [])));
+    if (ended && buf.length) {
+        voiceCache.set(sid, { buf, t: Date.now() });
+        while (voiceCache.size > 2) voiceCache.delete(voiceCache.keys().next().value);
+    }
+    return buf;
+}
+app.get("/api/voice/:sid", auth, full, wrap(async (req, res) => {
+    const sid = String(req.params.sid || "");
+    if (!/^[\w-]{4,60}$/.test(sid)) return res.status(400).json({ error: "تسجيل غير صحيح" });
+    const d = await VoiceSess.findOne({ sid }).lean();
+    if (!d) return res.status(404).json({ error: "التسجيل غير موجود (انحذف أو انتهت مدة حفظه)" });
+    const live = !d.endedAt && d.lastAt && Date.now() - new Date(d.lastAt).getTime() < 120000;
+    res.json({ session: {
+        sid, chName: d.chName || "", startedAt: new Date(d.startedAt).getTime(),
+        endedAt: d.endedAt ? new Date(d.endedAt).getTime() : null, lastAt: d.lastAt ? new Date(d.lastAt).getTime() : null,
+        live: !!live, hasAudio: (d.chunks || 0) > 0,
+        stays: (d.stays || []).map(x => ({ uid: String(x.uid), name: x.name || x.tag || x.uid, avatar: x.avatar || null, start: Number(x.start), end: x.end ? Number(x.end) : null })),
+        speech: (d.speech || []).filter(e => Array.isArray(e) && e.length >= 3),
+    } });
+}));
+app.get("/api/voice/:sid/audio", auth, full, wrap(async (req, res) => {
+    const sid = String(req.params.sid || "");
+    if (!/^[\w-]{4,60}$/.test(sid)) return res.status(400).end();
+    const d = await VoiceSess.findOne({ sid }).select("endedAt").lean();
+    if (!d) return res.status(404).end();
+    const buf = await voiceBuffer(sid, !!d.endedAt);
+    if (!buf.length) return res.status(404).end();
+    const total = buf.length;
+    res.set({ "Content-Type": "audio/ogg", "Accept-Ranges": "bytes", "Cache-Control": d.endedAt ? "private, max-age=300" : "no-store" });
+    const rg = /^bytes=(\d*)-(\d*)$/.exec(String(req.headers.range || ""));
+    if (rg && (rg[1] !== "" || rg[2] !== "")) {
+        const start = rg[1] === "" ? Math.max(0, total - parseInt(rg[2], 10)) : parseInt(rg[1], 10);
+        const end = rg[1] === "" || rg[2] === "" ? total - 1 : Math.min(parseInt(rg[2], 10), total - 1);
+        if (start > end || start >= total) return res.status(416).set("Content-Range", "bytes */" + total).end();
+        return res.status(206).set({ "Content-Range": "bytes " + start + "-" + end + "/" + total, "Content-Length": String(end - start + 1) }).end(buf.subarray(start, end + 1));
+    }
+    res.set("Content-Length", String(total));
+    res.end(buf);
+}));
+
 // ── API: اللوق ──
 const escRe = s => s.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
 
@@ -485,6 +548,7 @@ app.get("/api/events/:id/info", auth, wrap(async (req, res) => {
         channel: d.channel || null, probot: !!d.probot, catchup: !!d.catchup,
         images: (Array.isArray(d.images) ? d.images : []).filter(i => i && i.id).map(i => ({ id: String(i.id) })),
         hasMsgs: d.act === "bulk_delete" || d.act === "mass_msg_delete",
+        recRoom: !!d.recRoom, recSid: d.recRoom && d.sid ? String(d.sid) : null,
     } });
 }));
 // اسم الشخص بالسيرفر + يوزره (من قائمة أعضاء البوت)
@@ -983,6 +1047,19 @@ nav { height:auto; min-height:62px; padding-top:env(safe-area-inset-top,0px); }
 /* ══ نوافذ ما تتحرك ══ */
 .ov { overscroll-behavior:contain; -webkit-overflow-scrolling:touch; }
 .modal { margin:0 auto; }
+/* ══ التسجيل التوضيحي للروم الصوتي ══ */
+.rp-clock { font-size:26px; font-weight:800; text-align:center; color:var(--gold-soft); direction:ltr; }
+.rp-prog { height:6px; background:rgba(255,255,255,0.08); border-radius:4px; overflow:hidden; margin:8px 0 12px; }
+.rp-prog div { height:100%; width:0; background:var(--green2); }
+.rp-row { display:flex; justify-content:space-between; align-items:center; gap:8px; padding:7px 10px; margin-bottom:6px; border-radius:10px; border:1px solid var(--border); background:rgba(255,255,255,0.04); font-size:13px; transition:background .2s, opacity .2s; }
+.rp-row.wait { opacity:.4; }
+.rp-row.in { background:rgba(34,197,94,0.16); border-color:#22c55e; }
+.rp-row.out { background:rgba(100,116,139,0.18); opacity:.75; }
+.rp-row.talk { box-shadow:0 0 0 2px #22c55e; }
+.rp-mic { font-size:11px; font-weight:700; color:#94a3b8; margin-right:4px; }
+.rp-mic.live { color:#4ade80; animation:rpPulse .9s ease-in-out infinite; }
+@keyframes rpPulse { 0%,100% { opacity:1; } 50% { opacity:.45; } }
+.rp-feed { max-height:120px; overflow-y:auto; font-size:12px; color:#cbd5e1; margin-top:8px; line-height:1.9; }
 `;
 
 const HEAD = (title) => `<!DOCTYPE html>
@@ -1013,6 +1090,160 @@ function esc(s){return String(s==null?'':s).replace(/&/g,'&amp;').replace(/</g,'
 function toast(m){var t=$('toast');t.textContent=m;t.style.display='block';clearTimeout(t._t);t._t=setTimeout(function(){t.style.display='none';},3200);}
 function fmt(d){try{return new Date(d).toLocaleString('ar-SA',{timeZone:'Asia/Riyadh',hour12:true,dateStyle:'medium',timeStyle:'short'});}catch(e){return new Date(d).toLocaleString();}}
 function ago(d){var s=Math.floor((Date.now()-new Date(d).getTime())/1000);if(s<60)return 'الحين';if(s<3600)return 'قبل '+Math.floor(s/60)+' دقيقة';if(s<86400)return 'قبل '+Math.floor(s/3600)+' ساعة';return 'قبل '+Math.floor(s/86400)+' يوم';}
+/* ══ تسجيل الروم الصوتي: تسجيل توضيحي (دخول/خروج + مايك) + الصوت ══ */
+var VR=null;
+function vrT(ms){try{return new Date(ms).toLocaleTimeString('ar-SA-u-nu-latn',{timeZone:'Asia/Riyadh',hour12:true,hour:'numeric',minute:'2-digit',second:'2-digit'});}catch(e){return new Date(ms).toLocaleTimeString();}}
+function vrDur(ms){var s=Math.max(0,Math.round(ms/1000)),h=Math.floor(s/3600),m=Math.floor((s%3600)/60),x=s%60;return h?h+' س '+m+' د':(m?m+' د '+x+' ث':x+' ث');}
+function vrStop(){
+  if(VR&&VR.timer)clearInterval(VR.timer);
+  if(VR&&VR.audio){try{VR.audio.pause();VR.audio.removeAttribute('src');}catch(e){}}
+  VR=null;
+}
+function vrClose(){vrStop();closeModal();}
+async function vrOpen(sid){
+  vrStop();
+  modal('<h3>🎬 تسجيل توضيحي</h3><p class="muted center" style="padding:20px 0">جارِ التحميل...</p>');
+  var j;
+  try{j=await api('/api/voice/'+encodeURIComponent(sid));}
+  catch(e){closeModal();toast(e.message);return;}
+  var s=j.session;
+  var E=s.endedAt||s.lastAt||Date.now();
+  var span=Math.max(1000,E-s.startedAt);
+  var evs=[];
+  s.stays.forEach(function(st,k){
+    evs.push({t:st.start,k:k,a:'join'});
+    if(st.end)evs.push({t:st.end,k:k,a:'leave'});
+    st.ongoing=!st.end&&s.live;
+  });
+  evs.sort(function(x,y){return x.t-y.t;});
+  var sp={};
+  s.speech.forEach(function(e){(sp[e[0]]=sp[e[0]]||[]).push([s.startedAt+Number(e[2]),e[1]]);});
+  Object.keys(sp).forEach(function(u){sp[u].sort(function(a,b){return a[0]-b[0];});});
+  VR={s:s,E:E,span:span,evs:evs,sp:sp,T:0,mult:1,rate:1,playing:true,timer:null,base:Math.max(1,span/30000),states:{},passed:-1,audio:null,sid:sid};
+  var uniq={};s.stays.forEach(function(st){uniq[st.uid]=1;});
+  var h='<h3>🎬 تسجيل توضيحي — '+esc(s.chName||'الروم المسجّل')+'</h3>'
+    +'<div style="text-align:center;margin:14px 0"><div style="font-size:46px">'+(s.hasAudio?'🎧':'🎬')+'</div>'
+    +'<p class="muted" style="font-size:13px;line-height:1.9;margin:8px 0 0">'+(s.hasAudio?'هذي الجلسة فيها تسجيل صوتي. اضغط تشغيل ويشتغل الصوت مع الخط الزمني، وجنب اسم اللي يتكلم يطلع المايك.':'هذي الجلسة بدون صوت. اضغط تشغيل لإعادة الدخول والخروج.')+'</p></div>'
+    +'<div class="card" style="margin:8px 0;padding:6px 12px">'
+    +'<div class="prow"><span class="muted">📅 بدأت</span><b>'+esc(fmt(s.startedAt))+'</b></div>'
+    +'<div class="prow"><span class="muted">⏱️ المدة</span><b>'+esc(vrDur(span))+(s.live?' (جارية الحين)':'')+'</b></div>'
+    +'<div class="prow" style="border:none"><span class="muted">👥 عدد الحضور</span><b>'+Object.keys(uniq).length+'</b></div></div>'
+    +'<div class="row" style="justify-content:center;gap:8px"><button class="btn" onclick="vrStart()">▶️ تشغيل '+(s.hasAudio?'التسجيل':'الفيديو')+'</button><button class="btn gray sm" onclick="vrClose()">✖ إغلاق</button></div>';
+  modal(h);
+}
+function vrShell(s){
+  var h='<h3>🎬 تسجيل توضيحي — '+esc(s.chName||'الروم المسجّل')+'</h3>';
+  h+='<div class="rp-clock" id="rp-clock">--</div>';
+  h+='<div style="text-align:center;font-size:12px;color:var(--muted)">مضى: <span id="rp-elapsed">0 ث</span> — داخل الروم: <b id="rp-count">0</b><span id="rp-aud"></span></div>';
+  h+='<div class="rp-prog"><div id="rp-bar"></div></div>';
+  s.stays.forEach(function(st,k){
+    h+='<div class="rp-row wait" id="rp-r'+k+'"><span>'+esc(st.name)+' <span class="rp-mic" id="rp-m'+k+'"></span></span><span id="rp-s'+k+'">لم يدخل</span></div>';
+  });
+  h+='<div class="rp-feed" id="rp-feed"></div>';
+  h+='<div class="row" style="justify-content:center;gap:8px;margin-top:12px"><button class="btn sm" id="rp-pp" onclick="vrToggle()">⏸️ إيقاف</button><button class="btn gray sm" id="rp-sp" onclick="vrSpeed()">×1</button><button class="btn danger sm" onclick="vrClose()">✖ إغلاق</button></div>';
+  return h;
+}
+function vrStart(){
+  if(!VR||VR.timer)return;
+  modal(vrShell(VR.s));
+  if(VR.s.hasAudio)vrAudioStart();
+  VR.timer=setInterval(vrTick,100);
+  vrTick(true);
+}
+function vrAudioStart(){
+  var a=new Audio();a.preload='auto';VR.audio=a;
+  a.onended=function(){if(!VR)return;VR.T=VR.span;VR.playing=false;vrPaintBtn();};
+  a.onerror=function(){if(!VR)return;toast('تعذر تشغيل الصوت، يتم العرض بدون صوت');vrAudioOff();};
+  a.src='/api/voice/'+encodeURIComponent(VR.sid)+'/audio';
+  a.playbackRate=VR.rate;
+  var pr=a.play();if(pr&&pr.catch)pr.catch(function(){});
+  var el=$('rp-aud');if(el)el.textContent=' — 🔊 الصوت شغال';
+}
+function vrAudioOff(){
+  if(!VR||!VR.audio)return;
+  try{VR.audio.pause();VR.audio.removeAttribute('src');}catch(e){}
+  VR.audio=null;VR.sp={};VR.states={};
+  var el=$('rp-aud');if(el)el.textContent='';
+}
+function vrSpeakState(uid,now){
+  var arr=VR.sp[uid];if(!arr)return 0;
+  var spoke=false,on=false;
+  for(var i=0;i<arr.length;i++){if(arr[i][0]>now)break;if(arr[i][1]===1){spoke=true;on=true;}else on=false;}
+  return on?2:(spoke?1:0);
+}
+function vrTick(first){
+  if(!VR)return;
+  if(!$('rp-clock')){vrStop();return;}
+  if(VR.audio){
+    if(VR.playing)VR.T=Math.min(VR.span,Math.max(0,VR.audio.currentTime*1000));
+  }else if(VR.playing&&first!==true){
+    VR.T+=100*VR.base*VR.mult;
+    if(VR.T>=VR.span){VR.T=VR.span;VR.playing=false;vrPaintBtn();}
+  }
+  var s=VR.s,now=s.startedAt+VR.T;
+  $('rp-clock').textContent=vrT(now);
+  $('rp-elapsed').textContent=vrDur(VR.T);
+  $('rp-bar').style.width=(VR.T/VR.span*100)+'%';
+  var inCount=0;
+  s.stays.forEach(function(st,k){
+    var state='wait';
+    if(now>=st.start){
+      if(st.end)state=now>=st.end?'out':'in';
+      else if(VR.T>=VR.span&&!st.ongoing)state='out';
+      else state='in';
+    }
+    if(state==='in')inCount++;
+    var m=state==='wait'?0:vrSpeakState(st.uid,now);
+    var key=state+'|'+m;
+    if(VR.states[k]!==key){
+      VR.states[k]=key;
+      var row=$('rp-r'+k),lab=$('rp-s'+k),mic=$('rp-m'+k);
+      if(row)row.className='rp-row '+state+(m===2?' talk':'');
+      if(lab)lab.textContent=state==='in'?'🟢 داخل الروم':(state==='out'?(st.end?'⚫ طلع '+vrT(st.end):'⚠️ انقطع'):'لم يدخل');
+      if(mic){mic.className='rp-mic'+(m===2?' live':'');mic.textContent=m===2?'🎤 يتحدث الحين':(m===1?'🎤 تحدث':'');}
+    }
+  });
+  $('rp-count').textContent=inCount;
+  var passed=0;
+  for(var i=0;i<VR.evs.length;i++){if(VR.evs[i].t<=now)passed++;}
+  if(passed!==VR.passed){
+    VR.passed=passed;
+    var lines=[];
+    for(var j=passed-1;j>=0&&lines.length<8;j--){
+      var ev=VR.evs[j],st2=s.stays[ev.k];
+      lines.push('<div>'+(ev.a==='join'?'➡️ دخل ':'⬅️ طلع ')+esc(st2.name)+' — '+esc(vrT(ev.t))+'</div>');
+    }
+    $('rp-feed').innerHTML=lines.join('');
+  }
+}
+function vrPaintBtn(){
+  var b=$('rp-pp');if(!b||!VR)return;
+  b.textContent=VR.playing?'⏸️ إيقاف':(VR.T>=VR.span?'🔄 إعادة':'▶️ تشغيل');
+}
+function vrToggle(){
+  if(!VR)return;
+  var a=VR.audio;
+  if(!VR.playing&&VR.T>=VR.span){
+    VR.passed=-1;VR.states={};VR.playing=true;VR.T=0;
+    if(a){a.currentTime=0;var p1=a.play();if(p1&&p1.catch)p1.catch(function(){});}
+  }else{
+    VR.playing=!VR.playing;
+    if(a){if(VR.playing){var p2=a.play();if(p2&&p2.catch)p2.catch(function(){});}else a.pause();}
+  }
+  vrPaintBtn();
+}
+function vrSpeed(){
+  if(!VR)return;
+  var b=$('rp-sp');
+  if(VR.audio){
+    VR.rate=VR.rate===1?1.5:(VR.rate===1.5?2:1);
+    VR.audio.playbackRate=VR.rate;
+    if(b)b.textContent='×'+VR.rate;
+    return;
+  }
+  VR.mult=VR.mult===1?2:(VR.mult===2?4:1);
+  if(b)b.textContent='×'+VR.mult;
+}
 async function api(url,opt){
   var r=await fetch(url,Object.assign({headers:{'Content-Type':'application/json'}},opt||{}));
   var j=await r.json().catch(function(){return {};});
@@ -1235,6 +1466,7 @@ function evRow(e){
   if(e.resolved&&e.resolvedBy)meta+=' &nbsp;•&nbsp; حلّها: '+esc(e.resolvedBy);
   var acts='';
   if(e.hasMsgs)acts+='<button class="btn sm gray" onclick="showMsgs(\''+e._id+'\')">📄 عرض الرسائل</button>';
+  if(e.data&&e.data.recRoom&&S.level==='full')acts+=e.data.sid?'<button class="btn sm" onclick="vrOpen(\''+e.data.sid+'\')">🎬 تسجيل توضيحي + صوت وصورة</button>':'<span class="badge low">بدون تسجيل</span>';
   if(sus&&S.level==='full'){
     if(e.remedy)acts+='<button class="btn sm danger" onclick="doRemedy(\''+e._id+'\',this)">'+esc(e.remedy.label)+'</button>';
     if(!e.resolved)acts+='<button class="btn sm ok" onclick="doResolve(\''+e._id+'\',this)">✅ حل العملية</button>';
@@ -1368,7 +1600,8 @@ function drawEv(){
   var det=e.details?'<div class="card" style="margin:8px 0;padding:12px"><div class="muted" style="font-size:12px;margin-bottom:4px">📝 التفاصيل</div><div class="log-det">'+esc(e.details)+'</div></div>':'';
   var imgs=(e.images&&e.images.length)?'<div class="imgrow">'+e.images.map(function(im){return '<img src="/api/images/'+im.id+'" alt="" loading="lazy" onclick="showImg(\''+im.id+'\')">';}).join('')+'</div>':'';
   var msgs=e.hasMsgs?'<div style="margin-top:8px"><button class="btn sm gray" onclick="showMsgs(\''+e._id+'\')">📄 عرض الرسائل</button></div>':'';
-  box.innerHTML='<h3>📋 تفاصيل العملية</h3>'+head+actor+target+when+det+imgs+msgs;
+  var recb=(e.recRoom&&S.level==='full')?(e.recSid?'<div style="margin-top:8px"><button class="btn" onclick="vrOpen(\''+e.recSid+'\')">🎬 تسجيل توضيحي + صوت وصورة</button></div>':'<div class="log-meta">⚠️ ما فيه تسجيل لهذي العملية</div>'):'';
+  box.innerHTML='<h3>📋 تفاصيل العملية</h3>'+head+actor+target+when+det+imgs+msgs+recb;
 }
 
 /* ══ تفاصيل العمليات المشبوهة (يوم / أسبوع) ══ */
