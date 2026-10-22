@@ -2877,6 +2877,7 @@ function attachHandlers() {
         const RC = vrCh();
         const toRec = !!RC && nc === RC, fromRec = !!RC && oc === RC;
         if (toRec || fromRec) {
+            console.log("🎙️ حدث الروم المسجّل:", m.user.username, toRec ? "دخل" : "طلع", "| البوت بالروم:", !!VR.conn, "| جلسة:", !!VR.sess);
             try {
                 let sid = null, title, details;
                 if (toRec) {
@@ -3859,6 +3860,7 @@ function vrBotState(n) {
 }
 
 async function vrInit() {
+    console.log("🎙️ vrInit — المكتبات:", !!VoiceLib, !!OpusScript, "| الروم:", vrCh());
     if (!vrEnabled()) { console.log("ℹ️ تسجيل الروم الصوتي غير مفعّل (ينقص VOICE_REC_CHANNEL_ID أو المكتبات)"); return; }
     try {
         const stale = await VoiceSess.find({ endedAt: null }).select("sid lastAt startedAt").lean();
