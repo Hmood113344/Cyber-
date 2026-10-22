@@ -829,6 +829,16 @@ app.delete("/api/perms/channels/:id/:tid", auth, full, wrap(async (req, res) => 
     res.json({ ok: true });
 }));
 
+// ── API: باندات الأعضاء (القديمة + الجديدة) — البوت يجمعها من ديسكورد وسجل التدقيق ──
+app.get("/api/bans", auth, wrap(async (req, res) => {
+    res.json(await callBot("bans", { force: req.query.refresh === "1" }, 90000));
+}));
+app.get("/api/bans/:id/history", auth, wrap(async (req, res) => {
+    if (!/^\d{5,25}$/.test(req.params.id)) return res.status(400).json({ error: "آيدي غير صالح" });
+    const ev = await Event.find({ cat: "ban", targetId: req.params.id }).sort({ createdAt: -1 }).limit(15).lean();
+    res.json({ events: ev.map(e => ({ title: e.title, details: String(e.details || "").slice(0, 300), actorTag: e.actorTag, at: e.createdAt, act: e.data && e.data.act })) });
+}));
+
 // ── API: أعضاء الأمن السيبراني (للقائد والنائب فقط) ──
 app.get("/api/members", auth, full, wrap(async (req, res) => {
     const r = await callBot("members", { meId: req.session.user.id }, 60000);
@@ -946,6 +956,20 @@ input:focus, select:focus { outline:none; border-color:var(--gold-soft); }
 .tfchips { display:flex; flex-wrap:wrap; gap:8px; margin:8px 0 14px; }
 .tftabs { display:flex; gap:8px; margin:6px 0 12px; }
 .tftabs .btn { flex:1; text-align:center; }
+.bn-grid { display:grid; grid-template-columns:repeat(auto-fill,minmax(320px,1fr)); gap:12px; }
+.bn-grid .card { margin-bottom:0; }
+.bn-card { cursor:pointer; display:flex; gap:12px; align-items:flex-start; transition:.15s; }
+.bn-card:hover { border-color:var(--gold-soft); transform:translateY(-1px); }
+.bn-card img { width:56px; height:56px; border-radius:50%; object-fit:cover; flex:none; border:2px solid #ef4444; background:#0b1730; }
+.bn-rs { color:#cbd5e1; font-size:13px; line-height:1.6; margin:2px 0 4px; display:-webkit-box; -webkit-line-clamp:2; -webkit-box-orient:vertical; overflow:hidden; overflow-wrap:anywhere; }
+.bn-hero { display:flex; gap:14px; align-items:center; margin-bottom:10px; }
+.bn-hero img { width:84px; height:84px; border-radius:50%; object-fit:cover; border:3px solid #ef4444; background:#0b1730; flex:none; }
+.bn-row { display:flex; justify-content:space-between; align-items:flex-start; gap:12px; padding:9px 0; border-bottom:1px dashed rgba(255,255,255,0.09); font-size:13px; }
+.bn-row > span { color:var(--muted); flex:none; }
+.bn-row > b { text-align:left; overflow-wrap:anywhere; font-weight:700; }
+.bn-who { display:inline-flex; align-items:center; gap:7px; }
+.bn-who img { width:26px; height:26px; border-radius:50%; object-fit:cover; }
+.bn-reason { background:rgba(255,255,255,0.05); border:1px solid var(--border); border-radius:10px; padding:10px 12px; margin:8px 0; line-height:1.8; white-space:pre-wrap; overflow-wrap:anywhere; font-size:13px; }
 .tfgrid { display:grid; grid-template-columns:1fr 1fr; gap:8px 10px; align-items:center; }
 .tfgrid .tfl { grid-column:1 / -1; font-size:12px; color:#94a3b8; margin-top:6px; }
 .tfpr { display:flex; flex-wrap:wrap; gap:8px; margin-top:8px; }
@@ -1093,7 +1117,7 @@ function loginPage(mode) {
 }
 
 const CLIENT = String.raw`
-var PAGES=[['logs','📜 اللوق'],['stats','📊 الإحصائيات'],['bots','🤖 البوتات'],['perms','🔐 صلاحيات السيرفر']];
+var PAGES=[['logs','📜 اللوق'],['stats','📊 الإحصائيات'],['bots','🤖 البوتات'],['perms','🔐 صلاحيات السيرفر'],['bans','🔨 الباندات']];
 var S={page:'logs',q:'',cat:'',unres:false,cu:false,events:[],sig:'',timer:null,permsTab:'roles',permsView:'danger',permsQ:'',meta:null,presence:true,level:'view',meId:null,tf:null};
 var CATS=[['','الكل'],['sus','⚠️ العمليات المشبوهة'],['newacc','🆕 حسابات جديدة'],['join','دخول'],['leave','خروج'],['kick','طرد'],['ban','حظر'],['role','الرتب'],['inquiry','📩 استفسارات الرتب'],['channel','القنوات'],['voice','🎙️ الرومات الصوتية'],['message','الرسائل المحذوفة'],['probot','🧹 حذف عبر ProBot'],['bot','البوتات'],['webhook','ويبهوكس'],['everyone','منشن everyone'],['server','إعدادات السيرفر'],['panel','عمليات اللوحة']];
 var RULE_AR={new_account:'حساب جديد',mass_roles_created:'رتب جماعية',mass_role_delete:'حذف رتب',mass_channel_create:'إنشاء قنوات',mass_channel_delete:'حذف قنوات',mass_ban:'حظر جماعي',mass_kick:'طرد جماعي',dangerous_perm_grant:'صلاحيات خطيرة',dangerous_role_assigned:'رتبة خطيرة',bot_added:'بوت جديد',webhook_created:'ويبهوك',everyone_spam:'منشن everyone',mass_join:'غارة دخول',mass_msg_delete:'مسح ضخم',server_changed:'إعدادات السيرفر'};
@@ -1434,7 +1458,7 @@ function buildNav(){
 function openDrawer(){$('drawer').classList.add('open');$('dov').classList.add('open');}
 function closeDrawer(){$('drawer').classList.remove('open');$('dov').classList.remove('open');}
 function go(p){S.page=p;closeDrawer();clearInterval(S.timer);buildNav();render();}
-function render(){var f={logs:pgLogs,stats:pgStats,bots:pgBots,perms:pgPerms,members:pgMembers}[S.page];f();}
+function render(){var f={logs:pgLogs,stats:pgStats,bots:pgBots,perms:pgPerms,bans:pgBans,members:pgMembers}[S.page];f();}
 
 /* ══ اللوق ══ */
 function openBackfill(){
@@ -1918,6 +1942,98 @@ async function pgBots(){
 async function kickBot(id,name){
   if(!(await ask('متأكد تبي تطرد البوت '+name+'؟')))return;
   try{await api('/api/bots/'+id+'/kick',{method:'POST'});toast('تم طرد البوت');pgBots();}catch(e){toast(e.message);}
+}
+
+/* ══ باندات الأعضاء ══ */
+function bnSince(t){var s=Math.floor((Date.now()-t)/1000);if(s<60)return 'أقل من دقيقة';var m=Math.floor(s/60);if(m<60)return m+' دقيقة';var h=Math.floor(m/60);if(h<48)return h+' ساعة';var d=Math.floor(h/24);if(d<60)return d+' يوم';var mo=Math.floor(d/30);if(mo<24)return mo+' شهر';return Math.floor(d/365)+' سنة';}
+function bnDurAr(ms){var m=Math.round(ms/60000);if(m<60)return m+' دقيقة';var h=Math.round(m/60);if(h<48)return h+' ساعة';var d=Math.round(h/24);if(d<60)return d+' يوم';return Math.round(d/30)+' شهر';}
+function bnDur(x){
+  if(x.durMs){
+    var end=x.bannedAt?x.bannedAt+x.durMs:null;
+    return 'مؤقت: '+bnDurAr(x.durMs)+(end&&end<Date.now()?' (انتهت المدة وهو لسا محظور)':'');
+  }
+  return 'دائم';
+}
+function bnWho(x){
+  if(x.probot)return '🤖 ProBot'+(x.invTag?' ← '+x.invTag:'');
+  if(x.execTag)return '👤 '+x.execTag;
+  return '❔ غير معروف';
+}
+function bnWhoBox(tag,av){return '<span class="bn-who">'+(av?'<img src="'+esc(av)+'" alt="">':'')+esc(tag)+'</span>';}
+async function pgBans(force){
+  if(!S.bn)S.bn={list:[],q:'',f:'all',at:0};
+  $('main').innerHTML='<h2>🔨 باندات الأعضاء</h2><div class="card center muted">جاري التحميل... (أول مرة ممكن ياخذ كم ثانية)</div>';
+  try{
+    var j=await api('/api/bans'+(force===true?'?refresh=1':''));if(S.page!=='bans')return;
+    S.bn.list=j.bans;S.bn.at=j.at;drawBans();
+  }catch(e){toast(e.message);}
+}
+function setBnFilter(f){S.bn.f=f;drawBans();}
+function drawBans(){
+  var b=S.bn,c={all:b.list.length,pb:0,direct:0,old:0};
+  b.list.forEach(function(x){if(x.probot)c.pb++;else if(x.execTag)c.direct++;if(x.src==='old')c.old++;});
+  var tabs=[['all','📋 الكل',c.all],['pb','🤖 عبر ProBot',c.pb],['direct','👤 مباشر',c.direct],['old','📜 قديم بدون تفاصيل',c.old]].map(function(t){
+    return '<button class="tab '+(b.f===t[0]?'active':'')+'" onclick="setBnFilter(\''+t[0]+'\')">'+t[1]+' ('+t[2]+')</button>';}).join('');
+  $('main').innerHTML='<div class="row"><h2>🔨 باندات الأعضاء ('+c.all+')</h2><button class="btn sm gray" onclick="pgBans(true)">🔄 تحديث</button></div>'
+   +'<div class="muted" style="font-size:12px;margin:-4px 0 10px">👆 اضغط على أي بطاقة لعرض التفاصيل كاملة (من حظره، السبب، التاريخ) • آخر تحديث: '+fmt(b.at)+'</div>'
+   +'<div class="card" style="padding:12px"><input id="bn-q" placeholder="🔍 ابحث بالاسم أو الآيدي أو السبب أو اسم اللي حظره" value="'+esc(b.q)+'" oninput="S.bn.q=this.value;bnList()"></div>'
+   +'<div class="tabs">'+tabs+'</div><div id="bn-list"></div>';
+  bnList();
+}
+function bnList(){
+  var b=S.bn,q=(b.q||'').trim().toLowerCase();
+  var arr=b.list.filter(function(x){
+    if(b.f==='pb'&&!x.probot)return false;
+    if(b.f==='direct'&&!(x.execTag&&!x.probot))return false;
+    if(b.f==='old'&&x.src!=='old')return false;
+    if(!q)return true;
+    return [x.tag,x.name,x.id,x.reason,x.execTag,x.invTag].join(' ').toLowerCase().indexOf(q)>=0;
+  });
+  var shown=arr.slice(0,150);
+  $('bn-list').innerHTML=(shown.length?'<div class="bn-grid">'+shown.map(bnCard).join('')+'</div>':'<div class="card center muted">'+(b.list.length?'ما فيه نتائج':'ما فيه أحد محظور 🎉')+'</div>')
+   +(arr.length>shown.length?'<div class="card center muted" style="margin-top:12px">عرض أول 150 من '+arr.length+' — استخدم البحث لتضييق النتائج</div>':'');
+}
+function bnCard(x){
+  return '<div class="card bn-card" onclick="bnOpen(\''+x.id+'\')"><img src="'+esc(x.avatar)+'" alt="" loading="lazy">'
+   +'<div style="flex:1;min-width:0"><div class="log-title">'+esc(x.tag)+(x.name&&x.name!==x.tag?' <span class="muted" style="font-size:12px;font-weight:400">'+esc(x.name)+'</span>':'')+'</div>'
+   +'<div class="bn-rs">'+(x.reason?esc(x.reason):'<span class="muted">بدون سبب</span>')+'</div>'
+   +'<div><span class="chip '+(x.probot?'high':'safe')+'">'+esc(bnWho(x))+'</span><span class="chip safe">⏳ '+esc(bnDur(x))+'</span>'
+   +(x.bannedAt?'<span class="chip safe">🕒 '+ago(x.bannedAt)+'</span>':'<span class="chip safe">🕒 تاريخ غير معروف</span>')+'</div></div></div>';
+}
+function bnOpen(id){
+  var x=S.bn.list.filter(function(y){return y.id===id;})[0];if(!x)return;
+  var row=function(k,v){return '<div class="bn-row"><span>'+k+'</span><b>'+v+'</b></div>';};
+  var who;
+  if(x.probot){
+    who=bnWhoBox('ProBot',null);
+  }else if(x.execTag){who=bnWhoBox(x.execTag,x.execAvatar);}
+  else who='<span class="muted">غير متوفر</span>';
+  var h='<div style="max-height:72vh;overflow-y:auto"><h3>🔨 تفاصيل الباند</h3>'
+   +'<div class="bn-hero"><img src="'+esc(x.avatar)+'" alt=""><div style="min-width:0"><div class="log-title" style="margin:0">'+esc(x.tag)+'</div>'
+   +(x.name&&x.name!==x.tag?'<div class="muted" style="font-size:12px">'+esc(x.name)+'</div>':'')
+   +'<div class="log-meta" style="margin-top:4px">🆔 '+esc(x.id)+cpb(x.id,'تم نسخ الآيدي','نسخ')+'</div></div></div>'
+   +'<div class="muted" style="font-size:12px">📝 سبب الباند</div><div class="bn-reason">'+(x.reason?esc(x.reason):'<span class="muted">بدون سبب</span>')+'</div>'
+   +row('🔨 اللي نفّذ الباند',who);
+  if(x.probot){
+    h+=row('👤 اللي كتب الأمر',x.invTag?bnWhoBox(x.invTag,x.invAvatar)+(x.invHow?' <span class="muted" style="font-size:11px;font-weight:400">('+esc(x.invHow)+')</span>':''):'<span class="muted">غير معروف</span>');
+    if(!x.invTag)h+='<div class="log-meta" style="margin:6px 0">ℹ️ ديسكورد ما يسجّل مين كتب أمر ProBot، والبوت يعرفه من رسالة الأمر أو رد ProBot لحظة التنفيذ. الباندات القديمة قبل تشغيل هالميزة ما ينعرف منفّذها.</div>';
+  }
+  h+=row('📅 تاريخ الباند',x.bannedAt?fmt(x.bannedAt):'<span class="muted">غير معروف (باند قديم)</span>')
+   +row('⏱️ نوع المدة',esc(bnDur(x)))
+   +row('⌛ صار له',x.bannedAt?esc(bnSince(x.bannedAt)):'<span class="muted">غير معروف</span>')
+   +row('🗓️ عمر الحساب',x.acctAt?fmt(x.acctAt)+' <span class="muted" style="font-size:11px;font-weight:400">('+esc(bnSince(x.acctAt))+')</span>':'-')
+   +row('📚 المصدر',x.src==='live'?'سُجّل مباشرة وقت الباند':x.src==='audit'?'من سجل التدقيق':'باند قديم — ما له تفاصيل')
+   +'<div style="margin-top:14px"><div class="muted" style="font-size:12px;margin-bottom:6px">📜 سجل هذا العضو (حظر / فك حظر)</div><div id="bn-hist" class="muted" style="font-size:13px">جاري التحميل...</div></div></div>'
+   +'<div class="row" style="justify-content:flex-start;margin-top:14px"><button class="btn gray" onclick="closeModal()">إغلاق</button></div>';
+  modal(h);
+  api('/api/bans/'+id+'/history').then(function(j){
+    var el=$('bn-hist');if(!el)return;
+    el.innerHTML=j.events.length?j.events.map(function(e){
+      return '<div class="mlist" style="align-items:flex-start;flex-direction:column;gap:2px"><div><b>'+(e.act==='unban'?'✅ ':'🔨 ')+esc(e.title)+'</b> <span class="muted" style="font-size:11px">'+fmt(e.at)+'</span></div>'
+       +(e.actorTag?'<div class="log-meta" style="margin:0">بواسطة: '+esc(e.actorTag)+'</div>':'')
+       +(e.details?'<div class="log-meta" style="margin:0;white-space:pre-wrap">'+esc(e.details)+'</div>':'')+'</div>';
+    }).join(''):'ما فيه عمليات محفوظة (اللوق يحتفظ بآخر 60 يوم)';
+  }).catch(function(){var el=$('bn-hist');if(el)el.textContent='تعذّر تحميل السجل';});
 }
 
 /* ══ صلاحيات السيرفر ══ */
