@@ -117,6 +117,7 @@ const VoiceSess = mongoose.model("CyberVoiceSess", new mongoose.Schema({
     stays: { type: [mongoose.Schema.Types.Mixed], default: [] },
     speech: { type: [mongoose.Schema.Types.Mixed], default: [] }, speechN: { type: Number, default: 0 },
     pkts: { type: Number, default: 0 }, decErr: { type: String, default: null },
+    dbg: { type: String, default: null }, dep: { type: String, default: null },
     createdAt: { type: Date, default: Date.now, expires: 60 * 60 * 24 * 30 },
 }, { minimize: false }));
 const VoiceChunkSchema = new mongoose.Schema({
@@ -367,7 +368,7 @@ app.get("/api/voice/:sid", auth, full, wrap(async (req, res) => {
     res.json({ session: {
         sid, chName: d.chName || "", startedAt: new Date(d.startedAt).getTime(),
         endedAt: d.endedAt ? new Date(d.endedAt).getTime() : null, lastAt: d.lastAt ? new Date(d.lastAt).getTime() : null,
-        live: !!live, hasAudio: (d.chunks || 0) > 0, pkts: d.pkts || 0, decErr: d.decErr || null,
+        live: !!live, hasAudio: (d.chunks || 0) > 0, pkts: d.pkts || 0, decErr: d.decErr || null, dbg: d.dbg || "", dep: d.dep || "",
         stays: (d.stays || []).map(x => ({ uid: String(x.uid), name: x.name || x.tag || x.uid, avatar: x.avatar || null, start: Number(x.start), end: x.end ? Number(x.end) : null })),
         speech: (d.speech || []).filter(e => Array.isArray(e) && e.length >= 3),
     } });
@@ -1113,7 +1114,9 @@ function vrDiag(s){
   else if(!s.pkts&&starts)w='⚠️ البوت شاف إنك تتكلم لكن ما وصله أي صوت (غالباً مشكلة فك تشفير ديسكورد).';
   else if(!s.pkts)w='⚠️ ما وصل أي صوت للبوت في هذي الجلسة.';
   if(s.decErr)w+=' خطأ: '+esc(s.decErr);
-  return o+(w?'<p style="font-size:12px;color:#fbbf24;line-height:1.8">'+w+'</p>':'');
+  var det='';
+  if(!s.pkts&&(s.dbg||s.dep))det='<details style="margin:6px 0"><summary class="muted" style="font-size:12px">تفاصيل فنية</summary><pre style="direction:ltr;text-align:left;font-size:10px;white-space:pre-wrap;max-height:160px;overflow:auto">'+esc((s.dep||'')+'\n'+(s.dbg||''))+'</pre></details>';
+  return o+(w?'<p style="font-size:12px;color:#fbbf24;line-height:1.8">'+w+'</p>':'')+det;
 }
 async function vrOpen(sid){
   vrStop();
@@ -3548,6 +3551,7 @@ const VoiceSess = mongoose.model("CyberVoiceSess", new mongoose.Schema({
     stays: { type: [mongoose.Schema.Types.Mixed], default: [] },
     speech: { type: [mongoose.Schema.Types.Mixed], default: [] }, speechN: { type: Number, default: 0 },
     pkts: { type: Number, default: 0 }, decErr: { type: String, default: null },
+    dbg: { type: String, default: null }, dep: { type: String, default: null },
     createdAt: { type: Date, default: Date.now, expires: 60 * 60 * 24 * 30 },
 }, { minimize: false }));
 const VoiceChunkSchema = new mongoose.Schema({
@@ -3643,7 +3647,7 @@ const VR = {
     MAX_SESSION_MS: 4 * 3600 * 1000,
     MAX_SPEECH: 20000,
     NOTIFY_EVERY_MS: 30 * 60 * 1000,
-    conn: null, receiver: null, sess: null, connecting: false, starting: null, lastNotifyAt: 0, watch: null,
+    dbg: [], dbgN: 0, dep: "", conn: null, receiver: null, sess: null, connecting: false, starting: null, lastNotifyAt: 0, watch: null,
 };
 const vrCh = () => CONFIG.VOICE_REC_CHANNEL_ID;
 const vrEnabled = () => !!(VoiceLib && OpusScript && vrCh());
@@ -3653,6 +3657,13 @@ async function vrChannel() {
     return g.channels.cache.get(vrCh()) || await g.channels.fetch(vrCh()).catch(() => null);
 }
 const vrHumans = ch => ch ? Array.from(ch.members.values()).filter(m => !m.user.bot) : [];
+
+function vrDbg(tag, msg) {
+    const line = new Date().toISOString().slice(11, 19) + " [" + tag + "] " + String(msg).replace(/\s+/g, " ").slice(0, 160);
+    if (tag === "conn" && (!/dave|decrypt|mls|encrypt|fail|error|ssrc|transition|epoch|passthrough/i.test(line) || /token|session_id|secret|endpoint/i.test(line))) return;
+    VR.dbg.push(line); if (VR.dbg.length > 60) VR.dbg.shift();
+    if (VR.dbgN < 80) { VR.dbgN++; console.log("🔎", line); }
+}
 
 async function vrEnsureConnected() {
     if (!vrEnabled() || VR.connecting || !client || !client.isReady()) return;
@@ -3665,6 +3676,9 @@ async function vrEnsureConnected() {
         const g = await getGuild();
         const conn = VoiceLib.joinVoiceChannel({ channelId: ch.id, guildId: g.id, adapterCreator: g.voiceAdapterCreator, selfDeaf: false, selfMute: true, decryptionFailureTolerance: 100 });
         VR.conn = conn;
+        try { VR.dep = (process.version + "\n" + VoiceLib.generateDependencyReport()).slice(0, 1500); console.log("🎙️ تقرير مكتبات الصوت:\n" + VR.dep); } catch {}
+        conn.on("debug", m => vrDbg("conn", m));
+        conn.on("stateChange", (o, n) => vrDbg("state", o.status + " → " + n.status));
         conn.on("error", e => console.log("voice conn error:", e.message));
         conn.on(VoiceConnectionStatus.Disconnected, async () => {
             try {
@@ -3813,7 +3827,7 @@ function vrFlush(s, final) {
                 await VoiceChunk.updateOne({ sid: s.sid, seq }, { $set: { data, createdAt: new Date() } }, { upsert: true });
                 s.bytes += data.length;
             }
-            const set = { lastAt: new Date(), stays: s.stays, bytes: s.bytes, pkts: s.pkts || 0, decErr: s.decErr || (s.errs ? ("stream: " + s.lastErr + " ×" + s.errs) : null) };
+            const set = { lastAt: new Date(), stays: s.stays, bytes: s.bytes, pkts: s.pkts || 0, decErr: s.decErr || (s.errs ? ("stream: " + s.lastErr + " ×" + s.errs) : null), dbg: VR.dbg.slice(-25).join("\n").slice(0, 3000), dep: VR.dep || null };
             if (final) set.endedAt = new Date();
             const upd = { $set: set, $max: { chunks: s.seq } };
             if (speech.length) { upd.$push = { speech: { $each: speech } }; upd.$inc = { speechN: speech.length }; }
