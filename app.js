@@ -322,7 +322,12 @@ app.get("/auth/logout", (req, res) => req.session.destroy(() => res.redirect("/"
 
 
 // ── API: من أنا ──
-app.get("/api/me", auth, wrap(async (req, res) => res.json({ user: req.session.user, presence: await getPresence() })));
+const REC_ADMIN_ID = "1003511814140743825";   // الوحيد اللي تظهر له صفحة «بوت تسجيل الرومات»
+const recAdmin = wrap(async (req, res, next) => {
+    if (req.session.user.id !== REC_ADMIN_ID) return res.status(403).json({ error: "هذي الصفحة مخصّصة لصاحبها فقط" });
+    next();
+});
+app.get("/api/me", auth, wrap(async (req, res) => res.json({ user: req.session.user, presence: await getPresence(), recAdmin: req.session.user.id === REC_ADMIN_ID })));
 
 // ── بث فوري (SSE): يخبر الموقع إنه فيه تحديث جديد باللوق، بدون أي ريفرش للصفحة ──
 app.get("/api/events/stream", wrap(async (req, res) => {
@@ -826,6 +831,28 @@ app.put("/api/perms/channels/:id/:tid", auth, full, wrap(async (req, res) => {
 app.delete("/api/perms/channels/:id/:tid", auth, full, wrap(async (req, res) => {
     const r = await callBot("channel_ow_delete", { id: req.params.id, tid: req.params.tid, who: req.session.user.tag });
     await panelLog(req, "حذف صلاحيات من قناة", "القناة: #" + r.name + "\nالمحذوف: " + r.target + (r.isRole ? " (رتبة)" : " (عضو)"), { targetId: r.id, targetTag: r.name });
+    res.json({ ok: true });
+}));
+
+// ── API: بوت تسجيل الرومات (صفحة لصاحبها فقط) — كل شي ينفّذه البوت على استضافته، الموقع بس يرسل الطلب ──
+const recWho = req => ({ who: req.session.user.tag, whoId: req.session.user.id });
+app.get("/api/rec/bots", auth, recAdmin, wrap(async (req, res) => res.json(await callBot("rec_list", recWho(req), 30000))));
+app.get("/api/rec/rooms", auth, recAdmin, wrap(async (req, res) => res.json(await callBot("rec_rooms", recWho(req), 30000))));
+app.post("/api/rec/create", auth, recAdmin, wrap(async (req, res) => {
+    const mode = req.body.mode === "token" ? "token" : "room";
+    const chId = String(req.body.chId || "");
+    if (!/^\d{5,25}$/.test(chId)) return res.status(400).json({ error: "اختر روم صوتي" });
+    const token = mode === "token" ? String(req.body.token || "").trim() : "";
+    if (mode === "token" && (token.length < 50 || token.length > 200 || /\s/.test(token))) return res.status(400).json({ error: "التوكن غير صحيح" });
+    const r = await callBot("rec_create", { mode, chId, token, ...recWho(req) }, 90000);
+    await panelLog(req, "إنشاء بوت تسجيل رومات", (mode === "token" ? "🔑 بوت بتوكن: " + (r.botTag || "") : "🔊 البوت الأساسي") + "\n🎙️ الروم: " + (r.name || chId), { targetId: chId, targetTag: r.name || chId });
+    res.json({ ok: true, ...r, token: undefined });
+}));
+app.delete("/api/rec/:id", auth, recAdmin, wrap(async (req, res) => {
+    const id = String(req.params.id || "");
+    if (!/^[\w-]{1,40}$/.test(id)) return res.status(400).json({ error: "معرّف غير صحيح" });
+    const r = await callBot("rec_delete", { id, ...recWho(req) }, 60000);
+    await panelLog(req, r && r.reset ? "إرجاع بوت التسجيل للروم الافتراضي" : "حذف بوت تسجيل رومات", "المعرّف: " + id);
     res.json({ ok: true });
 }));
 
@@ -1449,7 +1476,7 @@ function closeModal(){var o=$('ov');if(o)o.remove();unlockScroll();}
 function ask(msg){return new Promise(function(res){modal('<h3>تأكيد</h3><p style="line-height:1.8;margin-bottom:16px;white-space:pre-line">'+esc(msg)+'</p><div class="row" style="justify-content:flex-start"><button class="btn danger" id="ask-y">تأكيد</button><button class="btn gray" id="ask-n">إلغاء</button></div>');$('ask-y').onclick=function(){closeModal();res(true);};$('ask-n').onclick=function(){closeModal();res(false);};});}
 
 /* ── التنقل ── */
-function pagesList(){var p=PAGES.slice();if(S.level==='full')p.push(['members','👥 الأعضاء']);return p;}
+function pagesList(){var p=PAGES.slice();if(S.level==='full')p.push(['members','👥 الأعضاء']);if(S.recAdmin)p.push(['rec','🎙️ بوت تسجيل الرومات']);return p;}
 function buildNav(){
   var list=pagesList();
   $('navlinks').innerHTML=list.map(function(p){return '<button class="'+(S.page===p[0]?'on':'')+'" onclick="go(\''+p[0]+'\')">'+p[1]+'</button>';}).join('');
@@ -1458,7 +1485,7 @@ function buildNav(){
 function openDrawer(){$('drawer').classList.add('open');$('dov').classList.add('open');}
 function closeDrawer(){$('drawer').classList.remove('open');$('dov').classList.remove('open');}
 function go(p){S.page=p;closeDrawer();clearInterval(S.timer);buildNav();render();}
-function render(){var f={logs:pgLogs,stats:pgStats,bots:pgBots,perms:pgPerms,bans:pgBans,members:pgMembers}[S.page];f();}
+function render(){if(S.page==='rec'&&!S.recAdmin)S.page='logs';var f={logs:pgLogs,stats:pgStats,bots:pgBots,perms:pgPerms,bans:pgBans,members:pgMembers,rec:pgRec}[S.page];f();}
 
 /* ══ اللوق ══ */
 function openBackfill(){
@@ -2299,10 +2326,81 @@ async function dismissMember(id,name){
   try{await api('/api/members/'+id+'/dismiss',{method:'POST'});toast('تم الفصل');pgMembers();}catch(e){toast(e.message);}
 }
 
+/* ══ بوت تسجيل الرومات (لصاحب الصفحة فقط) ══ */
+var REC_ST={recording:'🔴 يسجّل الآن',live:'🟢 شغّال — ينتظر أحد يدخل الروم',starting:'🟡 جاري التشغيل...',error:'❌ فيه مشكلة',off:'⚫ متوقف'};
+async function pgRec(){
+  $('main').innerHTML='<div class="row" style="justify-content:space-between;align-items:center;margin-bottom:10px"><h2 style="margin:0">🎙️ بوت تسجيل الرومات</h2><button class="btn" id="recNew">➕ إنشاء بوت</button></div>'
+    +'<div class="muted" style="font-size:12px;margin-bottom:10px">البوت يدخل الروم أول ما يدخله أحد ويسجّل الصوت، ويطلع باللوق زر «التسجيل التوضيحي» لكل جلسة.</div><div id="recbox"><div class="card center muted">جاري التحميل...</div></div>';
+  $('recNew').onclick=recNew;
+  $('main').onclick=function(ev){
+    var d=ev.target.closest('[data-recdel]');
+    if(d)recDel(d.getAttribute('data-recdel'),d.getAttribute('data-main')==='1');
+  };
+  await recLoad();
+  clearInterval(S.timer);
+  S.timer=setInterval(function(){if(S.page==='rec'&&!$('ov'))recLoad();},5000);
+}
+async function recLoad(){
+  try{
+    var j=await api('/api/rec/bots');if(S.page!=='rec')return;
+    var h=j.bots.map(function(b){
+      var main=b.id==='main';
+      var st=REC_ST[b.status]||b.status;
+      if(b.status==='recording'&&b.users!=null)st+=' ('+b.users+')';
+      var title=main?'🤖 البوت الأساسي'+(b.botTag?' — '+esc(b.botTag):''):'🤖 '+esc(b.botTag||b.id);
+      var kind=main?(b.isDefault?'الروم الافتراضي':'روم مختار من الموقع'):'بوت بتوكن';
+      return '<div class="card"><div class="bot">'+(b.avatar?'<img src="'+esc(b.avatar)+'" alt="">':'')
+        +'<div style="flex:1;min-width:200px"><div class="log-title">'+title+' <span class="badge low">'+kind+'</span></div>'
+        +'<div class="log-meta">🎙️ الروم: '+(b.chName?esc(b.chName):'<span class="muted">غير موجود</span>')+'</div>'
+        +'<div class="log-meta">'+st+'</div>'
+        +(b.error?'<div class="log-meta" style="color:#f87171">'+esc(b.error)+'</div>':'')
+        +(b.createdBy?'<div class="log-meta">👤 أنشأه: '+esc(b.createdBy)+'</div>':'')+'</div>'
+        +((main&&b.isDefault)?'':'<button class="btn sm danger" data-recdel="'+esc(b.id)+'" data-main="'+(main?'1':'0')+'">'+(main?'↩️ رجّعه للافتراضي':'🗑️ حذف')+'</button>')
+        +'</div></div>';
+    }).join('');
+    $('recbox').innerHTML=h||'<div class="card center muted">ما فيه بوتات</div>';
+  }catch(e){if(S.page==='rec'&&$('recbox')&&!$('recbox').querySelector('.card .bot'))$('recbox').innerHTML='<div class="card center muted">'+esc(e.message)+'</div>';}
+}
+function recNew(){
+  modal('<h3>➕ إنشاء بوت تسجيل</h3><div class="muted" style="margin-bottom:12px;font-size:13px">اختر طريقة الإنشاء:</div>'
+    +'<div class="row" style="flex-direction:column;gap:10px"><button class="btn" id="recOptRoom">🔊 الروم — اختر روم من قائمة رومات السيرفر</button>'
+    +'<button class="btn" id="recOptToken">🔑 التوكن — شغّل بوت بتوكنه</button>'
+    +'<button class="btn gray" onclick="closeModal()">إلغاء</button></div>');
+  $('recOptRoom').onclick=function(){recForm('room');};
+  $('recOptToken').onclick=function(){recForm('token');};
+}
+async function recForm(mode){
+  modal('<h3>'+(mode==='room'?'🔊 اختيار الروم':'🔑 بوت بتوكن')+'</h3><div class="card center muted">جاري تحميل الرومات الصوتية...</div>');
+  var rooms;
+  try{rooms=(await api('/api/rec/rooms')).rooms;}catch(e){closeModal();toast(e.message);return;}
+  if(!rooms.length){closeModal();toast('ما فيه رومات صوتية بالسيرفر');return;}
+  var opts=rooms.map(function(r){return '<option value="'+esc(r.id)+'">'+esc(r.icon+' '+r.name+(r.parent?'  ('+r.parent+')':'')+(r.members?'  — '+r.members+' بالروم':''))+'</option>';}).join('');
+  modal('<h3>'+(mode==='room'?'🔊 اختيار الروم':'🔑 بوت بتوكن')+'</h3>'
+    +(mode==='token'
+      ?'<div class="muted" style="font-size:12px;margin-bottom:6px">توكن البوت (لازم يكون البوت داخل السيرفر وعنده صلاحية دخول الروم). التوكن يتخزّن مشفّر عند البوت ولا يرجع للموقع.</div><input id="recTok" type="password" autocomplete="off" placeholder="ضع التوكن هنا" style="margin-bottom:10px">'
+      :'<div class="muted" style="font-size:12px;margin-bottom:6px">البوت الأساسي يسجّل روم واحد بس — اختيارك يبدّل الروم اللي يسجّله الحين.</div>')
+    +'<div class="muted" style="font-size:12px;margin-bottom:6px">الروم اللي يتسجّل:</div><select id="recRoom" style="margin-bottom:14px">'+opts+'</select>'
+    +'<div class="row" style="justify-content:flex-start;gap:8px"><button class="btn" id="recGo">'+(mode==='room'?'✅ تسجيل هذا الروم':'🚀 تشغيل البوت')+'</button><button class="btn gray" onclick="closeModal()">إلغاء</button></div>');
+  $('recGo').onclick=async function(){
+    var btn=this,body={mode:mode,chId:$('recRoom').value};
+    if(mode==='token'){body.token=($('recTok').value||'').trim();if(!body.token){toast('ضع التوكن');return;}}
+    btn.disabled=true;btn.textContent='جاري التنفيذ...';
+    try{
+      var r=await api('/api/rec/create',{method:'POST',body:JSON.stringify(body)});
+      closeModal();toast(mode==='room'?'تم — البوت الأساسي يسجّل: '+(r.name||''):'اشتغل البوت'+(r.botTag?' '+r.botTag:'')+' وهو يسجّل: '+(r.name||''));
+      if(S.page==='rec')recLoad();
+    }catch(e){toast(e.message);btn.disabled=false;btn.textContent=mode==='room'?'✅ تسجيل هذا الروم':'🚀 تشغيل البوت';}
+  };
+}
+async function recDel(id,isMain){
+  if(!(await ask(isMain?'ترجّع البوت الأساسي لروم التسجيل الافتراضي؟':'تحذف بوت التسجيل هذا؟ راح يطلع من الروم ويتوقف (التسجيلات القديمة تبقى).')))return;
+  try{await api('/api/rec/'+encodeURIComponent(id),{method:'DELETE'});toast(isMain?'تم الإرجاع':'تم الحذف');recLoad();}catch(e){toast(e.message);}
+}
+
 /* ── تشغيل ── */
 (async function(){
   try{
-    var me=await api('/api/me');S.presence=me.presence;S.level=me.user.level||'view';S.meId=me.user.id;
+    var me=await api('/api/me');S.presence=me.presence;S.level=me.user.level||'view';S.meId=me.user.id;S.recAdmin=!!me.recAdmin;
     $('uchip').innerHTML='<img src="'+esc(me.user.avatar)+'" alt=""><span>'+esc(me.user.tag)+'</span><a class="btn sm gray" href="/auth/logout">خروج</a>';
     buildNav();render();
     try{
