@@ -221,6 +221,31 @@ async function callBot(type, params, timeoutMs) {
     const e = new Error("البوت ما رد بالوقت المناسب — حاول مرة ثانية"); e.status = 504; throw e;
 }
 
+// طلبات صفحة «بوت تسجيل الرومات» تمر بجدول خاص (CyberRecJob) — ما يلقطها أي بوت قديم، بس البوت الجديد
+const RecJob = mongoose.model("CyberRecJob", new mongoose.Schema({
+    type: String,
+    params: { type: mongoose.Schema.Types.Mixed, default: {} },
+    status: { type: String, default: "pending", index: true },
+    result: mongoose.Schema.Types.Mixed,
+    error: String, errStatus: Number,
+    createdAt: { type: Date, default: Date.now, index: true, expires: 60 * 30 },
+    startedAt: Date, doneAt: Date,
+}, { minimize: false }));
+async function callRecBot(type, params, timeoutMs) {
+    if (!(await botAlive())) { const e = new Error("البوت غير متصل حالياً — تأكد إنه شغّال على استضافته"); e.status = 503; throw e; }
+    const job = await RecJob.create({ type, params: params || {}, status: "pending" });
+    const t0 = Date.now(), limit = timeoutMs || 25000;
+    while (Date.now() - t0 < limit) {
+        await sleep(300);
+        const j = await RecJob.findById(job._id).lean();
+        if (!j) break;
+        if (j.status === "done") return j.result;
+        if (j.status === "error") { const e = new Error(j.error || "فشل التنفيذ"); e.status = j.errStatus || 500; throw e; }
+    }
+    await RecJob.deleteOne({ _id: job._id, status: "pending" }).catch(() => {});
+    const e = new Error("البوت ما رد — تأكد إن ملف البوت الجديد (app.js) هو اللي شغّال على الاستضافة وأعد تشغيله"); e.status = 504; throw e;
+}
+
 let presenceCache = { v: true, t: 0 };
 async function getPresence() {
     if (Date.now() - presenceCache.t < 30000) return presenceCache.v;
@@ -836,22 +861,22 @@ app.delete("/api/perms/channels/:id/:tid", auth, full, wrap(async (req, res) => 
 
 // ── API: بوت تسجيل الرومات (صفحة لصاحبها فقط) — كل شي ينفّذه البوت على استضافته، الموقع بس يرسل الطلب ──
 const recWho = req => ({ who: req.session.user.tag, whoId: req.session.user.id });
-app.get("/api/rec/bots", auth, recAdmin, wrap(async (req, res) => res.json(await callBot("rec_list", recWho(req), 30000))));
-app.get("/api/rec/rooms", auth, recAdmin, wrap(async (req, res) => res.json(await callBot("rec_rooms", recWho(req), 30000))));
+app.get("/api/rec/bots", auth, recAdmin, wrap(async (req, res) => res.json(await callRecBot("rec_list", recWho(req), 30000))));
+app.get("/api/rec/rooms", auth, recAdmin, wrap(async (req, res) => res.json(await callRecBot("rec_rooms", recWho(req), 30000))));
 app.post("/api/rec/create", auth, recAdmin, wrap(async (req, res) => {
     const mode = req.body.mode === "token" ? "token" : "room";
     const chId = String(req.body.chId || "");
     if (!/^\d{5,25}$/.test(chId)) return res.status(400).json({ error: "اختر روم صوتي" });
     const token = mode === "token" ? String(req.body.token || "").trim() : "";
     if (mode === "token" && (token.length < 50 || token.length > 200 || /\s/.test(token))) return res.status(400).json({ error: "التوكن غير صحيح" });
-    const r = await callBot("rec_create", { mode, chId, token, ...recWho(req) }, 90000);
+    const r = await callRecBot("rec_create", { mode, chId, token, ...recWho(req) }, 90000);
     await panelLog(req, "إنشاء بوت تسجيل رومات", (mode === "token" ? "🔑 بوت بتوكن: " + (r.botTag || "") : "🔊 البوت الأساسي") + "\n🎙️ الروم: " + (r.name || chId), { targetId: chId, targetTag: r.name || chId });
     res.json({ ok: true, ...r, token: undefined });
 }));
 app.delete("/api/rec/:id", auth, recAdmin, wrap(async (req, res) => {
     const id = String(req.params.id || "");
     if (!/^[\w-]{1,40}$/.test(id)) return res.status(400).json({ error: "معرّف غير صحيح" });
-    const r = await callBot("rec_delete", { id, ...recWho(req) }, 60000);
+    const r = await callRecBot("rec_delete", { id, ...recWho(req) }, 60000);
     await panelLog(req, r && r.reset ? "إرجاع بوت التسجيل للروم الافتراضي" : "حذف بوت تسجيل رومات", "المعرّف: " + id);
     res.json({ ok: true });
 }));
