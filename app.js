@@ -2362,35 +2362,29 @@ async function recLoad(){
   }catch(e){if(S.page==='rec'&&$('recbox')&&!$('recbox').querySelector('.card .bot'))$('recbox').innerHTML='<div class="card center muted">'+esc(e.message)+'</div>';}
 }
 function recNew(){
-  modal('<h3>➕ إنشاء بوت تسجيل</h3><div class="muted" style="margin-bottom:12px;font-size:13px">اختر طريقة الإنشاء:</div>'
-    +'<div class="row" style="flex-direction:column;gap:10px"><button class="btn" id="recOptRoom">🔊 الروم — اختر روم من قائمة رومات السيرفر</button>'
-    +'<button class="btn" id="recOptToken">🔑 التوكن — شغّل بوت بتوكنه</button>'
-    +'<button class="btn gray" onclick="closeModal()">إلغاء</button></div>');
-  $('recOptRoom').onclick=function(){recForm('room');};
-  $('recOptToken').onclick=function(){recForm('token');};
-}
-async function recForm(mode){
-  modal('<h3>'+(mode==='room'?'🔊 اختيار الروم':'🔑 بوت بتوكن')+'</h3><div class="card center muted">جاري تحميل الرومات الصوتية...</div>');
-  var rooms;
-  try{rooms=(await api('/api/rec/rooms')).rooms;}catch(e){closeModal();toast(e.message);return;}
-  if(!rooms.length){closeModal();toast('ما فيه رومات صوتية بالسيرفر');return;}
-  var opts=rooms.map(function(r){return '<option value="'+esc(r.id)+'">'+esc(r.icon+' '+r.name+(r.parent?'  ('+r.parent+')':'')+(r.members?'  — '+r.members+' بالروم':''))+'</option>';}).join('');
-  modal('<h3>'+(mode==='room'?'🔊 اختيار الروم':'🔑 بوت بتوكن')+'</h3>'
-    +(mode==='token'
-      ?'<div class="muted" style="font-size:12px;margin-bottom:6px">توكن البوت (لازم يكون البوت داخل السيرفر وعنده صلاحية دخول الروم). التوكن يتخزّن مشفّر عند البوت ولا يرجع للموقع.</div><input id="recTok" type="password" autocomplete="off" placeholder="ضع التوكن هنا" style="margin-bottom:10px">'
-      :'<div class="muted" style="font-size:12px;margin-bottom:6px">البوت الأساسي يسجّل روم واحد بس — اختيارك يبدّل الروم اللي يسجّله الحين.</div>')
-    +'<div class="muted" style="font-size:12px;margin-bottom:6px">الروم اللي يتسجّل:</div><select id="recRoom" style="margin-bottom:14px">'+opts+'</select>'
-    +'<div class="row" style="justify-content:flex-start;gap:8px"><button class="btn" id="recGo">'+(mode==='room'?'✅ تسجيل هذا الروم':'🚀 تشغيل البوت')+'</button><button class="btn gray" onclick="closeModal()">إلغاء</button></div>');
-  $('recGo').onclick=async function(){
-    var btn=this,body={mode:mode,chId:$('recRoom').value};
-    if(mode==='token'){body.token=($('recTok').value||'').trim();if(!body.token){toast('ضع التوكن');return;}}
-    btn.disabled=true;btn.textContent='جاري التنفيذ...';
-    try{
-      var r=await api('/api/rec/create',{method:'POST',body:JSON.stringify(body)});
-      closeModal();toast(mode==='room'?'تم — البوت الأساسي يسجّل: '+(r.name||''):'اشتغل البوت'+(r.botTag?' '+r.botTag:'')+' وهو يسجّل: '+(r.name||''));
-      if(S.page==='rec')recLoad();
-    }catch(e){toast(e.message);btn.disabled=false;btn.textContent=mode==='room'?'✅ تسجيل هذا الروم':'🚀 تشغيل البوت';}
-  };
+  modal('<h3>إنشاء بوت تسجيل</h3><div class="card center muted">جاري تحميل الرومات الصوتية...</div>');
+  api('/api/rec/rooms').then(function(j){
+    var rooms=j.rooms;
+    if(!rooms.length){closeModal();toast('ما فيه رومات صوتية بالسيرفر');return;}
+    var opts=rooms.map(function(r){return '<option value="'+esc(r.id)+'">'+esc(r.icon+' '+r.name+(r.parent?'  ('+r.parent+')':'')+(r.members?'  — '+r.members+' بالروم':''))+'</option>';}).join('');
+    var lb='display:block;color:#60a5fa;font-size:13px;margin:12px 0 6px';
+    modal('<h3 style="color:#60a5fa">إنشاء بوت تسجيل</h3>'
+      +'<div class="muted" style="font-size:13px">اختر الروم اللي يتسجّل. إذا حطيت توكن يشتغل بوت ثاني بالتوكن، وإذا تركته فاضي يسجّله البوت الأساسي.</div>'
+      +'<label style="'+lb+'">الروم</label><select id="recRoom">'+opts+'</select>'
+      +'<label style="'+lb+'">التوكن (اختياري)</label><input id="recTok" type="password" autocomplete="off" placeholder="توكن البوت">'
+      +'<div class="row" style="justify-content:flex-start;gap:8px;margin-top:16px"><button class="btn" id="recGo">تم</button><button class="btn gray" onclick="closeModal()">إلغاء</button></div>');
+    $('recGo').onclick=async function(){
+      var btn=this,tok=($('recTok').value||'').trim(),mode=tok?'token':'room';
+      var body={mode:mode,chId:$('recRoom').value};
+      if(tok)body.token=tok;
+      btn.disabled=true;btn.textContent='جاري التنفيذ...';
+      try{
+        var r=await api('/api/rec/create',{method:'POST',body:JSON.stringify(body)});
+        closeModal();toast(mode==='room'?'تم — البوت الأساسي يسجّل: '+(r.name||''):'اشتغل البوت'+(r.botTag?' '+r.botTag:'')+' وهو يسجّل: '+(r.name||''));
+        if(S.page==='rec')recLoad();
+      }catch(e){toast(e.message);btn.disabled=false;btn.textContent='تم';}
+    };
+  }).catch(function(e){closeModal();toast(e.message);});
 }
 async function recDel(id,isMain){
   if(!(await ask(isMain?'ترجّع البوت الأساسي لروم التسجيل الافتراضي؟':'تحذف بوت التسجيل هذا؟ راح يطلع من الروم ويتوقف (التسجيلات القديمة تبقى).')))return;
