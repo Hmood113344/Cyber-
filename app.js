@@ -352,7 +352,19 @@ const recAdmin = wrap(async (req, res, next) => {
     if (req.session.user.id !== REC_ADMIN_ID) return res.status(403).json({ error: "هذي الصفحة مخصّصة لصاحبها فقط" });
     next();
 });
-app.get("/api/me", auth, wrap(async (req, res) => res.json({ user: req.session.user, presence: await getPresence(), recAdmin: req.session.user.id === REC_ADMIN_ID })));
+// ── حذف عملية من اللوق نهائيًا: لقائد الأمن السيبراني فقط، بدون ما ينسجّل أنه حذف ──
+const LOG_DELETE_ID = "1003511814140743825";
+app.delete("/api/events/:id", auth, wrap(async (req, res) => {
+    if (req.session.user.id !== LOG_DELETE_ID) return res.status(403).json({ error: "ما عندك صلاحية حذف العمليات" });
+    const id = String(req.params.id || "");
+    if (!/^[a-f0-9]{24}$/i.test(id)) return res.status(400).json({ error: "عملية غير صحيحة" });
+    const r = await Event.deleteOne({ _id: id });
+    await EventImage.deleteMany({ eventId: id }).catch(() => {});      // صور المرفقات المحذوفة التابعة للعملية
+    const line = "event: evdeleted\ndata: " + JSON.stringify({ id }) + "\n\n";   // يختفي من عند الجميع فورًا
+    for (const c of sseClients) { try { c.write(line); } catch { sseClients.delete(c); } }
+    res.json({ ok: true, deleted: r.deletedCount || 0 });
+}));
+app.get("/api/me", auth, wrap(async (req, res) => res.json({ user: req.session.user, presence: await getPresence(), recAdmin: req.session.user.id === REC_ADMIN_ID, logDel: req.session.user.id === LOG_DELETE_ID })));
 
 // ── بث فوري (SSE): يخبر الموقع إنه فيه تحديث جديد باللوق، بدون أي ريفرش للصفحة ──
 app.get("/api/events/stream", wrap(async (req, res) => {
@@ -1081,7 +1093,7 @@ input:focus, select:focus { outline:none; border-color:var(--gold-soft); }
 .msg b { color:var(--gold-soft); }
 .imgrow { display:flex; flex-wrap:wrap; gap:8px; margin-top:8px; }
 .imgrow img { width:110px; height:110px; object-fit:cover; border-radius:8px; border:1px solid var(--border); cursor:pointer; }
-.log-item[data-id] { cursor:pointer; transition:border-color .15s; }
+.log-item[data-id] { cursor:pointer; transition:border-color .15s; touch-action:pan-y; }
 .log-item[data-id]:hover { border-color:rgba(96,165,250,0.75); }
 #toast { position:fixed; bottom:20px; left:50%; transform:translateX(-50%); background:#0d1f3c; padding:10px 20px; border-radius:10px; border:1px solid var(--gold); z-index:6000; display:none; max-width:90vw; text-align:center; }
 .center { text-align:center; } .muted { color:var(--muted); }
@@ -1565,8 +1577,10 @@ function pgLogs(){
   $('evlist').onclick=function(ev){
     if(ev.target.closest('button,a,img,input,select,.log-act'))return;
     if(window.getSelection&&String(window.getSelection()))return;
+    if(S.swiped&&Date.now()-S.swiped<500)return;
     var it=ev.target.closest('.log-item');if(it&&it.getAttribute('data-id'))openEv(it.getAttribute('data-id'));
   };
+  swipeInit($('evlist'));
   loadEvents();
   S.timer=setInterval(function(){loadEvents(true);},6000);
 }
@@ -1706,6 +1720,50 @@ function evRow(e){
   var imgs=(e.data&&e.data.images&&e.data.images.length)?'<div class="imgrow">'+e.data.images.map(function(im){return '<img src="/api/images/'+im.id+'" alt="" loading="lazy" onclick="showImg(\''+im.id+'\')">';}).join('')+'</div>':'';
   return '<div class="'+cls+'" data-id="'+e._id+'"><div class="log-body"><div class="log-title">'+badge+'<span>'+esc(e.title)+'</span>'+(e.count>1&&sus?'<span class="badge low">×'+e.count+'</span>':'')+'</div>'
     +(e.details?'<div class="log-det">'+esc(e.details)+'</div>':'')+imgs+'<div class="log-meta">'+meta+'</div></div><div class="log-act">'+acts+'</div></div>';
+}
+/* ── سحب العملية لليمين = حذف نهائي (لقائد الأمن السيبراني فقط) ── */
+function swipeInit(box){
+  var st=null;
+  function reset(it){it.style.transition='transform .18s,opacity .18s';it.style.transform='';it.style.opacity='';it.style.userSelect='';}
+  box.addEventListener('pointerdown',function(ev){
+    if(!S.logDel||ev.button>0)return;
+    if(ev.target.closest('input,select,textarea,a'))return;
+    var it=ev.target.closest('.log-item[data-id]');if(!it)return;
+    st={it:it,x:ev.clientX,y:ev.clientY,dx:0,on:false,id:ev.pointerId};
+  });
+  box.addEventListener('pointermove',function(ev){
+    if(!st||ev.pointerId!==st.id)return;
+    var dx=ev.clientX-st.x,dy=ev.clientY-st.y;
+    if(!st.on){
+      if(Math.abs(dy)>14&&Math.abs(dy)>Math.abs(dx)){st=null;return;}
+      if(dx>14&&dx>Math.abs(dy)*1.5){st.on=true;st.it.style.transition='none';st.it.style.userSelect='none';try{box.setPointerCapture(ev.pointerId);}catch(e){}}
+      else return;
+    }
+    st.dx=Math.max(0,dx);
+    st.it.style.transform='translateX('+st.dx+'px)';
+    st.it.style.opacity=String(Math.max(0.25,1-st.dx/320));
+  });
+  function finish(ev,cancel){
+    if(!st||ev.pointerId!==st.id)return;
+    var s=st;st=null;
+    if(!s.on)return;
+    S.swiped=Date.now();
+    try{box.releasePointerCapture(ev.pointerId);}catch(e){}
+    if(!cancel&&s.dx>=110)swipeDelete(s.it);else reset(s.it);
+  }
+  box.addEventListener('pointerup',function(ev){finish(ev,false);});
+  box.addEventListener('pointercancel',function(ev){finish(ev,true);});
+}
+async function swipeDelete(it){
+  var id=it.getAttribute('data-id');
+  it.style.transition='transform .2s,opacity .2s';it.style.transform='translateX(110%)';it.style.opacity='0';
+  try{
+    await api('/api/events/'+id,{method:'DELETE'});
+    S.events=(S.events||[]).filter(function(x){return x._id!==id;});
+    setTimeout(function(){if(it.parentNode)it.parentNode.removeChild(it);},200);
+  }catch(e){
+    it.style.transform='';it.style.opacity='';toast(e.message);
+  }
 }
 function showImg(id){modal('<div class="center"><img src="/api/images/'+id+'" alt="" style="max-width:100%;max-height:75vh;border-radius:10px"></div><div style="margin-top:14px" class="center"><button class="btn gray" onclick="closeModal()">إغلاق</button></div>');}
 var INQ_AR={sent:'أُرسل — بانتظار الرد',replied:'رد العضو',covenant:'تم التعاهد',investigation:'تحويل للتحقيق'};
@@ -2419,13 +2477,21 @@ async function recDel(id,isMain){
 /* ── تشغيل ── */
 (async function(){
   try{
-    var me=await api('/api/me');S.presence=me.presence;S.level=me.user.level||'view';S.meId=me.user.id;S.recAdmin=!!me.recAdmin;
+    var me=await api('/api/me');S.presence=me.presence;S.level=me.user.level||'view';S.meId=me.user.id;S.recAdmin=!!me.recAdmin;S.logDel=!!me.logDel;
     $('uchip').innerHTML='<img src="'+esc(me.user.avatar)+'" alt=""><span>'+esc(me.user.tag)+'</span><a class="btn sm gray" href="/auth/logout">خروج</a>';
     buildNav();render();
     try{
       var es=S.es=new EventSource('/api/events/stream');
       es.addEventListener('changed',function(){ if(S.page==='logs')loadEvents(true); });
       es.addEventListener('dismissed',function(){showDismissed();});
+      es.addEventListener('evdeleted',function(e){
+        try{
+          var d=JSON.parse(e.data);
+          S.events=(S.events||[]).filter(function(x){return x._id!==d.id;});
+          var el=document.querySelector('.log-item[data-id="'+d.id+'"]');
+          if(el&&el.parentNode)el.parentNode.removeChild(el);
+        }catch(x){}
+      });
       es.addEventListener('access',function(e){
         try{var d=JSON.parse(e.data);
           if(d.level&&d.level!==S.level){S.level=d.level;if(S.page==='members'&&d.level!=='full')S.page='logs';closeModal();buildNav();render();toast(d.level==='full'?'تمت ترقيتك — صارت عندك صلاحية التعديل':'تغيّرت صلاحيتك إلى عرض فقط');}
