@@ -391,15 +391,138 @@ app.get("/api/images/:id", auth, wrap(async (req, res) => {
 }));
 
 // ── تسجيل الروم الصوتي: بيانات الجلسة + الصوت (للقائد والنائب فقط) ──
+// ══════════════════════════════════════════════════════════════════════════
+// Ogg Opus — قراءة وإعادة بناء الصوت (يصلّح التقديم/التأخير بالمشغّل + يغذّي البث المباشر)
+// ملف الصوت يجي من قطع متلصّقة (ممكن فيها أكثر من ستريم)، المتصفح ما يقدر يقدّم فيها بدقة،
+// فنقرأ الحزم الصوتية ونعيد بناءها كستريم واحد نظيف بأوقات صحيحة.
+// ══════════════════════════════════════════════════════════════════════════
+const OGG_CRC = (() => {
+    const t = new Uint32Array(256);
+    for (let i = 0; i < 256; i++) { let r = (i << 24) >>> 0; for (let j = 0; j < 8; j++) r = (r & 0x80000000) ? (((r << 1) ^ 0x04C11DB7) >>> 0) : ((r << 1) >>> 0); t[i] = r; }
+    return t;
+})();
+function oggCrc(b) { let c = 0; for (let i = 0; i < b.length; i++) c = (((c << 8) >>> 0) ^ OGG_CRC[((c >>> 24) ^ b[i]) & 0xFF]) >>> 0; return c >>> 0; }
+const SILENCE_PKT = Buffer.from([0xf8, 0xff, 0xfe]);            // حزمة صمت 20ms
+const binOf = x => Buffer.isBuffer(x) ? x : Buffer.from((x && x.buffer) || x || []);
+// عدد عيّنات (48kHz) داخل حزمة Opus من أول بايت فيها
+function opusSamples(p) {
+    if (!p || !p.length) return 0;
+    const cfg = p[0] >> 3, c = p[0] & 3;
+    const fs = cfg < 12 ? [480, 960, 1920, 2880][cfg & 3] : cfg < 16 ? ((cfg & 1) ? 960 : 480) : [120, 240, 480, 960][cfg & 3];
+    let n = 1;
+    if (c === 1 || c === 2) n = 2;
+    else if (c === 3) { if (p.length < 2) return 0; n = p[1] & 0x3F; }
+    return fs * n;
+}
+const isTag = (p, s) => p.length >= 8 && p.toString("latin1", 0, 8) === s;
+class OggOpusReader {
+    constructor() { this.buf = Buffer.alloc(0); this.cont = null; this.head = null; }
+    // يستقبل بايتات (ممكن تنقطع بنص صفحة) ويرجّع الحزم الصوتية الكاملة فقط
+    push(chunk) {
+        chunk = binOf(chunk);
+        this.buf = this.buf.length ? Buffer.concat([this.buf, chunk]) : chunk;
+        const b = this.buf, out = [];
+        let pos = 0;
+        for (;;) {
+            if (b.length - pos < 27) break;
+            if (b.readUInt32BE(pos) !== 0x4F676753) {                     // مو بداية صفحة — نبحث عن اللي بعدها
+                const i = b.indexOf("OggS", pos + 1, "latin1");
+                if (i < 0) { pos = Math.max(pos, b.length - 3); break; }
+                pos = i; this.cont = null; continue;
+            }
+            const nseg = b[pos + 26];
+            if (b.length - pos < 27 + nseg) break;
+            let body = 0; for (let i = 0; i < nseg; i++) body += b[pos + 27 + i];
+            if (b.length - pos < 27 + nseg + body) break;
+            const flags = b[pos + 5];
+            let off = pos + 27 + nseg;
+            let part = (flags & 1) ? this.cont : null;
+            let skip = !!(flags & 1) && !this.cont;                       // بداية الحزمة ضايعة — نتجاوزها
+            this.cont = null;
+            for (let i = 0; i < nseg; i++) {
+                const l = b[pos + 27 + i];
+                if (!skip) part = part ? Buffer.concat([part, b.subarray(off, off + l)]) : Buffer.from(b.subarray(off, off + l));
+                off += l;
+                if (l < 255) {
+                    if (!skip && part && part.length) {
+                        if (isTag(part, "OpusHead")) { if (!this.head) this.head = Buffer.from(part); }
+                        else if (!isTag(part, "OpusTags")) out.push(part);
+                    }
+                    part = null; skip = false;
+                }
+            }
+            this.cont = part;
+            pos += 27 + nseg + body;
+        }
+        this.buf = b.subarray(pos);
+        return out;
+    }
+}
+class OggOpusWriter {
+    constructor(head, serial) {
+        this.head = head; this.serial = (serial || 0x6e6f7276) >>> 0;
+        this.pre = head.length >= 12 ? head.readUInt16LE(10) : 312;
+        this.seq = 0; this.samples = 0;
+    }
+    _page(packets, flags, granule) {
+        const segs = [];
+        for (const p of packets) { let n = p.length; while (n >= 255) { segs.push(255); n -= 255; } segs.push(n); }
+        const h = Buffer.alloc(27 + segs.length);
+        h.write("OggS", 0, "latin1"); h[4] = 0; h[5] = flags;
+        h.writeUInt32LE(granule % 4294967296, 6); h.writeUInt32LE(Math.floor(granule / 4294967296), 10);
+        h.writeUInt32LE(this.serial, 14); h.writeUInt32LE(this.seq++, 18); h.writeUInt32LE(0, 22);
+        h[26] = segs.length; segs.forEach((s, i) => { h[27 + i] = s; });
+        const pg = Buffer.concat([h, ...packets]);
+        pg.writeUInt32LE(oggCrc(pg), 22);
+        return pg;
+    }
+    headers() {
+        const v = Buffer.from("claude-site", "latin1");
+        const tags = Buffer.alloc(8 + 4 + v.length + 4);
+        tags.write("OpusTags", 0, "latin1"); tags.writeUInt32LE(v.length, 8); v.copy(tags, 12); tags.writeUInt32LE(0, 12 + v.length);
+        return Buffer.concat([this._page([this.head], 2, 0), this._page([tags], 0, 0)]);
+    }
+    // يكتب الحزم صفحات (حوالي ثانية للصفحة)؛ eos = آخر صفحة بالملف
+    audio(packets, eos) {
+        const pages = [];
+        let grp = [], segs = 0, dur = 0;
+        const flush = last => {
+            if (!grp.length) return;
+            this.samples += dur;
+            pages.push(this._page(grp, last && eos ? 4 : 0, this.pre + this.samples));
+            grp = []; segs = 0; dur = 0;
+        };
+        for (let i = 0; i < packets.length; i++) {
+            const p = packets[i], need = Math.floor(p.length / 255) + 1;
+            if (grp.length >= 50 || segs + need > 250) flush(false);
+            grp.push(p); segs += need; dur += opusSamples(p);
+        }
+        flush(true);
+        return pages.length ? Buffer.concat(pages) : Buffer.alloc(0);
+    }
+}
+// يعيد بناء ملف Ogg Opus كامل كستريم واحد نظيف. يرجّع null إذا ما قدر (نرجع للأصلي).
+function remuxOgg(buf) {
+    try {
+        const rd = new OggOpusReader();
+        const pk = rd.push(buf);
+        if (!rd.head || !pk.length) return null;
+        const w = new OggOpusWriter(rd.head);
+        return Buffer.concat([w.headers(), w.audio(pk, true)]);
+    } catch (e) { console.error("remuxOgg:", e.message); return null; }
+}
+
 const voiceCache = new Map();
 async function voiceBuffer(sid, ended, uid) {
     const ck = sid + "|" + (uid || "");
     const c = voiceCache.get(ck);
-    if (ended && c && Date.now() - c.t < 10 * 60 * 1000) return c.buf;
+    if (c && (ended ? (c.ended && Date.now() - c.t < 10 * 60 * 1000) : Date.now() - c.t < 2000)) return c.buf;
     const parts = await VoiceChunk.find({ sid, uid: uid || null }).sort({ seq: 1 }).select("data").lean();
-    const buf = Buffer.concat(parts.map(x => Buffer.isBuffer(x.data) ? x.data : Buffer.from(x.data?.buffer || x.data || [])));
-    if (ended && buf.length) {
-        voiceCache.set(ck, { buf, t: Date.now() });
+    let buf = Buffer.concat(parts.map(x => binOf(x.data)));
+    const rm = buf.length ? remuxOgg(buf) : null;      // ستريم واحد نظيف بأوقات صحيحة → التقديم/التأخير يمشي صح
+    if (rm && rm.length) buf = rm;
+    if (buf.length) {
+        voiceCache.set(ck, { buf, t: Date.now(), ended: !!ended });
         while (voiceCache.size > 6) voiceCache.delete(voiceCache.keys().next().value);
     }
     return buf;
@@ -893,6 +1016,70 @@ app.delete("/api/rec/:id", auth, recAdmin, wrap(async (req, res) => {
     res.json({ ok: true });
 }));
 
+
+// ── استماع مباشر لبوت التسجيل: الجلسات الجارية الحين + معلومات الروم + بث الصوت الحي ──
+app.get("/api/rec/live", auth, recAdmin, wrap(async (req, res) => {
+    const list = await VoiceSess.find({ endedAt: null, startedAt: { $gte: new Date(Date.now() - 12 * 3600 * 1000) } })
+        .sort({ startedAt: -1 }).limit(20).select("sid chId chName startedAt lastAt").lean();
+    res.json({ sessions: list.map(d => ({ sid: d.sid, chId: d.chId || null, chName: d.chName || "", startedAt: new Date(d.startedAt).getTime(), lastAt: d.lastAt ? new Date(d.lastAt).getTime() : null })) });
+}));
+app.get("/api/rec/live/:sid/info", auth, recAdmin, wrap(async (req, res) => {
+    const sid = String(req.params.sid || "");
+    if (!/^[\w-]{4,60}$/.test(sid)) return res.status(400).json({ error: "جلسة غير صحيحة" });
+    const d = await VoiceSess.findOne({ sid }).select("chName startedAt endedAt lastAt stays speech").lean();
+    if (!d) return res.status(404).json({ error: "الجلسة غير موجودة" });
+    const now = Date.now(), last = {}, people = {};
+    (d.speech || []).forEach(e => { if (Array.isArray(e) && e.length >= 3) { const u = String(e[0]), t = Number(e[2]); if (!last[u] || t >= last[u].t) last[u] = { on: e[1] === 1, t }; } });
+    (d.stays || []).forEach(x => {
+        const u = String(x.uid);
+        if (!people[u]) people[u] = { uid: u, name: x.name || x.tag || u, avatar: x.avatar || null, inside: false };
+        if (!x.end) people[u].inside = true;
+    });
+    const list = Object.values(people).filter(x => x.inside).map(x => ({ uid: x.uid, name: x.name, avatar: x.avatar, speaking: !!(last[x.uid] && last[x.uid].on && now - last[x.uid].t < 30000) }));
+    res.json({ chName: d.chName || "", ended: !!d.endedAt, people: list });
+}));
+// بث صوتي حي (Ogg Opus مستمر): البوت يكتب القطع بقاعدة البيانات، وهنا نقرأ الجديد أول بأول ونرسله للمتصفح
+app.get("/api/rec/live/:sid/stream", auth, recAdmin, wrap(async (req, res) => {
+    const sid = String(req.params.sid || "");
+    if (!/^[\w-]{4,60}$/.test(sid)) return res.status(400).end();
+    if (!(await VoiceSess.findOne({ sid }).select("_id").lean())) return res.status(404).end();
+    res.status(200).set({ "Content-Type": "audio/ogg", "Cache-Control": "no-store, no-transform", Connection: "keep-alive", "X-Accel-Buffering": "no" });
+    res.flushHeaders?.();
+    let closed = false;
+    req.on("close", () => { closed = true; });
+    const rd = new OggOpusReader();
+    let w = null, lastSeq = null, t0 = 0, sentMs = 0, lastData = Date.now(), tick = 0;
+    const begin = Date.now(), sleep = ms => new Promise(r => setTimeout(r, ms));
+    while (!closed && Date.now() - begin < 6 * 3600 * 1000) {
+        try {
+            if (!w) {   // الهيدر من أول قطعة بالجلسة
+                const f = await VoiceChunk.findOne({ sid, uid: null }).sort({ seq: 1 }).select("data").lean();
+                if (f) { const hr = new OggOpusReader(); hr.push(binOf(f.data)); if (hr.head) { w = new OggOpusWriter(hr.head); res.write(w.headers()); t0 = Date.now(); } }
+            }
+            if (w) {
+                // أول مرة: نبدأ من آخر 3 ثواني تقريبًا (قرب الحاضر)، بعدها نكمل من آخر قطعة وصلت
+                const q = lastSeq == null ? { sid, uid: null, createdAt: { $gte: new Date(Date.now() - 3000) } } : { sid, uid: null, seq: { $gt: lastSeq } };
+                const parts = await VoiceChunk.find(q).sort({ seq: 1 }).select("data seq").lean();
+                if (parts.length) {
+                    lastSeq = parts[parts.length - 1].seq;
+                    const pk = [];
+                    for (const c of parts) for (const x of rd.push(c.data)) pk.push(x);
+                    if (pk.length) { res.write(w.audio(pk)); for (const x of pk) sentMs += opusSamples(x) / 48; lastData = Date.now(); }
+                }
+                // نبقي الستريم ماشي بالوقت الحقيقي: لو ما فيه كلام نرسل صمت (عشان المتصفح ما يوقف ولا الاتصال ينقطع)
+                const lag = (Date.now() - t0) + 300 - sentMs;
+                if (lag >= 100) { const n = Math.floor(lag / 20); res.write(w.audio(Array(n).fill(SILENCE_PKT))); sentMs += n * 20; }
+            }
+            if (++tick % 8 === 0) {
+                const sd = await VoiceSess.findOne({ sid }).select("endedAt").lean();
+                if (!sd || (sd.endedAt && Date.now() - lastData > 4000) || Date.now() - lastData > 30 * 60 * 1000) break;
+            }
+        } catch (e) { console.error("rec live stream:", e.message); }
+        await sleep(350);
+    }
+    try { res.end(); } catch { }
+}));
+
 // ── API: باندات الأعضاء (القديمة + الجديدة) — البوت يجمعها من ديسكورد وسجل التدقيق ──
 app.get("/api/bans", auth, wrap(async (req, res) => {
     res.json(await callBot("bans", { force: req.query.refresh === "1" }, 90000));
@@ -1095,6 +1282,13 @@ input:focus, select:focus { outline:none; border-color:var(--gold-soft); }
 .imgrow img { width:110px; height:110px; object-fit:cover; border-radius:8px; border:1px solid var(--border); cursor:pointer; }
 .log-item[data-id] { cursor:pointer; transition:border-color .15s; touch-action:pan-y; }
 .log-item[data-id]:hover { border-color:rgba(96,165,250,0.75); }
+.livedot { display:inline-block; width:10px; height:10px; border-radius:50%; background:#ef4444; margin-left:8px; animation:livep 1.2s infinite; }
+@keyframes livep { 0%{opacity:1;transform:scale(1)} 50%{opacity:.35;transform:scale(1.35)} 100%{opacity:1;transform:scale(1)} }
+.lvp { display:flex; align-items:center; gap:8px; padding:7px 10px; border-radius:8px; background:rgba(255,255,255,0.03); margin:4px 0; font-size:13px; }
+.lvp.sp { background:rgba(74,222,128,0.14); outline:1px solid rgba(74,222,128,0.55); }
+.lvp img { width:26px; height:26px; border-radius:50%; }
+.card.clk { cursor:pointer; }
+.card.clk:hover { border-color:rgba(248,113,113,0.7); }
 #toast { position:fixed; bottom:20px; left:50%; transform:translateX(-50%); background:#0d1f3c; padding:10px 20px; border-radius:10px; border:1px solid var(--gold); z-index:6000; display:none; max-width:90vw; text-align:center; }
 .center { text-align:center; } .muted { color:var(--muted); }
 .warn { background:rgba(234,179,8,0.1); border:1px solid #eab308; color:#fde68a; border-radius:10px; padding:10px 14px; font-size:13px; margin-bottom:14px; }
@@ -1299,7 +1493,7 @@ function vrKeys(){
 function vrEl(k){
   var a=VR.els[k];if(a)return a;
   a=new Audio();a.preload='auto';
-  a.src='/api/voice/'+encodeURIComponent(VR.sid)+'/audio'+(k==='mix'?'':'?u='+encodeURIComponent(k));
+  a.src='/api/voice/'+encodeURIComponent(VR.sid)+'/audio?v=2'+(k==='mix'?'':'&u='+encodeURIComponent(k));
   a.playbackRate=VR.rate;
   a.onerror=function(){if(VR&&!VR.errShown){VR.errShown=true;toast('تعذر تشغيل الصوت');}};
   VR.els[k]=a;return a;
@@ -1317,7 +1511,7 @@ function vrSync(dt){
   if(master===null){VR.T+=dt*VR.rate;return;}
   a=vrEl(master);
   if(a.paused&&!a.ended){vrPlayEl(a,(VR.T-vrOff(master))/1000);}
-  else if(!a.paused){VR.T=Math.min(VR.span,a.currentTime*1000+vrOff(master));}
+  else if(!a.paused&&!a.seeking){VR.T=Math.min(VR.span,a.currentTime*1000+vrOff(master));}
   if(a.ended)VR.T=VR.span;
   for(i=0;i<keys.length;i++){
     k=keys[i];if(k===master)continue;
@@ -1342,9 +1536,23 @@ function vrToggle(){if(!VR)return;if(VR.playing)vrPause();else{VR.clip=false;vrP
 function vrSeekTo(ms){
   if(!VR)return;
   VR.T=Math.max(0,Math.min(VR.span,ms));
-  for(var k in VR.els){var t=(VR.T-vrOff(k))/1000;try{VR.els[k].currentTime=Math.max(0,t);}catch(e){}}
+  for(var k in VR.els)vrSeekEl(k,VR.els[k],(VR.T-vrOff(k))/1000);
   if(VR.playing)vrSync(0);
   vrPaint();
+}
+function vrSeekEl(k,a,t){
+  t=Math.max(0,t);
+  var tok=(a._sk=(a._sk||0)+1),tries=0;
+  var fix=function(){
+    a.removeEventListener('seeked',fix);
+    if(!VR||VR.els[k]!==a||a._sk!==tok)return;
+    if(Math.abs(a.currentTime-t)>1){
+      if(tries<2){tries++;a.addEventListener('seeked',fix);try{a.currentTime=t;}catch(e){}return;}
+      if(k===vrKeys()[0]){VR.T=Math.max(0,Math.min(VR.span,a.currentTime*1000+vrOff(k)));vrPaint();}   // الصوت ما وصل للمكان — الصورة تتبعه بدل ما تفترق عنه
+    }
+  };
+  a.addEventListener('seeked',fix);
+  try{a.currentTime=t;}catch(e){}
 }
 function vrSkip(d){if(VR){VR.clip=false;vrSeekTo(VR.T+d);}}
 function vrDrag(v){if(!VR)return;VR.drag=true;VR.dragT=Number(v);var c=$('rp-clock');if(c)c.textContent=vrT(VR.s.startedAt+VR.dragT);var e=$('vr-el');if(e)e.textContent=vrMS(VR.dragT);var ph=$('vr-ph');if(ph)ph.style.left=(VR.dragT/VR.span*100)+'%';}
@@ -2417,7 +2625,9 @@ async function pgRec(){
   $('recNew').onclick=recNew;
   $('main').onclick=function(ev){
     var d=ev.target.closest('[data-recdel]');
-    if(d)recDel(d.getAttribute('data-recdel'),d.getAttribute('data-main')==='1');
+    if(d){recDel(d.getAttribute('data-recdel'),d.getAttribute('data-main')==='1');return;}
+    var l=ev.target.closest('[data-reclive]');
+    if(l)recLive(l.getAttribute('data-reclive'),l.getAttribute('data-chn'));
   };
   await recLoad();
   clearInterval(S.timer);
@@ -2426,18 +2636,26 @@ async function pgRec(){
 async function recLoad(){
   try{
     var j=await api('/api/rec/bots');if(S.page!=='rec')return;
+    var lvs=[];try{lvs=(await api('/api/rec/live')).sessions||[];}catch(e){}
     var h=j.bots.map(function(b){
+      var ls=null;
+      if(b.status==='recording'){
+        var mt=lvs.filter(function(x){return (b.chId&&x.chId&&String(b.chId)===String(x.chId))||(b.chName&&x.chName&&b.chName===x.chName);});
+        ls=mt.length?mt[0]:(lvs.length===1?lvs[0]:null);
+      }
       var main=b.id==='main';
       var st=REC_ST[b.status]||b.status;
       if(b.status==='recording'&&b.users!=null)st+=' ('+b.users+')';
       var title=main?'🤖 البوت الأساسي'+(b.botTag?' — '+esc(b.botTag):''):'🤖 '+esc(b.botTag||b.id);
       var kind=main?(b.isDefault?'الروم الافتراضي':'روم مختار من الموقع'):'بوت بتوكن';
-      return '<div class="card"><div class="bot">'+(b.avatar?'<img src="'+esc(b.avatar)+'" alt="">':'')
+      return '<div class="card'+(ls?' clk':'')+'"'+(ls?' data-reclive="'+esc(ls.sid)+'" data-chn="'+esc(b.chName||ls.chName||'')+'"':'')+'><div class="bot">'+(b.avatar?'<img src="'+esc(b.avatar)+'" alt="">':'')
         +'<div style="flex:1;min-width:200px"><div class="log-title">'+title+' <span class="badge low">'+kind+'</span></div>'
         +'<div class="log-meta">🎙️ الروم: '+(b.chName?esc(b.chName):'<span class="muted">غير موجود</span>')+'</div>'
         +'<div class="log-meta">'+st+'</div>'
         +(b.error?'<div class="log-meta" style="color:#f87171">'+esc(b.error)+'</div>':'')
-        +(b.createdBy?'<div class="log-meta">👤 أنشأه: '+esc(b.createdBy)+'</div>':'')+'</div>'
+        +(b.createdBy?'<div class="log-meta">👤 أنشأه: '+esc(b.createdBy)+'</div>':'')
+        +(ls?'<div class="log-meta" style="color:#f87171">🔴 يسجّل الحين — اضغط على البوت للاستماع المباشر</div>':'')+'</div>'
+        +(ls?'<button class="btn sm" data-reclive="'+esc(ls.sid)+'" data-chn="'+esc(b.chName||ls.chName||'')+'">🎧 استمع مباشر</button>':'')
         +((main&&b.isDefault)?'':'<button class="btn sm danger" data-recdel="'+esc(b.id)+'" data-main="'+(main?'1':'0')+'">'+(main?'↩️ رجّعه للافتراضي':'🗑️ حذف')+'</button>')
         +'</div></div>';
     }).join('');
@@ -2468,6 +2686,45 @@ function recNew(){
       }catch(e){toast(e.message);btn.disabled=false;btn.textContent='تم';}
     };
   }).catch(function(e){closeModal();toast(e.message);});
+}
+var LV=null;
+function lvStop(){
+  if(LV){clearInterval(LV.timer);try{LV.a.pause();LV.a.removeAttribute('src');LV.a.load();}catch(e){}}
+  LV=null;
+}
+function recLive(sid,name){
+  lvStop();
+  modal('<h3><span class="livedot"></span>استماع مباشر — '+esc(name||'الروم')+'</h3>'
+   +'<div class="muted" style="font-size:12px;margin-bottom:8px;line-height:1.8">تسمع اللي يقولونه الحين بتأخير بسيط (من ثانية إلى ثلاث). إذا ما اشتغل الصوت لحاله اضغط تشغيل ▶️.</div>'
+   +'<div id="lv-st" class="center" style="margin:8px 0;font-weight:700">⏳ جاري الاتصال...</div>'
+   +'<audio id="lv-a" controls autoplay style="width:100%"></audio>'
+   +'<div style="margin:12px 0 4px;font-size:13px;font-weight:700">👥 اللي بالروم الحين</div><div id="lv-who"><div class="muted">...</div></div>'
+   +'<div class="row" style="justify-content:center;gap:8px;margin-top:12px"><button class="btn gray sm" id="lv-re">🔄 إعادة الاتصال</button><button class="btn danger sm" onclick="closeModal()">✖ إغلاق</button></div>');
+  var a=$('lv-a');
+  LV={sid:sid,a:a,timer:null};
+  var st=function(t){var e=$('lv-st');if(e)e.textContent=t;};
+  var conn=function(){
+    a.src='/api/rec/live/'+encodeURIComponent(sid)+'/stream?t='+Date.now();
+    var p=a.play();if(p&&p.catch)p.catch(function(){st('اضغط تشغيل ▶️ لبدء الصوت');});
+  };
+  a.addEventListener('playing',function(){st('🔴 مباشر الحين');});
+  a.addEventListener('waiting',function(){st('⏳ يحمّل الصوت...');});
+  a.addEventListener('error',function(){st('⚠️ انقطع البث — اضغط إعادة الاتصال');});
+  a.addEventListener('ended',function(){st('⚫ انتهى البث (الجلسة خلصت أو انقطع الاتصال)');});
+  $('lv-re').onclick=conn;
+  conn();
+  var poll=async function(){
+    if(!LV||LV.sid!==sid)return;
+    if(!$('lv-a')){lvStop();return;}
+    try{
+      var j=await api('/api/rec/live/'+encodeURIComponent(sid)+'/info');
+      var w=$('lv-who');if(!w)return;
+      w.innerHTML=j.people.length?j.people.map(function(p){return '<div class="lvp'+(p.speaking?' sp':'')+'">'+(p.avatar?'<img src="'+esc(p.avatar)+'" alt="">':'')+'<span style="flex:1">'+esc(p.name)+'</span>'+(p.speaking?'<span>🎤 يتكلم</span>':'')+'</div>';}).join(''):'<div class="muted">ما فيه أحد بالروم</div>';
+      if(j.ended)st('⚫ انتهت هذي الجلسة');
+    }catch(e){}
+  };
+  poll();
+  LV.timer=setInterval(poll,2500);
 }
 async function recDel(id,isMain){
   if(!(await ask(isMain?'ترجّع البوت الأساسي لروم التسجيل الافتراضي؟':'تحذف بوت التسجيل هذا؟ راح يطلع من الروم ويتوقف (التسجيلات القديمة تبقى).')))return;
