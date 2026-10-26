@@ -383,8 +383,11 @@ async function oauthFetch(kind, url, opt) {
         try { r = await fetch(url, { ...opt, headers: { Accept: "application/json", "User-Agent": OAUTH_UA, ...(opt.headers || {}) } }); txt = await r.text(); }
         catch (e) { console.error("❌ OAuth " + kind + " شبكة:", e.message); if (i < 2) { await sleep(800); continue; } throw new Error(kind + "_network"); }
         let j = {}; try { j = JSON.parse(txt); } catch { }
-        if (r.status === 429 && i < 2) { await sleep(Math.min(4000, Math.ceil((j.retry_after || 1) * 1000))); continue; }
-        if (!r.ok) { console.error("❌ OAuth " + kind + ":", r.status, String(txt).slice(0, 200)); throw new Error(kind + "_" + r.status + (j.error ? "_" + String(j.error).replace(/[^a-z_]/gi, "") : "")); }
+        const ra = Number(j.retry_after || r.headers.get("retry-after") || 0);
+        const html = /html/i.test(r.headers.get("content-type") || "") || /cloudflare|1015|banned/i.test(String(txt).slice(0, 400));
+        if (r.status === 429) console.error("⚠️ 429 من ديسكورد (" + kind + "): retry_after=" + ra + "s —", html ? "حظر Cloudflare على عنوان الاستضافة" : "حد طلبات عادي");
+        if (r.status === 429 && !html && i < 2 && ra > 0 && ra <= 3) { await sleep(Math.ceil(ra * 1000) + 200); continue; }   // ما نكرر الطلب لو الانتظار طويل (التكرار يطوّل الحظر)
+        if (!r.ok) { console.error("❌ OAuth " + kind + ":", r.status, String(txt).slice(0, 200)); throw new Error(kind + "_" + r.status + (r.status === 429 ? (html ? "_cf" : "_r" + Math.ceil(ra)) : (j.error ? "_" + String(j.error).replace(/[^a-z_]/gi, "") : ""))); }
         return j;
     }
 }
@@ -1602,7 +1605,10 @@ function loginHint(c) {
     if (c === "state") return "انتهت صلاحية محاولة الدخول — افتح الموقع من جديد واضغط تسجيل الدخول مرة وحدة.";
     if (/invalid_client|_401/.test(c)) return "الـ Client Secret أو الـ Client ID غلط في إعدادات الاستضافة.";
     if (/invalid_grant/.test(c)) return "رابط الرجوع (Redirect URI) ما يطابق اللي في ديسكورد، أو الكود انستخدم قبل — جرّب مرة ثانية.";
-    if (/_429|_403|_1015/.test(c)) return "ديسكورد حاجب الطلبات مؤقتاً (ضغط على عنوان الاستضافة) — جرّب بعد دقيقة.";
+    if (/_429_cf|_403|_1015/.test(c)) return "ديسكورد (Cloudflare) حاجب عنوان الاستضافة مؤقتاً — لا تكرر الضغط، انتظر 15–30 دقيقة ثم جرّب مرة وحدة.";
+    const m = /_429_r(\d+)/.exec(c);
+    if (m) return "ديسكورد حاط حد طلبات مؤقت — جرّب بعد " + m[1] + " ثانية (لا تكرر الضغط).";
+    if (/_429/.test(c)) return "ديسكورد حاجب الطلبات مؤقتاً (ضغط على عنوان الاستضافة) — جرّب بعد دقيقة.";
     if (/network/.test(c)) return "السيرفر ما قدر يوصل لديسكورد — جرّب بعد شوي.";
     if (/^discord_access_denied/.test(c)) return "أنت رفضت صلاحية الدخول في ديسكورد.";
     return "";
