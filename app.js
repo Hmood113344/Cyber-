@@ -18,6 +18,7 @@ const CONFIG = {
     DISCORD_CALLBACK_URL: process.env.DISCORD_CALLBACK_URL || "",   // مثال: https://xxx.com/auth/discord/callback
     MONGO_URI: process.env.MONGO_URI || "",
     SESSION_SECRET: process.env.SESSION_SECRET || "غيّر_هذا_السر_2026",
+    NOTIFY_BOT_TOKEN: process.env.NOTIFY_BOT_TOKEN || process.env.BOT_TOKEN || "",   // نفس توكن بوت الأمن السيبراني — يُستخدم فقط لإرسال إشعارات القيادة بالخاص
     PORT: process.env.PORT || 7800,
     SITE_NAME: "الأمن السيبراني",
     SITE_SUB: "وزارة الداخلية",
@@ -128,6 +129,17 @@ const VoiceChunkSchema = new mongoose.Schema({
 VoiceChunkSchema.index({ sid: 1, seq: 1 });
 VoiceChunkSchema.index({ sid: 1, uid: 1, seq: 1 });
 const VoiceChunk = mongoose.model("CyberVoiceChunk", VoiceChunkSchema);
+
+// إشعارات القيادة (من عضو عن عملية مشبوهة، أو من مسؤول الأفراد عن عضو) — تظهر منبثقة للقائد والنائب وتوصلهم بالخاص
+const Notice = mongoose.model("CyberNotice", new mongoose.Schema({
+    type: String,                                   // op | member
+    eventId: String, eventTitle: String, eventDetails: String,
+    subjectId: String, subjectTag: String, reason: String,
+    senderId: String, senderTag: String, senderAvatar: String,
+    recipients: { type: [String], index: true }, seenBy: { type: [String], default: [] },
+    dm: { type: mongoose.Schema.Types.Mixed, default: {} },
+    createdAt: { type: Date, default: Date.now, index: true, expires: 60 * 60 * 24 * 30 },
+}, { minimize: false }));
 
 // ── بث فوري للوحة (Server-Sent Events) — بدون أي تحديث كامل للصفحة ──
 const sseClients = new Set();
@@ -270,11 +282,51 @@ const wrap = fn => (req, res, next) => Promise.resolve(fn(req, res, next)).catch
 
 // الصلاحية تجي من جدول CyberAccess اللي البوت يحدّثه لحظياً من رتب ديسكورد
 const roleCheck = new Map();
+
+// ── رتبة «مسؤول أفراد الأمن السيبراني»: زي العضو العادي + صفحة الأعضاء (عرض فقط) ──
+// الموقع يسأل البوت عن اللي معهم الرتبة (بنفس أمر "role_members" الموجود) ويحدّث القائمة كل 20 ثانية
+const MGR_ROLE_ID = "1563654738803949708";
+let mgrSet = new Set(), mgrAt = 0, mgrBusy = null;
+const effLevel = (uid, base) => base === "full" ? "full" : (mgrSet.has(uid) ? "mgr" : (base || null));
+let mgrAltAt = 0;
+async function refreshMgr(maxAge, forceAlt) {
+    if (mgrBusy) return mgrBusy;
+    if (Date.now() - mgrAt < (maxAge == null ? 20000 : maxAge)) return;
+    mgrBusy = (async () => {
+        try {
+            if (!(await botAlive())) return;
+            let next = null;
+            try {
+                const r = await callBot("role_members", { id: MGR_ROLE_ID }, 30000);
+                next = new Set(((r && r.members) || []).filter(m => m && !m.bot).map(m => String(m.id || m.uid || "")).filter(Boolean));
+            } catch (e) { console.error("refreshMgr role_members:", e.message); }
+            // احتياط: لو ما رجع أحد نسأل عن كل الأعضاء ورتبهم (أثقل، فنكرره كل 5 دقايق بس — أو فوراً وقت تسجيل الدخول)
+            if ((!next || !next.size) && (forceAlt || Date.now() - mgrAltAt > 300000)) {
+                mgrAltAt = Date.now();
+                try {
+                    const pm = await callBot("perm_members", {}, 60000);
+                    const alt = new Set(((pm && pm.members) || []).filter(m => m && !m.bot && Array.isArray(m.roles) && m.roles.includes(MGR_ROLE_ID)).map(m => String(m.id)));
+                    if (alt.size || !next) next = alt;
+                } catch (e) { console.error("refreshMgr perm_members:", e.message); }
+            }
+            if (!next) return;   // فشل الطلبين — نبقي القائمة القديمة
+            const changed = [];
+            for (const id of next) if (!mgrSet.has(id)) changed.push(id);
+            for (const id of mgrSet) if (!next.has(id)) changed.push(id);
+            if (changed.length) console.log("🗂️ مسؤولو أفراد الأمن السيبراني:", next.size);
+            mgrSet = next; mgrAt = Date.now();
+            for (const id of changed) { roleCheck.delete(id); applyAccess(id, accessSeen.has(id) ? accessSeen.get(id) : null); }
+        } catch (e) { console.error("refreshMgr:", e.message); }
+        finally { mgrBusy = null; }
+    })();
+    return mgrBusy;
+}
 async function stillAuthorized(uid) {
     const c = roleCheck.get(uid);
     if (c && Date.now() - c.t < 10000) return c;
     let level = null; // 'full' | 'view' | null
     try { const d = await Access.findById(uid).lean(); level = d && d.level ? d.level : null; } catch { level = null; }
+    level = effLevel(uid, level);   // full | mgr | view | null
     const res = { ok: !!level, level };
     roleCheck.set(uid, { ...res, t: Date.now() });
     return res;
@@ -285,8 +337,9 @@ function pushToUser(uid, event, data) {
     for (const res of sseClients) { if (res._uid === uid) { try { res.write(line); } catch { sseClients.delete(res); } } }
 }
 function applyAccess(uid, level) {
-    roleCheck.set(uid, { ok: !!level, level, t: Date.now() });
-    if (level) pushToUser(uid, "access", { level }); else pushToUser(uid, "dismissed");
+    const eff = effLevel(uid, level);
+    roleCheck.set(uid, { ok: !!eff, level: eff, t: Date.now() });
+    if (eff) pushToUser(uid, "access", { level: eff }); else pushToUser(uid, "dismissed");
 }
 const seenThrottle = new Map();
 const auth = wrap(async (req, res, next) => {
@@ -302,13 +355,41 @@ const auth = wrap(async (req, res, next) => {
     }
     next();
 });
+const canMembers = wrap(async (req, res, next) => {
+    const lv = req.session.user.level;
+    if (lv !== "full" && lv !== "mgr") return res.status(403).json({ error: "هذي الصفحة للقائد والنائب ومسؤول الأفراد فقط" });
+    next();
+});
 const full = wrap(async (req, res, next) => {
     if (req.session.user.level !== "full") return res.status(403).json({ error: "هذا الإجراء يحتاج صلاحية القائد أو النائب" });
     next();
 });
 
+// state موقّع بالسر: يشتغل حتى لو الجلسة انمسحت (ريستارت الاستضافة) أو المتصفح ما حفظ الكوكي
+const oauthSign = t => crypto.createHmac("sha256", String(CONFIG.SESSION_SECRET)).update(t).digest("hex").slice(0, 32);
+function makeState() { const n = crypto.randomBytes(8).toString("hex") + "." + Date.now().toString(36); return n + "." + oauthSign(n); }
+function checkState(st) {
+    const p = String(st || "").split(".");
+    if (p.length !== 3) return false;
+    const a = Buffer.from(oauthSign(p[0] + "." + p[1])), b = Buffer.from(p[2]);
+    if (a.length !== b.length || !crypto.timingSafeEqual(a, b)) return false;
+    const ts = parseInt(p[1], 36), now = Date.now();
+    return ts <= now + 60000 && now - ts < 15 * 60 * 1000;
+}
+const OAUTH_UA = "DiscordBot (https://discord.com, 1.0)";
+async function oauthFetch(kind, url, opt) {
+    for (let i = 0; i < 3; i++) {
+        let r, txt;
+        try { r = await fetch(url, { ...opt, headers: { Accept: "application/json", "User-Agent": OAUTH_UA, ...(opt.headers || {}) } }); txt = await r.text(); }
+        catch (e) { console.error("❌ OAuth " + kind + " شبكة:", e.message); if (i < 2) { await sleep(800); continue; } throw new Error(kind + "_network"); }
+        let j = {}; try { j = JSON.parse(txt); } catch { }
+        if (r.status === 429 && i < 2) { await sleep(Math.min(4000, Math.ceil((j.retry_after || 1) * 1000))); continue; }
+        if (!r.ok) { console.error("❌ OAuth " + kind + ":", r.status, String(txt).slice(0, 200)); throw new Error(kind + "_" + r.status + (j.error ? "_" + String(j.error).replace(/[^a-z_]/gi, "") : "")); }
+        return j;
+    }
+}
 app.get("/auth/discord", (req, res) => {
-    const state = crypto.randomBytes(16).toString("hex");
+    const state = makeState();
     req.session.oauthState = state;
     const q = new URLSearchParams({ client_id: CONFIG.DISCORD_CLIENT_ID, redirect_uri: CONFIG.DISCORD_CALLBACK_URL, response_type: "code", scope: "identify", state });
     req.session.save(() => res.redirect("https://discord.com/oauth2/authorize?" + q));
@@ -316,18 +397,22 @@ app.get("/auth/discord", (req, res) => {
 
 app.get("/auth/discord/callback", wrap(async (req, res) => {
     const { code, state } = req.query;
-    if (!code || !state || state !== req.session.oauthState) return res.redirect("/?err=1");
+    const fail = (c) => { console.error("❌ تسجيل الدخول فشل:", c); return res.redirect("/?err=" + encodeURIComponent(c)); };
+    if (req.query.error) return fail("discord_" + String(req.query.error).replace(/[^a-z_]/gi, "").slice(0, 30));
+    if (!code || !state) return fail("no_code");
+    if (!(state === req.session.oauthState || checkState(state))) return fail("state");
     delete req.session.oauthState;
-    const tr = await fetch("https://discord.com/api/oauth2/token", {
-        method: "POST", headers: { "Content-Type": "application/x-www-form-urlencoded" },
-        body: new URLSearchParams({ client_id: CONFIG.DISCORD_CLIENT_ID, client_secret: CONFIG.DISCORD_CLIENT_SECRET, grant_type: "authorization_code", code: String(code), redirect_uri: CONFIG.DISCORD_CALLBACK_URL }),
-    });
-    if (!tr.ok) return res.redirect("/?err=1");
-    const tok = await tr.json();
-    const ur = await fetch("https://discord.com/api/users/@me", { headers: { Authorization: "Bearer " + tok.access_token } });
-    if (!ur.ok) return res.redirect("/?err=1");
-    const u = await ur.json();
+    let tok, u;
+    try {
+        tok = await oauthFetch("token", "https://discord.com/api/oauth2/token", {
+            method: "POST", headers: { "Content-Type": "application/x-www-form-urlencoded" },
+            body: new URLSearchParams({ client_id: CONFIG.DISCORD_CLIENT_ID, client_secret: CONFIG.DISCORD_CLIENT_SECRET, grant_type: "authorization_code", code: String(code), redirect_uri: CONFIG.DISCORD_CALLBACK_URL }),
+        });
+        u = await oauthFetch("user", "https://discord.com/api/users/@me", { headers: { Authorization: "Bearer " + tok.access_token } });
+    } catch (e) { return fail(e.message); }
+    if (!u || !u.id) return fail("user_empty");
     roleCheck.delete(u.id);
+    await Promise.race([refreshMgr(5000, true), sleep(15000)]).catch(() => {});   // نتأكد من رتبة مسؤول الأفراد قبل الدخول
     const r0 = await stillAuthorized(u.id);
     const allowed = r0.ok;
     if (!allowed) {
@@ -364,7 +449,11 @@ app.delete("/api/events/:id", auth, wrap(async (req, res) => {
     for (const c of sseClients) { try { c.write(line); } catch { sseClients.delete(c); } }
     res.json({ ok: true, deleted: r.deletedCount || 0 });
 }));
-app.get("/api/me", auth, wrap(async (req, res) => res.json({ user: req.session.user, presence: await getPresence(), recAdmin: req.session.user.id === REC_ADMIN_ID, logDel: req.session.user.id === LOG_DELETE_ID })));
+app.get("/api/me", auth, wrap(async (req, res) => {
+    const openOp = req.session.openOp || null;
+    if (openOp) delete req.session.openOp;
+    res.json({ user: req.session.user, presence: await getPresence(), recAdmin: req.session.user.id === REC_ADMIN_ID, logDel: req.session.user.id === LOG_DELETE_ID, openOp });
+}));
 
 // ── بث فوري (SSE): يخبر الموقع إنه فيه تحديث جديد باللوق، بدون أي ريفرش للصفحة ──
 app.get("/api/events/stream", wrap(async (req, res) => {
@@ -721,6 +810,7 @@ app.get("/api/events/:id/info", auth, wrap(async (req, res) => {
         images: (Array.isArray(d.images) ? d.images : []).filter(i => i && i.id).map(i => ({ id: String(i.id) })),
         hasMsgs: d.act === "bulk_delete" || d.act === "mass_msg_delete",
         recRoom: !!d.recRoom, recSid: d.recRoom && d.sid ? String(d.sid) : null,
+        remedyLabel: e.remedy && e.remedy.label ? String(e.remedy.label) : null,
     } });
 }));
 // اسم الشخص بالسيرفر + يوزره (من قائمة أعضاء البوت)
@@ -1045,6 +1135,7 @@ app.get("/api/rec/live/:sid/stream", auth, recAdmin, wrap(async (req, res) => {
     if (!(await VoiceSess.findOne({ sid }).select("_id").lean())) return res.status(404).end();
     res.status(200).set({ "Content-Type": "audio/ogg", "Cache-Control": "no-store, no-transform", Connection: "keep-alive", "X-Accel-Buffering": "no" });
     res.flushHeaders?.();
+    try { req.socket.setNoDelay(true); req.socket.setTimeout(0); } catch { }
     let closed = false;
     req.on("close", () => { closed = true; });
     const rd = new OggOpusReader();
@@ -1057,14 +1148,24 @@ app.get("/api/rec/live/:sid/stream", auth, recAdmin, wrap(async (req, res) => {
                 if (f) { const hr = new OggOpusReader(); hr.push(binOf(f.data)); if (hr.head) { w = new OggOpusWriter(hr.head); res.write(w.headers()); t0 = Date.now(); } }
             }
             if (w) {
-                // أول مرة: نبدأ من آخر 3 ثواني تقريبًا (قرب الحاضر)، بعدها نكمل من آخر قطعة وصلت
-                const q = lastSeq == null ? { sid, uid: null, createdAt: { $gte: new Date(Date.now() - 3000) } } : { sid, uid: null, seq: { $gt: lastSeq } };
-                const parts = await VoiceChunk.find(q).sort({ seq: 1 }).select("data seq").lean();
+                // نبدأ دائماً من الحاضر (ما نرجع للكلام القديم أبداً — هذا اللي كان يسبب تكرار الكلام)، وبعدها نكمل من آخر قطعة وصلت
+                if (lastSeq == null) {
+                    const lt = await VoiceChunk.findOne({ sid, uid: null }).sort({ seq: -1 }).select("seq").lean();
+                    lastSeq = lt ? lt.seq : -1;
+                }
+                const parts = await VoiceChunk.find({ sid, uid: null, seq: { $gt: lastSeq } }).sort({ seq: 1 }).select("data seq").lean();
                 if (parts.length) {
                     lastSeq = parts[parts.length - 1].seq;
                     const pk = [];
                     for (const c of parts) for (const x of rd.push(c.data)) pk.push(x);
-                    if (pk.length) { res.write(w.audio(pk)); for (const x of pk) sentMs += opusSamples(x) / 48; lastData = Date.now(); }
+                    // لو الستريم متقدّم عن الوقت الحقيقي نحذف حزم الصمت من القطعة (يمنع تراكم التأخير) — الكلام نفسه ما ينحذف أبداً
+                    let ahead = sentMs - ((Date.now() - t0) + 300);
+                    const keep = [];
+                    for (const x of pk) {
+                        if (ahead > 500 && x.length <= 6) continue;
+                        keep.push(x); ahead += opusSamples(x) / 48;
+                    }
+                    if (keep.length) { res.write(w.audio(keep)); for (const x of keep) sentMs += opusSamples(x) / 48; lastData = Date.now(); }
                 }
                 // نبقي الستريم ماشي بالوقت الحقيقي: لو ما فيه كلام نرسل صمت (عشان المتصفح ما يوقف ولا الاتصال ينقطع)
                 const lag = (Date.now() - t0) + 300 - sentMs;
@@ -1075,7 +1176,7 @@ app.get("/api/rec/live/:sid/stream", auth, recAdmin, wrap(async (req, res) => {
                 if (!sd || (sd.endedAt && Date.now() - lastData > 4000) || Date.now() - lastData > 30 * 60 * 1000) break;
             }
         } catch (e) { console.error("rec live stream:", e.message); }
-        await sleep(350);
+        await sleep(250);
     }
     try { res.end(); } catch { }
 }));
@@ -1091,21 +1192,26 @@ app.get("/api/bans/:id/history", auth, wrap(async (req, res) => {
 }));
 
 // ── API: أعضاء الأمن السيبراني (للقائد والنائب فقط) ──
-app.get("/api/members", auth, full, wrap(async (req, res) => {
+app.get("/api/members", auth, canMembers, wrap(async (req, res) => {
     const r = await callBot("members", { meId: req.session.user.id }, 60000);
     const panelDocs = await PanelMember.find({ _id: { $in: r.members.map(m => m.id) } }).lean();
     const panelMap = {}; panelDocs.forEach(d => panelMap[d._id] = d);
     const out = r.members.map(m => {
         const p = panelMap[m.id];
         const durationMin = (p && p.lastLoginAt && p.lastSeenAt) ? Math.max(1, Math.round((new Date(p.lastSeenAt) - new Date(p.lastLoginAt)) / 60000)) : null;
-        return { id: m.id, tag: m.tag, avatar: m.avatar, rank: m.rank, lastLoginAt: p?.lastLoginAt || null, lastSeenAt: p?.lastSeenAt || null, durationMin };
+        return { id: m.id, tag: m.tag, avatar: m.avatar, rank: m.rank, mgr: mgrSet.has(m.id), lastLoginAt: p?.lastLoginAt || null, lastSeenAt: p?.lastSeenAt || null, durationMin };
     }).sort((a, b) => {
         const w = x => x === "leader" ? 0 : x === "deputy" ? 1 : 2;
         return w(a.rank) - w(b.rank) || (b.lastLoginAt ? new Date(b.lastLoginAt).getTime() : 0) - (a.lastLoginAt ? new Date(a.lastLoginAt).getTime() : 0);
     });
     res.json({ members: out, meRank: r.meRank });
 }));
-app.get("/api/members/:id/activity", auth, wrap(async (req, res) => {
+app.get("/api/members/:id/panel", auth, canMembers, wrap(async (req, res) => {
+    if (!/^\d{5,25}$/.test(req.params.id)) return res.status(400).json({ error: "آيدي غير صالح" });
+    const ev = await Event.find({ cat: "panel", actorId: req.params.id }).sort({ createdAt: -1 }).limit(40).lean();
+    res.json({ events: ev.map(e => ({ title: e.title, details: String(e.details || "").slice(0, 200), at: e.createdAt })) });
+}));
+app.get("/api/members/:id/activity", auth, canMembers, wrap(async (req, res) => {
     if (!/^\d{5,25}$/.test(req.params.id)) return res.status(400).json({ error: "آيدي غير صالح" });
     res.json(await callBot("member_activity", { id: req.params.id }, 30000));
 }));
@@ -1114,6 +1220,125 @@ app.post("/api/members/:id/dismiss", auth, full, wrap(async (req, res) => {
     const r = await callBot("dismiss", { id: req.params.id, actorId: req.session.user.id, who: req.session.user.tag });
     applyAccess(r.id, null); // يظهر له فوراً إنه مفصول إذا كان فاتح الموقع
     await panelLog(req, "فصل من الأمن السيبراني", "العضو: " + r.tag, { targetId: r.id, targetTag: r.tag });
+    res.json({ ok: true });
+}));
+
+// ══════════════════════════════════════════════════════════════════════════
+// إشعارات القيادة: نافذة منبثقة بالموقع + رسالة إمبد بالخاص لقائد الأمن السيبراني ونائبه
+// الرسائل الخاصة تنرسل بـ REST مباشرة بتوكن البوت (بدون تسجيل دخول) — حط توكن البوت في Environment Variable اسمها NOTIFY_BOT_TOKEN
+// ══════════════════════════════════════════════════════════════════════════
+const SITE_ORIGIN = (() => { try { return new URL(CONFIG.DISCORD_CALLBACK_URL).origin; } catch { return ""; } })();
+const clip = (t, n) => { t = String(t == null ? "" : t).trim(); return t.length > n ? t.slice(0, n - 1) + "…" : t; };
+async function discordApi(path, method, body) {
+    for (let i = 0; i < 2; i++) {
+        const r = await fetch("https://discord.com/api/v10" + path, { method, headers: { Authorization: "Bot " + CONFIG.NOTIFY_BOT_TOKEN, "Content-Type": "application/json" }, body: body ? JSON.stringify(body) : undefined });
+        const j = await r.json().catch(() => ({}));
+        if (r.status === 429 && i === 0) { await sleep(Math.min(5000, Math.ceil((j.retry_after || 1) * 1000))); continue; }
+        if (!r.ok) { const e = new Error(j.message || ("Discord " + r.status)); e.code = j.code; throw e; }
+        return j;
+    }
+}
+async function dmUser(uid, message) {
+    const ch = await discordApi("/users/@me/channels", "POST", { recipient_id: String(uid) });
+    return discordApi("/channels/" + ch.id + "/messages", "POST", message);
+}
+function noticePublic(n) {
+    return { id: String(n._id), type: n.type, eventId: n.eventId || null, eventTitle: n.eventTitle || "", eventDetails: n.eventDetails || "", subjectId: n.subjectId || null, subjectTag: n.subjectTag || "", reason: n.reason || "", senderId: n.senderId, senderTag: n.senderTag, senderAvatar: n.senderAvatar || "", createdAt: n.createdAt };
+}
+function noticeMessage(n) {
+    const isOp = n.type === "op";
+    const link = SITE_ORIGIN ? (isOp && n.eventId ? SITE_ORIGIN + "/?op=" + n.eventId : SITE_ORIGIN + "/") : "";
+    const e = isOp ? {
+        title: "🚨 إشعار عاجل — عملية مشبوهة",
+        description: "وصلكم هذا الإشعار من العضو **" + clip(n.senderTag, 60) + "** بخصوص عملية مشبوهة تحتاج مراجعتكم.\nاضغطوا على الزر بالأسفل لفتح العملية في اللوحة واتخاذ الإجراء المناسب.",
+        color: 0xef4444,
+        fields: [
+            { name: "👤 المرسل", value: clip(n.senderTag, 100) || "—", inline: true },
+            { name: "📌 العملية", value: clip(n.eventTitle, 200) || "—", inline: true },
+            ...(n.eventDetails ? [{ name: "📝 التفاصيل", value: clip(n.eventDetails, 900) }] : []),
+        ],
+    } : {
+        title: "📣 إشعار من مسؤول أفراد الأمن السيبراني",
+        description: "رفع لكم المسؤول **" + clip(n.senderTag, 60) + "** إشعاراً بخصوص العضو **" + clip(n.subjectTag, 60) + "**.\nنأمل الاطلاع على السبب أدناه واتخاذ ما ترونه مناسباً.",
+        color: 0x3b82f6,
+        fields: [
+            { name: "👤 المسؤول", value: clip(n.senderTag, 100) || "—", inline: true },
+            { name: "🎯 العضو", value: clip(n.subjectTag, 100) || "—", inline: true },
+            { name: "📝 سبب الإشعار", value: clip(n.reason, 1000) || "—" },
+        ],
+    };
+    e.footer = { text: "الأمن السيبراني — وزارة الداخلية" };
+    e.timestamp = new Date().toISOString();
+    if (/^https:\/\//.test(n.senderAvatar || "")) e.thumbnail = { url: n.senderAvatar };
+    return {
+        embeds: [e], allowed_mentions: { parse: [] },
+        components: link ? [{ type: 1, components: [{ type: 2, style: 5, label: isOp ? "🔍 عرض العملية" : "🔗 فتح لوحة الأمن السيبراني", url: link }] }] : [],
+    };
+}
+async function createNotice(fields) {
+    const rec = (await Access.find({ level: "full" }).select("_id").lean()).map(d => String(d._id)).filter(id => id !== fields.senderId);
+    if (!rec.length) { const e = new Error("ما لقيت قائد أو نائب مسجّلين بالنظام"); e.status = 503; throw e; }
+    const n = await Notice.create({ ...fields, recipients: rec });
+    const pub = noticePublic(n);
+    rec.forEach(id => pushToUser(id, "notice", pub));      // نافذة منبثقة فورية لمن هو فاتح الموقع
+    const msg = noticeMessage(n);
+    const dmJob = (async () => {
+        if (!CONFIG.NOTIFY_BOT_TOKEN) { console.warn("⚠️ NOTIFY_BOT_TOKEN فاضي — الإشعار وصل بالموقع بس، الخاص ما انرسل"); return { sent: 0, failed: rec.length, noToken: true }; }
+        let sent = 0, failed = 0;
+        await Promise.all(rec.map(async uid => { try { await dmUser(uid, msg); sent++; } catch (e) { failed++; console.error("notice DM:", uid, e.message); } }));
+        return { sent, failed };
+    })();
+    const dm = await Promise.race([dmJob, sleep(7000).then(() => ({ pending: true }))]);
+    Notice.updateOne({ _id: n._id }, { $set: { dm } }).catch(() => {});
+    return { n, dm, to: rec.length };
+}
+const noticeCool = new Map();
+// عضو يرسل إشعار للقيادة عن عملية مشبوهة
+app.post("/api/notices/op", auth, wrap(async (req, res) => {
+    const me = req.session.user;
+    if (me.level === "full") return res.status(400).json({ error: "أنت من القيادة — ما تحتاج ترسل إشعار" });
+    const id = String(req.body.eventId || "");
+    if (!mongoose.isValidObjectId(id)) return res.status(400).json({ error: "عملية غير صحيحة" });
+    const e = await Event.findById(id).select("title details kind actorTag").lean();
+    if (!e) return res.status(404).json({ error: "العملية غير موجودة" });
+    if (e.kind !== "suspicious") return res.status(400).json({ error: "الإشعار للعمليات المشبوهة فقط" });
+    const ck = me.id + "|" + id;
+    if (Date.now() - (noticeCool.get(ck) || 0) < 60000) return res.status(429).json({ error: "أرسلت إشعار لهذي العملية قبل شوي — انتظر دقيقة" });
+    noticeCool.set(ck, Date.now());
+    const r = await createNotice({ type: "op", eventId: id, eventTitle: clip(e.title, 200), eventDetails: clip(e.details, 600), senderId: me.id, senderTag: me.tag, senderAvatar: me.avatar });
+    await panelLog(req, "إشعار القيادة عن عملية مشبوهة", "العملية: " + e.title);
+    res.json({ ok: true, to: r.to, dm: r.dm });
+}));
+// مسؤول الأفراد يرفع إشعار عن عضو (تأخر / مخالفة ...) للقائد والنائب
+app.post("/api/notices/member", auth, wrap(async (req, res) => {
+    const me = req.session.user;
+    if (me.level !== "mgr") return res.status(403).json({ error: "هذا الإجراء لمسؤول أفراد الأمن السيبراني فقط" });
+    const mid = String(req.body.memberId || "");
+    if (!/^\d{5,25}$/.test(mid)) return res.status(400).json({ error: "آيدي غير صالح" });
+    if (mid === me.id) return res.status(400).json({ error: "ما تقدر ترفع إشعار على نفسك" });
+    const reason = String(req.body.reason || "").trim();
+    if (reason.length < 3) return res.status(400).json({ error: "اكتب سبب الإشعار" });
+    const acc = await Access.findById(mid).lean();
+    if (!acc || !acc.level) return res.status(404).json({ error: "هذا الشخص مو من أفراد الأمن السيبراني" });
+    if (acc.level === "full") return res.status(400).json({ error: "ما تقدر ترفع إشعار على القيادة" });
+    const ck = me.id + "|m|" + mid;
+    if (Date.now() - (noticeCool.get(ck) || 0) < 30000) return res.status(429).json({ error: "أرسلت إشعار عن هذا العضو قبل شوي" });
+    noticeCool.set(ck, Date.now());
+    const pm = await PanelMember.findById(mid).lean();
+    const subjectTag = clip((pm && pm.tag) || req.body.tag || mid, 60);
+    const r = await createNotice({ type: "member", subjectId: mid, subjectTag, reason: clip(reason, 600), senderId: me.id, senderTag: me.tag, senderAvatar: me.avatar });
+    await panelLog(req, "إشعار القيادة عن عضو", "العضو: " + subjectTag + "\nالسبب: " + clip(reason, 300), { targetId: mid, targetTag: subjectTag });
+    res.json({ ok: true, to: r.to, dm: r.dm });
+}));
+// إشعارات القيادة اللي ما انشافت (تنعرض أول ما يفتح الموقع)
+app.get("/api/notices/pending", auth, full, wrap(async (req, res) => {
+    const me = req.session.user.id;
+    const list = await Notice.find({ recipients: me, seenBy: { $ne: me }, createdAt: { $gte: new Date(Date.now() - 7 * 864e5) } }).sort({ createdAt: 1 }).limit(20).lean();
+    res.json({ notices: list.map(noticePublic) });
+}));
+app.post("/api/notices/:id/seen", auth, full, wrap(async (req, res) => {
+    if (!mongoose.isValidObjectId(req.params.id)) return res.status(400).json({ error: "إشعار غير صحيح" });
+    await Notice.updateOne({ _id: req.params.id }, { $addToSet: { seenBy: req.session.user.id } });
     res.json({ ok: true });
 }));
 
@@ -1143,6 +1368,8 @@ async function pollBotSignals() {
     finally { sigBusy = false; }
 }
 function startSiteJobs() {
+    setInterval(() => refreshMgr(), 20000);
+    refreshMgr(0);
     setInterval(pollBotSignals, 1500);
     pollBotSignals();
     // أرشفة الأسابيع المكتملة (كانت تتم من البوت — الحين من الموقع)
@@ -1336,6 +1563,15 @@ nav { height:auto; min-height:62px; padding-top:env(safe-area-inset-top,0px); }
 /* ══ نوافذ ما تتحرك ══ */
 .ov { overscroll-behavior:contain; -webkit-overflow-scrolling:touch; }
 .modal { margin:0 auto; }
+.nov { position:fixed; inset:0; z-index:6000; background:rgba(2,6,15,0.85); backdrop-filter:blur(3px); display:flex; align-items:flex-start; justify-content:center; overflow-y:auto; padding:calc(20px + env(safe-area-inset-top,0px)) 14px 24px; }
+.nbox { background:#0d1f3c; border:2px solid #ef4444; border-radius:16px; padding:22px; max-width:520px; width:100%; margin:auto; animation:npulse 1.6s ease-in-out infinite; }
+.nbox.info { border-color:#3b82f6; animation:none; box-shadow:0 0 30px rgba(59,130,246,.3); }
+.nbox h3 { color:#f87171; margin-bottom:12px; font-size:1.1rem; }
+.nbox.info h3 { color:#60a5fa; }
+.nbox .nq { background:rgba(255,255,255,.05); border-radius:10px; padding:10px 12px; margin:10px 0; line-height:1.9; white-space:pre-wrap; word-break:break-word; }
+.nbox .nfrom { display:flex; align-items:center; gap:10px; margin-bottom:8px; }
+.nbox .nfrom img { width:38px; height:38px; border-radius:50%; border:2px solid var(--gold); }
+@keyframes npulse { 0%,100% { box-shadow:0 0 22px rgba(239,68,68,.25); } 50% { box-shadow:0 0 48px rgba(239,68,68,.6); } }
 /* ══ التسجيل التوضيحي للروم الصوتي ══ */
 .rp-clock { font-size:26px; font-weight:800; text-align:center; color:var(--gold-soft); direction:ltr; }
 .rp-prog { height:6px; background:rgba(255,255,255,0.08); border-radius:4px; overflow:hidden; margin:8px 0 12px; }
@@ -1362,14 +1598,23 @@ const HEAD = (title) => `<!DOCTYPE html>
 <link href="https://fonts.googleapis.com/css2?family=Tajawal:wght@400;500;700;800&display=swap" rel="stylesheet">
 <style>${CSS}</style></head>`;
 
-function loginPage(mode) {
+function loginHint(c) {
+    if (c === "state") return "انتهت صلاحية محاولة الدخول — افتح الموقع من جديد واضغط تسجيل الدخول مرة وحدة.";
+    if (/invalid_client|_401/.test(c)) return "الـ Client Secret أو الـ Client ID غلط في إعدادات الاستضافة.";
+    if (/invalid_grant/.test(c)) return "رابط الرجوع (Redirect URI) ما يطابق اللي في ديسكورد، أو الكود انستخدم قبل — جرّب مرة ثانية.";
+    if (/_429|_403|_1015/.test(c)) return "ديسكورد حاجب الطلبات مؤقتاً (ضغط على عنوان الاستضافة) — جرّب بعد دقيقة.";
+    if (/network/.test(c)) return "السيرفر ما قدر يوصل لديسكورد — جرّب بعد شوي.";
+    if (/^discord_access_denied/.test(c)) return "أنت رفضت صلاحية الدخول في ديسكورد.";
+    return "";
+}
+function loginPage(mode, detail) {
     let body;
     if (mode === "denied") body = `<div class="auth-card deny"><div class="ico">⛔</div><h1>غير مصرّح</h1>
         <p>هذا الموقع فقط لمنسوبي الأمن السيبراني.<br>حسابك لا يملك الرتبة المطلوبة.</p>
         <a class="btn gray" href="/auth/discord">تسجيل الدخول بحساب آخر</a></div>`;
     else body = `<div class="auth-card"><div class="ico">🛡️</div><h1>${CONFIG.SITE_NAME}</h1>
         <p>${CONFIG.SITE_SUB}<br>الدخول مخصّص لمنسوبي الأمن السيبراني فقط، سجّل دخولك بحساب ديسكورد ليتم التحقق من رتبتك.</p>
-        ${mode === "err" ? '<div class="warn">صار خطأ أثناء تسجيل الدخول، حاول مرة ثانية.</div>' : ""}
+        ${mode === "err" ? '<div class="warn">صار خطأ أثناء تسجيل الدخول، حاول مرة ثانية.' + (/^[A-Za-z0-9_\-]{1,60}$/.test(detail || "") && detail !== "1" ? ((loginHint(detail) ? "<br>" + loginHint(detail) : "") + '<br><small dir="ltr" style="opacity:.7">code: ' + detail + "</small>") : "") + "</div>" : ""}
         <a class="btn" href="/auth/discord">🔐 تسجيل الدخول عبر ديسكورد</a></div>`;
     return HEAD(CONFIG.SITE_NAME) + `<body><div class="auth-page">${body}</div></body></html>`;
 }
@@ -1721,7 +1966,7 @@ function closeModal(){var o=$('ov');if(o)o.remove();unlockScroll();}
 function ask(msg){return new Promise(function(res){modal('<h3>تأكيد</h3><p style="line-height:1.8;margin-bottom:16px;white-space:pre-line">'+esc(msg)+'</p><div class="row" style="justify-content:flex-start"><button class="btn danger" id="ask-y">تأكيد</button><button class="btn gray" id="ask-n">إلغاء</button></div>');$('ask-y').onclick=function(){closeModal();res(true);};$('ask-n').onclick=function(){closeModal();res(false);};});}
 
 /* ── التنقل ── */
-function pagesList(){var p=PAGES.slice();if(S.level==='full')p.push(['members','👥 الأعضاء']);if(S.recAdmin)p.push(['rec','🎙️ بوت تسجيل الرومات']);return p;}
+function pagesList(){var p=PAGES.slice();if(S.level==='full'||S.level==='mgr')p.push(['members','👥 الأعضاء']);if(S.recAdmin)p.push(['rec','🎙️ بوت تسجيل الرومات']);return p;}
 function buildNav(){
   var list=pagesList();
   $('navlinks').innerHTML=list.map(function(p){return '<button class="'+(S.page===p[0]?'on':'')+'" onclick="go(\''+p[0]+'\')">'+p[1]+'</button>';}).join('');
@@ -1913,7 +2158,7 @@ function evRow(e){
   if(sus&&S.level==='full'){
     if(e.remedy)acts+='<button class="btn sm danger" onclick="doRemedy(\''+e._id+'\',this)">'+esc(e.remedy.label)+'</button>';
     if(!e.resolved)acts+='<button class="btn sm ok" onclick="doResolve(\''+e._id+'\',this)">✅ حل العملية</button>';
-  }
+  }else if(sus&&!e.resolved)acts+='<button class="btn sm" onclick="notifyLead(\''+e._id+'\',this)">🔔 إشعار القيادة</button>';
   var isReply=!!(e.data&&e.data.act==='inq_reply');
   if(e.cat==='role'&&e.actorId&&e.data&&e.data.act==='member_roles'&&String(e.details||'').indexOf('أُعطي')>-1){
     if(!e.inq){if(S.level==='full')acts+='<button class="btn sm" data-id="'+e._id+'" onclick="sendInq(this)">📩 إرسال رسالة للعضو</button>';}
@@ -2088,7 +2333,16 @@ function drawEv(){
   var imgs=(e.images&&e.images.length)?'<div class="imgrow">'+e.images.map(function(im){return '<img src="/api/images/'+im.id+'" alt="" loading="lazy" onclick="showImg(\''+im.id+'\')">';}).join('')+'</div>':'';
   var msgs=e.hasMsgs?'<div style="margin-top:8px"><button class="btn sm gray" onclick="showMsgs(\''+e._id+'\')">📄 عرض الرسائل</button></div>':'';
   var recb=(e.recRoom&&S.level==='full')?(e.recSid?'<div style="margin-top:8px"><button class="btn" onclick="vrOpen(\''+e.recSid+'\')">🎬 تسجيل توضيحي + صوت وصورة</button></div>':'<div class="log-meta">⚠️ ما فيه تسجيل لهذي العملية</div>'):'';
-  box.innerHTML='<h3>📋 تفاصيل العملية</h3>'+head+actor+target+when+det+imgs+msgs+recb;
+  var ab='';
+  if(sus){
+    if(S.level==='full'){
+      var bs='';
+      if(e.remedyLabel)bs+='<button class="btn sm danger" onclick="evRemedy(\''+e._id+'\',this)">'+esc(e.remedyLabel)+'</button>';
+      if(!e.resolved)bs+='<button class="btn sm ok" onclick="evResolve(\''+e._id+'\',this)">✅ حل العملية</button>';
+      if(bs)ab='<div class="row" style="justify-content:flex-start;gap:8px;margin-top:12px;flex-wrap:wrap">'+bs+'</div>';
+    }else if(!e.resolved)ab='<div class="row" style="justify-content:flex-start;margin-top:12px"><button class="btn sm" onclick="notifyLead(\''+e._id+'\',this)">🔔 إشعار القيادة</button></div>';
+  }
+  box.innerHTML='<h3>📋 تفاصيل العملية</h3>'+head+actor+target+when+det+imgs+msgs+recb+ab;
 }
 
 /* ══ تفاصيل العمليات المشبوهة (يوم / أسبوع) ══ */
@@ -2543,6 +2797,79 @@ function editOv(cid,tid){
 }
 function setTri(b,s){var row=b.closest('.prow');row.setAttribute('data-s',s);row.querySelectorAll('.tri button').forEach(function(x){x.classList.remove('on');});b.classList.add('on');}
 
+/* ══ إشعارات القيادة ══ */
+async function notifyLead(id,b){
+  if(b)b.disabled=true;
+  try{await api('/api/notices/op',{method:'POST',body:JSON.stringify({eventId:id})});toast('🔔 تم إرسال الإشعار لقائد الأمن السيبراني ونائبه');}
+  catch(e){toast(e.message);if(b)b.disabled=false;}
+}
+async function evResolve(id,b){
+  b.disabled=true;
+  try{await api('/api/events/'+id+'/resolve',{method:'POST'});toast('تم حل العملية');loadEvents(true);openEv(id);}catch(e){toast(e.message);b.disabled=false;}
+}
+async function evRemedy(id,b){
+  var lb=(S.evj&&S.evj.remedyLabel)||'',tt=(S.evj&&S.evj.title)||'';
+  if(!(await ask('تنفيذ الإجراء: '+lb+'\n\n'+tt))){openEv(id);return;}
+  try{var j=await api('/api/events/'+id+'/remedy',{method:'POST'});toast(j.msg||'تم');loadEvents(true);}catch(e){toast(e.message);}
+  openEv(id);
+}
+S.nq=[];S.nShown=null;
+function noticeSeen(n){api('/api/notices/'+n.id+'/seen',{method:'POST'}).catch(function(){});}
+function noticeEnqueue(n){
+  if(S.level!=='full'||!n||!n.id)return;
+  if(S.nq.some(function(x){return x.id===n.id;})||(S.nShown&&S.nShown.id===n.id))return;
+  S.nq.push(n);
+  if(!S.nShown)noticeNext();
+}
+function noticeNext(){
+  var old=$('nov');if(old)old.remove();
+  var n=S.nq.shift();
+  if(!n){S.nShown=null;if(!$('ov'))unlockScroll();return;}
+  S.nShown=n;
+  var isOp=n.type==='op';
+  var from='<div class="nfrom">'+(n.senderAvatar?'<img src="'+esc(n.senderAvatar)+'" alt="">':'')+'<div><b>'+esc(n.senderTag)+'</b><div class="log-meta">🕒 '+esc(ago(n.createdAt))+'</div></div></div>';
+  var body=isOp
+    ?'<p style="line-height:1.9">وصلك إشعار من العضو <b>'+esc(n.senderTag)+'</b> بخصوص عملية مشبوهة تحتاج مراجعتك.</p>'
+      +'<div class="nq"><b>📌 '+esc(n.eventTitle||'عملية مشبوهة')+'</b>'+(n.eventDetails?'<div class="log-meta" style="margin-top:4px">'+esc(n.eventDetails)+'</div>':'')+'</div>'
+    :'<p style="line-height:1.9">رفع لك المسؤول <b>'+esc(n.senderTag)+'</b> إشعاراً بخصوص العضو <b>'+esc(n.subjectTag)+'</b>.</p>'
+      +'<div class="nq"><div class="muted" style="font-size:12px;margin-bottom:4px">📝 سبب الإشعار</div>'+esc(n.reason)+'</div>';
+  var btns=isOp
+    ?'<button class="btn" id="nv-view">👁️ شوفها</button><button class="btn gray" id="nv-close">إغلاق</button>'
+    :'<button class="btn" id="nv-ok">✔️ تم الاطلاع</button><button class="btn gray" id="nv-mem">👥 صفحة الأعضاء</button>';
+  var o=document.createElement('div');o.className='nov';o.id='nov';
+  o.innerHTML='<div class="nbox'+(isOp?'':' info')+'"><h3>'+(isOp?'🚨 إشعار عاجل من الأمن السيبراني':'📣 إشعار من مسؤول الأفراد')+'</h3>'+from+body
+    +'<div class="row" style="justify-content:flex-start;gap:8px;margin-top:14px;flex-wrap:wrap">'+btns+'</div></div>';
+  document.body.appendChild(o);lockScroll();
+  var done=function(){noticeSeen(n);S.nShown=null;var x=$('nov');if(x)x.remove();};
+  if(isOp){
+    $('nv-view').onclick=function(){done();openEv(n.eventId);setTimeout(noticeNext,0);};
+    $('nv-close').onclick=function(){done();noticeNext();};
+  }else{
+    $('nv-ok').onclick=function(){done();noticeNext();};
+    $('nv-mem').onclick=function(){done();go('members');noticeNext();};
+  }
+}
+async function loadNotices(){
+  try{var j=await api('/api/notices/pending');(j.notices||[]).forEach(noticeEnqueue);}catch(e){}
+}
+function memberNotice(id){
+  var m=(S.memMap||{})[id]||{};
+  var lb='display:block;color:#60a5fa;font-size:13px;margin:12px 0 6px';
+  modal('<h3 style="color:#60a5fa">📣 إشعار القيادة</h3>'
+    +'<div class="muted" style="font-size:13px;line-height:1.8">راح يوصل الإشعار لقائد الأمن السيبراني ونائبه (منبثق بالموقع + رسالة بالخاص) بخصوص: <b>'+esc(m.tag||id)+'</b></div>'
+    +'<label style="'+lb+'">سبب الإشعار</label>'
+    +'<textarea id="mnR" rows="5" maxlength="600" placeholder="مثال: تأخر عن الدوام / سوّى كذا..." style="width:100%;background:rgba(255,255,255,.06);border:1px solid rgba(59,130,246,.35);border-radius:10px;color:#e2e8f0;padding:10px;font-family:inherit;font-size:14px;resize:vertical"></textarea>'
+    +'<div class="row" style="justify-content:flex-start;gap:8px;margin-top:14px"><button class="btn" id="mnGo">📤 إرسال</button><button class="btn gray" onclick="closeModal()">إلغاء</button></div>');
+  $('mnR').focus();
+  $('mnGo').onclick=async function(){
+    var r=($('mnR').value||'').trim();
+    if(r.length<3){toast('اكتب سبب الإشعار');return;}
+    this.disabled=true;
+    try{await api('/api/notices/member',{method:'POST',body:JSON.stringify({memberId:id,reason:r,tag:m.tag||''})});closeModal();toast('📣 تم إرسال الإشعار للقيادة');}
+    catch(e){toast(e.message);this.disabled=false;}
+  };
+}
+
 /* ══ أعضاء الأمن السيبراني (للقائد والنائب) ══ */
 var RANK_AR={leader:'👑 قائد',deputy:'🥈 نائب',member:'عضو'};
 async function pgMembers(){
@@ -2555,13 +2882,14 @@ async function pgMembers(){
       S.memMap[m.id]=m;
       var last=m.lastLoginAt?fmt(m.lastLoginAt):'لم يسجّل الدخول للوحة بعد';
       var dur=(m.durationMin!=null)?'⏱️ قعد آخر مرة: '+m.durationMin+' دقيقة':'';
-      var canDismiss=m.id!==S.meId&&!(m.rank==='leader'&&S.meRank!=='leader');
+      var canDismiss=S.level==='full'&&m.id!==S.meId&&!(m.rank==='leader'&&S.meRank!=='leader');
       return '<div class="card" data-mid="'+esc(m.id)+'" style="cursor:pointer"><div class="bot"><img src="'+esc(m.avatar)+'" alt=""><div style="flex:1;min-width:200px">'
-        +'<div class="log-title">'+esc(m.tag)+' <span class="badge '+(m.rank==='leader'?'high':m.rank==='deputy'?'medium':'low')+'">'+RANK_AR[m.rank]+'</span></div>'
+        +'<div class="log-title">'+esc(m.tag)+' <span class="badge '+(m.rank==='leader'?'high':m.rank==='deputy'?'medium':'low')+'">'+RANK_AR[m.rank]+'</span>'+(m.mgr?' <span class="badge medium">🗂️ مسؤول الأفراد</span>':'')+'</div>'
         +'<div class="log-meta">🕒 آخر دخول للوحة: '+last+'</div>'
         +(dur?'<div class="log-meta">'+dur+'</div>':'')
         +'<div class="log-meta" style="color:#60a5fa">🕵️ اضغط لعرض نشاطه في السيرفر</div></div>'
-        +(canDismiss?'<button class="btn sm danger" onclick="dismissMember(\''+m.id+'\',\''+esc(m.tag).replace(/'/g,'')+'\')">🚫 فصل</button>':'<span class="muted" style="font-size:12px">'+(m.id===S.meId?'أنت':'🔒 القائد')+'</span>')+'</div></div>';
+        +((S.level==='mgr'&&m.id!==S.meId&&m.rank==='member')?'<button class="btn sm" onclick="memberNotice(\''+m.id+'\')">📣 إشعار القيادة</button>':'')
+        +(canDismiss?'<button class="btn sm danger" onclick="dismissMember(\''+m.id+'\',\''+esc(m.tag).replace(/'/g,'')+'\')">🚫 فصل</button>':(S.level==='full'?'<span class="muted" style="font-size:12px">'+(m.id===S.meId?'أنت':'🔒 القائد')+'</span>':(m.id===S.meId?'<span class="muted" style="font-size:12px">أنت</span>':'')))+'</div></div>';
     }).join('')||'<div class="card center muted">ما فيه أعضاء بعد</div>';
     $('main').innerHTML=html;
     $('main').onclick=function(ev){
@@ -2583,11 +2911,18 @@ async function openAct(id){
   modal('<div id="actinfo" style="max-height:70vh;overflow-y:auto"><h3>🕵️ نشاط العضو</h3>'+actHead(b,id)+'<div class="card center muted">جاري التحميل...</div></div><div class="row" style="justify-content:flex-start;margin-top:14px"><button class="btn gray" onclick="closeModal()">إغلاق</button></div>');
   try{
     var j=await api('/api/members/'+id+'/activity');
+    var pj=null;try{pj=await api('/api/members/'+id+'/panel');}catch(x){}
     if(S.actId!==id||!$('actinfo'))return;
-    drawAct(j,b);
+    drawAct(j,b,pj);
   }catch(e){if(S.actId===id&&$('actinfo'))$('actinfo').innerHTML='<h3>🕵️ نشاط العضو</h3>'+actHead(b,id)+'<div class="card center muted">'+esc(e.message)+'</div>';}
 }
-function drawAct(a,b){
+function actPanel(pj){
+  var ev=(pj&&pj.events)||[];
+  var h='<div class="card" style="margin:8px 0;padding:12px"><div class="muted" style="font-size:12px;margin-bottom:6px">🛠️ آخر ما سوّاه في اللوحة (دخول وإجراءات)</div>';
+  if(!ev.length)return h+'<span class="muted">ما سوّى شي في اللوحة بعد</span></div>';
+  return h+ev.map(function(x){return '<div class="prow"><span>'+esc(x.title)+(x.details?'<div class="log-meta">'+esc(x.details)+'</div>':'')+'</span><span class="muted" style="font-size:11px;white-space:nowrap">'+esc(fmt(x.at))+'</span></div>';}).join('')+'</div>';
+}
+function drawAct(a,b,pj){
   var box=$('actinfo');if(!box)return;
   var hb={tag:a.tag||b.tag,avatar:a.avatar||b.avatar,rank:b.rank,name:a.name};
   var on=a.presenceOk&&a.status&&a.status!=='offline'&&a.status!=='unknown';
@@ -2610,7 +2945,7 @@ function drawAct(a,b){
       +(lm.att?'<div class="log-meta">📎 '+lm.att+' مرفق</div>':'')
       +(lm.url&&/^https:\/\/discord\.com\//.test(lm.url)?'<div style="margin-top:8px"><a class="btn sm gray" href="'+esc(lm.url)+'" target="_blank" rel="noopener">🔗 فتح الرسالة في ديسكورد</a></div>':'')+'</div>';
   }else msg='<div class="card" style="margin:8px 0;padding:12px"><div class="muted" style="font-size:12px;margin-bottom:4px">💬 آخر رسالة له في السيرفر</div><span class="muted">ما لقينا له رسالة'+(since?' من بدأ التتبّع ('+esc(since)+')':'')+'</span></div>';
-  box.innerHTML='<h3>🕵️ نشاط العضو</h3>'+actHead(hb,a.id)+rows+msg;
+  box.innerHTML='<h3>🕵️ نشاط العضو</h3>'+actHead(hb,a.id)+rows+msg+actPanel(pj);
 }
 async function dismissMember(id,name){
   if(!(await ask('متأكد تبي تفصل '+name+' من الأمن السيبراني؟\nراح تنسحب رتبته من ديسكورد وما يقدر يدخل اللوحة إلا إذا ترجعت له الرتبة.')))return;
@@ -2689,7 +3024,7 @@ function recNew(){
 }
 var LV=null;
 function lvStop(){
-  if(LV){clearInterval(LV.timer);try{LV.a.pause();LV.a.removeAttribute('src');LV.a.load();}catch(e){}}
+  if(LV){clearInterval(LV.timer);clearInterval(LV.t2);try{LV.a.pause();LV.a.removeAttribute('src');LV.a.load();}catch(e){}}
   LV=null;
 }
 function recLive(sid,name){
@@ -2701,17 +3036,32 @@ function recLive(sid,name){
    +'<div style="margin:12px 0 4px;font-size:13px;font-weight:700">👥 اللي بالروم الحين</div><div id="lv-who"><div class="muted">...</div></div>'
    +'<div class="row" style="justify-content:center;gap:8px;margin-top:12px"><button class="btn gray sm" id="lv-re">🔄 إعادة الاتصال</button><button class="btn danger sm" onclick="closeModal()">✖ إغلاق</button></div>');
   var a=$('lv-a');
-  LV={sid:sid,a:a,timer:null};
-  var st=function(t){var e=$('lv-st');if(e)e.textContent=t;};
+  LV={sid:sid,a:a,timer:null,t2:null,errs:0};
+  var st=function(t){if(!LV||LV.a!==a)return;var e=$('lv-st');if(e)e.textContent=t;};
   var conn=function(){
+    try{a.playbackRate=1;}catch(e){}
     a.src='/api/rec/live/'+encodeURIComponent(sid)+'/stream?t='+Date.now();
     var p=a.play();if(p&&p.catch)p.catch(function(){st('اضغط تشغيل ▶️ لبدء الصوت');});
   };
-  a.addEventListener('playing',function(){st('🔴 مباشر الحين');});
+  a.addEventListener('playing',function(){if(LV&&LV.a===a)LV.errs=0;st('🔴 مباشر الحين');});
   a.addEventListener('waiting',function(){st('⏳ يحمّل الصوت...');});
-  a.addEventListener('error',function(){st('⚠️ انقطع البث — اضغط إعادة الاتصال');});
+  a.addEventListener('error',function(){
+    if(!LV||LV.a!==a)return;
+    if(LV.errs<5){LV.errs++;st('⚠️ انقطع البث — جاري إعادة الاتصال...');setTimeout(function(){if(LV&&LV.a===a&&$('lv-a')===a)conn();},1500);}
+    else st('⚠️ انقطع البث — اضغط إعادة الاتصال');
+  });
   a.addEventListener('ended',function(){st('⚫ انتهى البث (الجلسة خلصت أو انقطع الاتصال)');});
-  $('lv-re').onclick=conn;
+  $('lv-re').onclick=function(){if(LV)LV.errs=0;conn();};
+  // لو تراكم صوت قدّام (بسبب تأخير القطع) نسرّع التشغيل شوي لين نلحق الحاضر — بدون ما نتخطى أي كلام
+  LV.t2=setInterval(function(){
+    if(!LV||LV.a!==a||a.paused)return;
+    try{
+      var bf=a.buffered;if(!bf||!bf.length)return;
+      var d=bf.end(bf.length-1)-a.currentTime,r=a.playbackRate;
+      if(d>4)r=1.5;else if(d>2.5)r=1.3;else if(d>1.5)r=1.15;else if(d<0.7)r=1;
+      if(r!==a.playbackRate)a.playbackRate=r;
+    }catch(e){}
+  },400);
   conn();
   var poll=async function(){
     if(!LV||LV.sid!==sid)return;
@@ -2737,8 +3087,11 @@ async function recDel(id,isMain){
     var me=await api('/api/me');S.presence=me.presence;S.level=me.user.level||'view';S.meId=me.user.id;S.recAdmin=!!me.recAdmin;S.logDel=!!me.logDel;
     $('uchip').innerHTML='<img src="'+esc(me.user.avatar)+'" alt=""><span>'+esc(me.user.tag)+'</span><a class="btn sm gray" href="/auth/logout">خروج</a>';
     buildNav();render();
+    if(S.level==='full')loadNotices();
+    if(me.openOp)openEv(me.openOp);
     try{
       var es=S.es=new EventSource('/api/events/stream');
+      es.addEventListener('notice',function(e){try{noticeEnqueue(JSON.parse(e.data));}catch(x){}});
       es.addEventListener('changed',function(){ if(S.page==='logs')loadEvents(true); });
       es.addEventListener('dismissed',function(){showDismissed();});
       es.addEventListener('evdeleted',function(e){
@@ -2751,7 +3104,7 @@ async function recDel(id,isMain){
       });
       es.addEventListener('access',function(e){
         try{var d=JSON.parse(e.data);
-          if(d.level&&d.level!==S.level){S.level=d.level;if(S.page==='members'&&d.level!=='full')S.page='logs';closeModal();buildNav();render();toast(d.level==='full'?'تمت ترقيتك — صارت عندك صلاحية التعديل':'تغيّرت صلاحيتك إلى عرض فقط');}
+          if(d.level&&d.level!==S.level){S.level=d.level;if(S.page==='members'&&d.level!=='full'&&d.level!=='mgr')S.page='logs';closeModal();buildNav();render();toast(d.level==='full'?'تمت ترقيتك — صارت عندك صلاحية التعديل':d.level==='mgr'?'صرت مسؤول أفراد الأمن السيبراني — انفتحت لك صفحة الأعضاء':'تغيّرت صلاحيتك إلى عرض فقط');if(d.level==='full')loadNotices();}
         }catch(x){}
       });
     }catch(e){}
@@ -2775,9 +3128,14 @@ function appPage() {
 }
 
 app.get("/", (req, res) => {
+    const op = String(req.query.op || "");
+    if (/^[a-f0-9]{24}$/i.test(op)) {
+        req.session.openOp = op;
+        return req.session.save(() => res.redirect("/"));
+    }
     if (req.session.user) return res.send(appPage());
     const mode = req.query.denied ? "denied" : req.query.err ? "err" : "login";
-    res.send(loginPage(mode));
+    res.send(loginPage(mode, String(req.query.err || "")));
 });
 app.get("/healthz", (req, res) => res.send("ok"));
 
