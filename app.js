@@ -18,7 +18,6 @@ const CONFIG = {
     DISCORD_CALLBACK_URL: process.env.DISCORD_CALLBACK_URL || "",   // مثال: https://xxx.com/auth/discord/callback
     MONGO_URI: process.env.MONGO_URI || "",
     SESSION_SECRET: process.env.SESSION_SECRET || "غيّر_هذا_السر_2026",
-    BOT_TOKEN: process.env.BOT_TOKEN || "",   // يُستخدم فقط لصفحة «الرومات» (قراءة/حذف الرسائل وإعادة هيكلة الرومات)
     // اختياري: لو عنوان الاستضافة محظور من ديسكورد (Cloudflare 1015) مرّر طلبات ديسكورد عبر Cloudflare Worker (ملف discord-proxy-worker.js)
     DISCORD_API_BASE: (process.env.DISCORD_API_BASE || "https://discord.com/api").replace(/\/+$/, ""),   // مثال: https://xxxx.workers.dev/api
     DISCORD_PROXY_KEY: process.env.DISCORD_PROXY_KEY || "",
@@ -1251,105 +1250,33 @@ app.post("/api/members/:id/dismiss", auth, full, wrap(async (req, res) => {
 
 // ══════════════════════════════════════════════════════════════════════════
 // صفحة «الرومات» — لصاحب الصفحة فقط (نفس REC_ADMIN_ID)
-// تعرض كل رومات السيرفر، تفتح رسايل أي روم، تحذف رسالة رسالة، أو تحذف الكل
-// (حذف الكل = ينشئ نسخة جديدة من الروم بنفس الإعدادات والصلاحيات، يحذف القديم، ويكتب البوت فيها رسالة).
-// تشتغل مباشرة بتوكن البوت (BOT_TOKEN) — البوت لازم يملك: عرض القنوات + قراءة سجل الرسائل + إدارة الرسائل + إدارة القنوات.
-// اختياري: GUILD_ID بالـ Environment Variables لو البوت داخل أكثر من سيرفر.
+// الموقع ما عنده أي توكن: كل شي ينفّذه البوت على استضافته عن طريق جدول CyberRecJob (نفس طريقة بوت تسجيل الرومات)
+// أوامر البوت: chan_list / chan_messages / chan_delete_msg / chan_wipe  (الكود جاهز بملف bot_rooms_module.js)
 // ══════════════════════════════════════════════════════════════════════════
-const CH_WIPE_TEXT = "تم حذف وإعادة هيكلة هذا الروم";
-const CH_TYPES = { 0: "💬", 5: "📢", 2: "🔊", 13: "🎤" };      // نص / إعلانات / صوتي / ستيج (كلها فيها رسائل)
-let chGuild = { id: process.env.GUILD_ID || "", at: 0 };
-function chNeedToken() { if (!CONFIG.BOT_TOKEN) { const e = new Error("توكن البوت ناقص — حط BOT_TOKEN بالـ Environment Variables"); e.status = 503; throw e; } }
-function chErr(e) {
-    const m = { 50001: "البوت ما يشوف هذا الروم (ينقصه صلاحية عرض القناة)", 50013: "البوت ينقصه صلاحية (إدارة الرسائل / إدارة القنوات / قراءة سجل الرسائل)", 10003: "الروم غير موجود (يمكن انحذف)", 10008: "الرسالة غير موجودة (يمكن انحذفت)", 50074: "ديسكورد يمنع حذف هذا الروم (روم أساسي للمجتمع)" };
-    const x = new Error(m[e.code] || e.message || "صار خطأ"); x.status = e.status || (m[e.code] ? 403 : 500); return x;
-}
-async function chGetGuildId() {
-    if (chGuild.id) return chGuild.id;
-    const gs = await discordApi("/users/@me/guilds", "GET");
-    if (!Array.isArray(gs) || !gs.length) { const e = new Error("البوت مو داخل أي سيرفر"); e.status = 404; throw e; }
-    chGuild = { id: String(gs[0].id), at: Date.now() };
-    if (gs.length > 1) console.warn("⚠️ البوت بأكثر من سيرفر — استخدمت الأول (" + gs[0].name + "). حدد GUILD_ID بالـ Environment لتحديد السيرفر.");
-    return chGuild.id;
-}
-// يتأكد إن الروم تابع لسيرفرنا ونوعه فيه رسائل
-async function chGetOwn(id) {
-    if (!/^\d{5,25}$/.test(String(id || ""))) { const e = new Error("روم غير صحيح"); e.status = 400; throw e; }
-    const gid = await chGetGuildId();
-    let c; try { c = await discordApi("/channels/" + id, "GET"); } catch (e) { throw chErr(e); }
-    if (String(c.guild_id) !== String(gid) || CH_TYPES[c.type] == null) { const e = new Error("هذا الروم غير مدعوم"); e.status = 400; throw e; }
-    return c;
-}
-app.get("/api/chans", auth, recAdmin, wrap(async (req, res) => {
-    chNeedToken();
-    const gid = await chGetGuildId();
-    let list; try { list = await discordApi("/guilds/" + gid + "/channels", "GET"); } catch (e) { throw chErr(e); }
-    const cats = new Map(list.filter(c => c.type === 4).map(c => [c.id, c.name]));
-    const out = list.filter(c => CH_TYPES[c.type] != null).map(c => ({
-        id: c.id, name: c.name, icon: CH_TYPES[c.type], type: c.type,
-        parent: c.parent_id ? (cats.get(c.parent_id) || "") : "", pos: c.position || 0,
-        ppos: c.parent_id && cats.has(c.parent_id) ? ((list.find(x => x.id === c.parent_id) || {}).position || 0) : -1,
-    }));
-    out.sort((a, b) => (a.ppos - b.ppos) || (a.parent > b.parent ? 1 : a.parent < b.parent ? -1 : 0) || (a.pos - b.pos));
-    res.json({ channels: out });
-}));
+const chId = v => /^\d{5,25}$/.test(String(v || ""));
+app.get("/api/chans", auth, recAdmin, wrap(async (req, res) => res.json(await callRecBot("chan_list", recWho(req), 30000))));
 app.get("/api/chans/:id/messages", auth, recAdmin, wrap(async (req, res) => {
-    chNeedToken();
-    const c = await chGetOwn(req.params.id);
-    const before = /^\d{5,25}$/.test(String(req.query.before || "")) ? "&before=" + req.query.before : "";
-    let ms; try { ms = await discordApi("/channels/" + c.id + "/messages?limit=100" + before, "GET"); } catch (e) { throw chErr(e); }
-    res.json({
-        channel: { id: c.id, name: c.name, icon: CH_TYPES[c.type] },
-        more: ms.length === 100,
-        messages: ms.map(m => ({
-            id: m.id, at: m.timestamp, edited: !!m.edited_timestamp, content: m.content || "",
-            author: { id: m.author && m.author.id, tag: m.author ? (m.author.global_name || m.author.username) : "؟", bot: !!(m.author && m.author.bot),
-                avatar: m.author && m.author.avatar ? "https://cdn.discordapp.com/avatars/" + m.author.id + "/" + m.author.avatar + ".png?size=64" : "" },
-            files: (m.attachments || []).map(a => ({ name: a.filename, url: a.url, img: /^image\//.test(a.content_type || "") })),
-            embeds: (m.embeds || []).map(e => clip([e.title, e.description].filter(Boolean).join(" — "), 300)).filter(Boolean),
-            sys: m.type !== 0 && m.type !== 19 && m.type !== 20,
-        })),
-    });
+    if (!chId(req.params.id)) return res.status(400).json({ error: "روم غير صحيح" });
+    const before = chId(req.query.before) ? String(req.query.before) : "";
+    res.json(await callRecBot("chan_messages", { id: req.params.id, before, ...recWho(req) }, 40000));
 }));
 app.delete("/api/chans/:id/messages/:mid", auth, recAdmin, wrap(async (req, res) => {
-    chNeedToken();
-    const mid = String(req.params.mid || "");
-    if (!/^\d{5,25}$/.test(mid)) return res.status(400).json({ error: "رسالة غير صحيحة" });
-    const c = await chGetOwn(req.params.id);
-    try { await discordApi("/channels/" + c.id + "/messages/" + mid, "DELETE"); } catch (e) { if (e.code !== 10008) throw chErr(e); }
+    if (!chId(req.params.id) || !chId(req.params.mid)) return res.status(400).json({ error: "معرّف غير صحيح" });
+    await callRecBot("chan_delete_msg", { id: req.params.id, mid: req.params.mid, ...recWho(req) }, 30000);
     res.json({ ok: true });
 }));
-// حذف كل رسائل الروم = إعادة هيكلته: ننشئ نسخة جديدة بنفس الإعدادات والصلاحيات والمكان، نحذف القديم، والبوت يكتب رسالة بالجديد
+// حذف كل الرسائل = البوت ينشئ نسخة جديدة من الروم بنفس الإعدادات والصلاحيات والمكان، يحذف القديم، ويكتب فيها «تم حذف وإعادة هيكلة هذا الروم»
 app.post("/api/chans/:id/wipe", auth, recAdmin, wrap(async (req, res) => {
-    chNeedToken();
-    const c = await chGetOwn(req.params.id);
-    const gid = await chGetGuildId();
-    const body = { name: c.name, type: c.type, position: c.position, parent_id: c.parent_id || null,
-        permission_overwrites: (c.permission_overwrites || []).map(o => ({ id: o.id, type: o.type, allow: o.allow, deny: o.deny })) };
-    for (const k of ["topic", "nsfw", "rate_limit_per_user", "bitrate", "user_limit", "rtc_region", "video_quality_mode", "default_auto_archive_duration"]) if (c[k] != null) body[k] = c[k];
-    let nc;
-    try { nc = await discordApi("/guilds/" + gid + "/channels", "POST", body); } catch (e) { throw chErr(e); }       // ننشئ الجديد أول — لو فشل ما ننحذف القديم
-    try { await discordApi("/channels/" + c.id, "DELETE"); }
-    catch (e) { try { await discordApi("/channels/" + nc.id, "DELETE"); } catch { } throw chErr(e); }                // لو القديم ما انحذف نشيل الجديد عشان ما يتكرر الروم
-    let sent = true;
-    try { await discordApi("/channels/" + nc.id + "/messages", "POST", { content: CH_WIPE_TEXT }); } catch (e) { sent = false; console.error("wipe msg:", e.message); }
-    await panelLog(req, "حذف وإعادة هيكلة روم", "الروم: #" + c.name + (sent ? "" : "\n⚠️ تم، لكن ما انكتبت رسالة بالروم الجديد"), { targetId: nc.id, targetTag: c.name });
-    res.json({ ok: true, newId: nc.id, sent });
+    if (!chId(req.params.id)) return res.status(400).json({ error: "روم غير صحيح" });
+    const r = await callRecBot("chan_wipe", { id: req.params.id, text: "تم حذف وإعادة هيكلة هذا الروم", ...recWho(req) }, 90000);
+    await panelLog(req, "حذف وإعادة هيكلة روم", "الروم: #" + (r.name || req.params.id) + (r.sent ? "" : "\n⚠️ تم، لكن ما انكتبت رسالة بالروم الجديد"), { targetId: r.newId || req.params.id, targetTag: r.name || "" });
+    res.json({ ok: true, newId: r.newId, sent: !!r.sent });
 }));
 
 // ══════════════════════════════════════════════════════════════════════════
 // إشعارات القيادة: نافذة منبثقة بالموقع فقط (بدون رسائل خاصة)
 // ══════════════════════════════════════════════════════════════════════════
 const clip = (t, n) => { t = String(t == null ? "" : t).trim(); return t.length > n ? t.slice(0, n - 1) + "…" : t; };
-async function discordApi(path, method, body) {
-    for (let i = 0; i < 2; i++) {
-        const r = await fetch(CONFIG.DISCORD_API_BASE + "/v10" + path, { method, headers: { ...(CONFIG.DISCORD_PROXY_KEY ? { "x-proxy-key": CONFIG.DISCORD_PROXY_KEY } : {}), Authorization: "Bot " + CONFIG.BOT_TOKEN, "Content-Type": "application/json" }, body: body ? JSON.stringify(body) : undefined });
-        const j = await r.json().catch(() => ({}));
-        if (r.status === 429 && i === 0) { await sleep(Math.min(5000, Math.ceil((j.retry_after || 1) * 1000))); continue; }
-        if (!r.ok) { const e = new Error(j.message || ("Discord " + r.status)); e.code = j.code; throw e; }
-        return j;
-    }
-}
 function noticePublic(n) {
     return { id: String(n._id), type: n.type, eventId: n.eventId || null, eventTitle: n.eventTitle || "", eventDetails: n.eventDetails || "", subjectId: n.subjectId || null, subjectTag: n.subjectTag || "", reason: n.reason || "", senderId: n.senderId, senderTag: n.senderTag, senderAvatar: n.senderAvatar || "", createdAt: n.createdAt, canAllow: n.type === "op" && n.rule === "new_account" && !n.allowedBy };
 }
