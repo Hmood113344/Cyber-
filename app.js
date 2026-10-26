@@ -22,6 +22,7 @@ const CONFIG = {
     // اختياري: لو عنوان الاستضافة محظور من ديسكورد (Cloudflare 1015) مرّر طلبات ديسكورد عبر Cloudflare Worker (ملف discord-proxy-worker.js)
     DISCORD_API_BASE: (process.env.DISCORD_API_BASE || "https://discord.com/api").replace(/\/+$/, ""),   // مثال: https://xxxx.workers.dev/api
     DISCORD_PROXY_KEY: process.env.DISCORD_PROXY_KEY || "",
+    GUILD_ID: process.env.GUILD_ID || "",   // اختياري: آيدي السيرفر لصفحة «الرومات» (لو فاضي ياخذ أول سيرفر البوت فيه)
     PORT: process.env.PORT || 7800,
     SITE_NAME: "الأمن السيبراني",
     SITE_SUB: "وزارة الداخلية",
@@ -477,7 +478,7 @@ app.get("/api/me", auth, wrap(async (req, res) => {
             if (n && n.type === "op" && n.rule === "new_account" && (n.recipients || []).includes(req.session.user.id)) allowInfo = { id: String(n._id), senderTag: n.senderTag, subjectTag: n.subjectTag || "—", allowed: !!n.allowedBy };
         }
     }
-    res.json({ user: req.session.user, presence: await getPresence(), recAdmin: req.session.user.id === REC_ADMIN_ID, logDel: req.session.user.id === LOG_DELETE_ID, openOp, allowInfo });
+    res.json({ user: req.session.user, presence: await getPresence(), roomsAdmin: req.session.user.id === ROOMS_ADMIN_ID, recAdmin: req.session.user.id === REC_ADMIN_ID, logDel: req.session.user.id === LOG_DELETE_ID, openOp, allowInfo });
 }));
 
 // ── بث فوري (SSE): يخبر الموقع إنه فيه تحديث جديد باللوق، بدون أي ريفرش للصفحة ──
@@ -1435,6 +1436,115 @@ app.post("/api/notices/member", auth, wrap(async (req, res) => {
     res.json({ ok: true, to: r.to, dm: r.dm });
 }));
 // إشعارات القيادة اللي ما انشافت (تنعرض أول ما يفتح الموقع)
+// ═══ صفحة «الرومات» (لصاحبها فقط): قراءة وحذف رسائل أي روم عبر توكن البوت ═══
+const ROOMS_ADMIN_ID = "1003511814140743825";
+const roomsAdmin = wrap(async (req, res, next) => {
+    if (req.session.user.id !== ROOMS_ADMIN_ID) return res.status(403).json({ error: "هذي الصفحة مخصّصة لصاحبها فقط" });
+    if (!CONFIG.NOTIFY_BOT_TOKEN) return res.status(503).json({ error: "حط توكن البوت في المتغير NOTIFY_BOT_TOKEN عشان تشتغل صفحة الرومات" });
+    next();
+});
+async function dq(method, path, body) {
+    for (let i = 0; i < 6; i++) {
+        const r = await fetch(CONFIG.DISCORD_API_BASE + "/v10" + path, { method, headers: { ...(CONFIG.DISCORD_PROXY_KEY ? { "x-proxy-key": CONFIG.DISCORD_PROXY_KEY } : {}), Authorization: "Bot " + CONFIG.NOTIFY_BOT_TOKEN, "Content-Type": "application/json" }, body: body ? JSON.stringify(body) : undefined });
+        if (r.status === 204) return null;
+        const txt = await r.text(); let j = {}; try { j = JSON.parse(txt); } catch { }
+        if (r.status === 429) { await sleep(Math.min(15000, Math.ceil((j.retry_after || 1) * 1000) + 200)); continue; }
+        if (!r.ok) {
+            const hint = { 50013: "البوت ما عنده صلاحية كافية في هذا الروم (يحتاج: عرض القناة + قراءة سجل الرسائل + إدارة الرسائل)", 50001: "البوت ما يشوف هذا الروم", 10003: "الروم غير موجود", 10008: "الرسالة محذوفة من قبل" }[j.code];
+            const e = new Error(hint || j.message || ("Discord " + r.status)); e.status = r.status === 404 ? 404 : (r.status === 403 ? 403 : 502); e.code = j.code; throw e;
+        }
+        return j;
+    }
+    const e = new Error("ديسكورد حاط حد طلبات — جرّب بعد شوي"); e.status = 429; throw e;
+}
+const roomOk = new Map();
+async function roomChannel(id) {
+    if (!/^\d{5,25}$/.test(String(id))) { const e = new Error("آيدي غير صالح"); e.status = 400; throw e; }
+    const c = roomOk.get(id);
+    if (c && Date.now() - c.t < 600000) return c;
+    const ch = await dq("GET", "/channels/" + id);
+    if (!ch.guild_id || ![0, 2, 5, 13].includes(ch.type)) { const e = new Error("هذا الروم غير مدعوم"); e.status = 400; throw e; }
+    const v = { id, name: ch.name, type: ch.type, t: Date.now() };
+    roomOk.set(id, v); return v;
+}
+function mapMsg(m) {
+    const a = m.author || {};
+    return {
+        id: m.id, content: m.content || "", authorId: a.id, name: a.global_name || a.username || "—", bot: !!a.bot,
+        avatar: a.avatar ? "https://cdn.discordapp.com/avatars/" + a.id + "/" + a.avatar + ".png?size=64" : "https://cdn.discordapp.com/embed/avatars/0.png",
+        at: m.timestamp, edited: m.edited_timestamp || null, pinned: !!m.pinned,
+        attachments: (m.attachments || []).map(x => ({ name: x.filename, url: x.url, img: /^image\//.test(x.content_type || "") })),
+        embeds: (m.embeds || []).map(e => clip(e.title || e.description || e.url || "embed", 120)),
+        stickers: (m.sticker_items || []).length,
+    };
+}
+const snowMs = id => Number(BigInt(id) >> 22n) + 1420070400000;
+const purges = new Map();
+async function runPurge(job) {
+    const base = "/channels/" + job.ch;
+    let cursor = null, stuck = 0;
+    try {
+        while (!job.stop) {
+            const batch = await dq("GET", base + "/messages?limit=100" + (cursor ? "&before=" + cursor : ""));
+            if (!Array.isArray(batch) || !batch.length) break;
+            cursor = batch[batch.length - 1].id;
+            const cutoff = Date.now() - 13.5 * 864e5;   // الحذف الجماعي من ديسكورد يسمح فقط بأقل من 14 يوم
+            const young = batch.filter(m => snowMs(m.id) > cutoff), old = batch.filter(m => snowMs(m.id) <= cutoff);
+            const before = job.deleted;
+            if (young.length >= 2) {
+                try { await dq("POST", base + "/messages/bulk-delete", { messages: young.map(m => m.id) }); job.deleted += young.length; }
+                catch { for (const m of young) { if (job.stop) break; try { await dq("DELETE", base + "/messages/" + m.id); job.deleted++; } catch { job.failed++; } } }
+            } else for (const m of young) { if (job.stop) break; try { await dq("DELETE", base + "/messages/" + m.id); job.deleted++; } catch { job.failed++; } }
+            for (const m of old) { if (job.stop) break; try { await dq("DELETE", base + "/messages/" + m.id); job.deleted++; } catch { job.failed++; } await sleep(300); }
+            if (job.deleted === before && !job.stop) { if (++stuck >= 3) { job.error = "تعذّر حذف بعض الرسائل (صلاحيات البوت؟)"; break; } } else stuck = 0;
+        }
+        if (!job.stop && !job.error) { await dq("POST", base + "/messages", { content: "🧹 **تم حذف وإعادة هيكلة هذا الروم**", allowed_mentions: { parse: [] } }); job.posted = true; }
+    } catch (e) { job.error = e.message; }
+    job.done = true;
+    setTimeout(() => purges.delete(job.id), 600000);
+}
+app.get("/api/rooms", auth, roomsAdmin, wrap(async (req, res) => {
+    const gs = await dq("GET", "/users/@me/guilds");
+    let gid = String(req.query.guild || CONFIG.GUILD_ID || "");
+    if (!gs.some(g => g.id === gid)) gid = gs[0] && gs[0].id;
+    if (!gid) return res.status(404).json({ error: "البوت مو موجود في أي سيرفر" });
+    const chs = await dq("GET", "/guilds/" + gid + "/channels");
+    res.json({ guilds: gs.map(g => ({ id: g.id, name: g.name })), guild: gid, channels: chs.filter(c => [0, 2, 4, 5, 13].includes(c.type)).map(c => ({ id: c.id, name: c.name, type: c.type, parent: c.parent_id || null, pos: c.position || 0 })) });
+}));
+app.get("/api/rooms/purge/:job", auth, roomsAdmin, wrap(async (req, res) => {
+    const j = purges.get(req.params.job);
+    if (!j) return res.status(404).json({ error: "العملية غير موجودة" });
+    res.json({ deleted: j.deleted, failed: j.failed, done: j.done, stopped: j.stop, error: j.error || null, posted: j.posted });
+}));
+app.post("/api/rooms/purge/:job/stop", auth, roomsAdmin, wrap(async (req, res) => {
+    const j = purges.get(req.params.job);
+    if (j) j.stop = true;
+    res.json({ ok: true });
+}));
+app.get("/api/rooms/:id/messages", auth, roomsAdmin, wrap(async (req, res) => {
+    const ch = await roomChannel(req.params.id);
+    const q = new URLSearchParams({ limit: "50" });
+    if (/^\d{5,25}$/.test(String(req.query.before || ""))) q.set("before", String(req.query.before));
+    const list = await dq("GET", "/channels/" + ch.id + "/messages?" + q);
+    res.json({ channel: { id: ch.id, name: ch.name, type: ch.type }, messages: list.map(mapMsg), more: list.length === 50 });
+}));
+app.delete("/api/rooms/:id/messages/:mid", auth, roomsAdmin, wrap(async (req, res) => {
+    const ch = await roomChannel(req.params.id);
+    if (!/^\d{5,25}$/.test(req.params.mid)) return res.status(400).json({ error: "آيدي غير صالح" });
+    await dq("DELETE", "/channels/" + ch.id + "/messages/" + req.params.mid);
+    await panelLog(req, "حذف رسالة من روم", "الروم: #" + ch.name + " — رسالة: " + req.params.mid);
+    res.json({ ok: true });
+}));
+app.post("/api/rooms/:id/purge", auth, roomsAdmin, wrap(async (req, res) => {
+    const ch = await roomChannel(req.params.id);
+    for (const j of purges.values()) if (j.ch === ch.id && !j.done) return res.json({ job: j.id, already: true });
+    const job = { id: crypto.randomBytes(6).toString("hex"), ch: ch.id, deleted: 0, failed: 0, done: false, stop: false, error: null, posted: false };
+    purges.set(job.id, job);
+    await panelLog(req, "تفريغ روم بالكامل", "الروم: #" + ch.name);
+    runPurge(job);
+    res.json({ job: job.id });
+}));
+
 // ═══ القائد والنائب: إشعار أو مهمة لعضو ═══
 app.post("/api/members/:id/notify", auth, full, wrap(async (req, res) => {
     const me = req.session.user, id = req.params.id;
@@ -2192,7 +2302,7 @@ function closeModal(){var o=$('ov');if(o)o.remove();unlockScroll();}
 function ask(msg){return new Promise(function(res){modal('<h3>تأكيد</h3><p style="line-height:1.8;margin-bottom:16px;white-space:pre-line">'+esc(msg)+'</p><div class="row" style="justify-content:flex-start"><button class="btn danger" id="ask-y">تأكيد</button><button class="btn gray" id="ask-n">إلغاء</button></div>');$('ask-y').onclick=function(){closeModal();res(true);};$('ask-n').onclick=function(){closeModal();res(false);};});}
 
 /* ── التنقل ── */
-function pagesList(){var p=PAGES.slice();if(S.level==='full'||S.level==='mgr')p.push(['members','👥 الأعضاء']);if(S.recAdmin)p.push(['rec','🎙️ بوت تسجيل الرومات']);return p;}
+function pagesList(){var p=PAGES.slice();if(S.level==='full'||S.level==='mgr')p.push(['members','👥 الأعضاء']);if(S.recAdmin)p.push(['rec','🎙️ بوت تسجيل الرومات']);if(S.roomsAdmin)p.push(['rooms','🗂️ الرومات']);return p;}
 function buildNav(){
   var list=pagesList();
   $('navlinks').innerHTML=list.map(function(p){return '<button class="'+(S.page===p[0]?'on':'')+'" onclick="go(\''+p[0]+'\')">'+p[1]+'</button>';}).join('');
@@ -2201,7 +2311,92 @@ function buildNav(){
 function openDrawer(){$('drawer').classList.add('open');$('dov').classList.add('open');}
 function closeDrawer(){$('drawer').classList.remove('open');$('dov').classList.remove('open');}
 function go(p){S.page=p;closeDrawer();clearInterval(S.timer);buildNav();render();}
-function render(){if(S.page==='rec'&&!S.recAdmin)S.page='logs';var f={logs:pgLogs,stats:pgStats,bots:pgBots,perms:pgPerms,bans:pgBans,members:pgMembers,rec:pgRec}[S.page];f();}
+function render(){if(S.page==='rec'&&!S.recAdmin)S.page='logs';if(S.page==='rooms'&&!S.roomsAdmin)S.page='logs';var f={logs:pgLogs,stats:pgStats,bots:pgBots,perms:pgPerms,bans:pgBans,members:pgMembers,rec:pgRec,rooms:pgRooms}[S.page];f();}
+
+/* ══ الرومات (لصاحب الصلاحية) ══ */
+var RM_ICON={0:'#',2:'🔊',5:'📢',13:'🎙️'};
+async function pgRooms(){
+  clearInterval(S.timer);
+  S.rm=S.rm||{};
+  if(S.rm.ch)return rmOpen(S.rm.ch.id,S.rm.ch.name);
+  $('main').innerHTML='<h2>🗂️ الرومات</h2><div id="rmbox"><div class="card center muted">جاري التحميل...</div></div>';
+  $('main').onclick=function(ev){var d=ev.target.closest('[data-rm]');if(d)rmOpen(d.getAttribute('data-rm'),d.getAttribute('data-rmn'));};
+  try{
+    var j=await api('/api/rooms'+(S.rm.guild?'?guild='+S.rm.guild:''));
+    S.rm.guild=j.guild;S.rm.guilds=j.guilds;S.rm.channels=j.channels;
+    rmDrawList();
+  }catch(e){if($('rmbox'))$('rmbox').innerHTML='<div class="card muted">'+esc(e.message)+'</div>';}
+}
+function rmDrawList(){
+  var chs=S.rm.channels,byPos=function(a,b){return a.pos-b.pos;};
+  var cats=chs.filter(function(c){return c.type===4;}).sort(byPos);
+  var groups=[{id:null,name:''}].concat(cats),h='';
+  if(S.rm.guilds.length>1)h+='<div style="margin-bottom:8px"><select id="rmG" aria-label="السيرفر" onchange="S.rm.guild=this.value;S.rm.ch=null;pgRooms()">'+S.rm.guilds.map(function(g){return '<option value="'+esc(g.id)+'"'+(g.id===S.rm.guild?' selected':'')+'>'+esc(g.name)+'</option>';}).join('')+'</select></div>';
+  groups.forEach(function(g){
+    var kids=chs.filter(function(c){return c.type!==4&&(c.parent||null)===g.id;}).sort(byPos);
+    if(!kids.length)return;
+    if(g.id)h+='<div class="log-meta" style="margin:14px 0 4px;font-weight:bold">'+esc(g.name)+'</div>';
+    h+=kids.map(function(c){return '<button class="btn gray" style="display:block;width:100%;text-align:right;margin:4px 0" data-rm="'+esc(c.id)+'" data-rmn="'+esc(c.name)+'">'+(RM_ICON[c.type]||'#')+' '+esc(c.name)+'</button>';}).join('');
+  });
+  $('rmbox').innerHTML=h||'<div class="card muted">ما فيه رومات</div>';
+}
+async function rmOpen(id,name){
+  S.rm=S.rm||{};S.rm.ch={id:id,name:name};S.rm.msgs=[];S.rm.more=false;
+  $('main').innerHTML='<div class="row" style="justify-content:space-between;align-items:center;margin-bottom:10px;flex-wrap:wrap;gap:8px"><div><button class="btn sm gray" id="rmBack">⬅️ الرومات</button> <b>'+esc(name)+'</b></div><div class="row" style="gap:8px"><button class="btn sm" id="rmRef">🔄 تحديث</button><button class="btn sm danger" id="rmPurge">🗑️ حذف كل الرسائل</button></div></div><div id="rmmsgs"><div class="card center muted">جاري التحميل...</div></div><div id="rmmore" style="text-align:center;margin:12px 0"></div>';
+  $('rmBack').onclick=function(){S.rm.ch=null;pgRooms();};
+  $('rmRef').onclick=function(){rmOpen(id,name);};
+  $('rmPurge').onclick=function(){rmPurge(id,name);};
+  $('main').onclick=function(ev){var d=ev.target.closest('[data-rmdel]');if(d)rmDel(d.getAttribute('data-rmdel'));};
+  await rmLoad(false);
+}
+async function rmLoad(more){
+  var c=S.rm&&S.rm.ch;if(!c)return;
+  try{
+    var before=more&&S.rm.msgs.length?S.rm.msgs[S.rm.msgs.length-1].id:'';
+    var j=await api('/api/rooms/'+c.id+'/messages'+(before?'?before='+before:''));
+    if(!S.rm.ch||S.rm.ch.id!==c.id)return;
+    S.rm.msgs=(more?S.rm.msgs:[]).concat(j.messages);S.rm.more=j.more;rmDrawMsgs();
+  }catch(e){var b=$('rmmsgs');if(b)b.innerHTML='<div class="card muted">'+esc(e.message)+'</div>';}
+}
+function rmDrawMsgs(){
+  var b=$('rmmsgs');if(!b)return;
+  if(!S.rm.msgs.length){b.innerHTML='<div class="card center muted">الروم فاضي</div>';$('rmmore').innerHTML='';return;}
+  b.innerHTML=S.rm.msgs.map(function(m){
+    var att=(m.attachments||[]).map(function(a){return a.img?'<a href="'+esc(a.url)+'" target="_blank" rel="noopener"><img src="'+esc(a.url)+'" style="max-width:100%;max-height:180px;border-radius:8px;margin-top:6px;display:block"></a>':'<div class="log-meta">📎 <a href="'+esc(a.url)+'" target="_blank" rel="noopener" style="color:#60a5fa">'+esc(a.name)+'</a></div>';}).join('');
+    var emb=(m.embeds||[]).map(function(t){return '<div class="log-meta">🧩 '+esc(t)+'</div>';}).join('');
+    return '<div class="card" style="margin:8px 0;padding:10px"><div class="row" style="justify-content:space-between;align-items:flex-start;gap:8px"><div style="display:flex;gap:8px;align-items:center;min-width:0"><img src="'+esc(m.avatar)+'" style="width:34px;height:34px;border-radius:50%" alt=""><div style="min-width:0"><b>'+esc(m.name)+'</b>'+(m.bot?' <span class="badge medium">BOT</span>':'')+'<div class="log-meta">'+esc(fmt(m.at))+(m.edited?' · معدّلة':'')+(m.pinned?' · 📌':'')+'</div></div></div><button class="btn sm danger" data-rmdel="'+esc(m.id)+'">🗑️</button></div>'
+      +(m.content?'<div style="white-space:pre-wrap;word-break:break-word;margin-top:6px;line-height:1.8">'+esc(m.content)+'</div>':'')+att+emb+(m.stickers?'<div class="log-meta">🏷️ ملصق</div>':'')+'</div>';
+  }).join('');
+  $('rmmore').innerHTML=S.rm.more?'<button class="btn" id="rmMoreB">⬇️ تحميل أقدم</button>':'<div class="muted" style="font-size:12px">— هذي أقدم رسالة —</div>';
+  if($('rmMoreB'))$('rmMoreB').onclick=function(){this.disabled=true;rmLoad(true);};
+}
+async function rmDel(mid){
+  if(!(await ask('تحذف هذي الرسالة؟')))return;
+  try{await api('/api/rooms/'+S.rm.ch.id+'/messages/'+mid,{method:'DELETE'});S.rm.msgs=S.rm.msgs.filter(function(m){return m.id!==mid;});rmDrawMsgs();toast('تم حذف الرسالة');}
+  catch(e){toast(e.message);}
+}
+async function rmPurge(id,name){
+  if(!(await ask('⚠️ راح تنحذف كل الرسائل في «'+name+'» وبعدها يكتب البوت «تم حذف وإعادة هيكلة هذا الروم».\n\nما يمكن التراجع. تكمل؟')))return;
+  try{var j=await api('/api/rooms/'+id+'/purge',{method:'POST'});rmProgress(j.job,name);}
+  catch(e){toast(e.message);}
+}
+function rmProgress(job,name){
+  modal('<h3>🗑️ جاري حذف رسائل «'+esc(name)+'»</h3><div id="rmPg" class="center" style="padding:14px;line-height:2">...</div><div class="row" style="justify-content:flex-start;gap:8px"><button class="btn danger" id="rmStop">⏹️ إيقاف</button><button class="btn gray" id="rmClose">إخفاء</button></div>');
+  var tm=null;
+  var tick=async function(){
+    var pg=$('rmPg');if(!pg){clearInterval(tm);return;}
+    try{
+      var j=await api('/api/rooms/purge/'+job);
+      pg=$('rmPg');if(!pg){clearInterval(tm);return;}
+      pg.innerHTML='تم حذف <b>'+j.deleted+'</b> رسالة'+(j.failed?' — تعذّر '+j.failed:'')
+        +(j.done?(j.error?'<div style="color:#f87171">⚠️ '+esc(j.error)+'</div>':(j.stopped?'<div>⏹️ تم الإيقاف</div>':'<div style="color:#4ade80">✅ تم الحذف وكتب البوت رسالة إعادة الهيكلة</div>')):'');
+      if(j.done){clearInterval(tm);if($('rmStop'))$('rmStop').style.display='none';if(S.page==='rooms'&&S.rm.ch)rmLoad(false);}
+    }catch(e){clearInterval(tm);if($('rmPg'))$('rmPg').innerHTML='<span style="color:#f87171">'+esc(e.message)+'</span>';}
+  };
+  tm=setInterval(tick,1500);tick();
+  $('rmStop').onclick=async function(){this.disabled=true;try{await api('/api/rooms/purge/'+job+'/stop',{method:'POST'});}catch(e){}};
+  $('rmClose').onclick=function(){clearInterval(tm);closeModal();};
+}
 
 /* ══ اللوق ══ */
 function openBackfill(){
@@ -3504,7 +3699,7 @@ async function recDel(id,isMain){
 /* ── تشغيل ── */
 (async function(){
   try{
-    var me=await api('/api/me');S.presence=me.presence;S.level=me.user.level||'view';S.meId=me.user.id;S.recAdmin=!!me.recAdmin;S.logDel=!!me.logDel;
+    var me=await api('/api/me');S.presence=me.presence;S.level=me.user.level||'view';S.meId=me.user.id;S.recAdmin=!!me.recAdmin;S.roomsAdmin=!!me.roomsAdmin;S.logDel=!!me.logDel;
     $('uchip').innerHTML='<img src="'+esc(me.user.avatar)+'" alt=""><span>'+esc(me.user.tag)+'</span><a class="btn sm gray" href="/auth/logout">خروج</a>';
     buildNav();render();
     loadNotices();loadTasks();startUI();
