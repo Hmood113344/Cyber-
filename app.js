@@ -19,6 +19,9 @@ const CONFIG = {
     MONGO_URI: process.env.MONGO_URI || "",
     SESSION_SECRET: process.env.SESSION_SECRET || "غيّر_هذا_السر_2026",
     NOTIFY_BOT_TOKEN: process.env.NOTIFY_BOT_TOKEN || process.env.BOT_TOKEN || "",   // نفس توكن بوت الأمن السيبراني — يُستخدم فقط لإرسال إشعارات القيادة بالخاص
+    // اختياري: لو عنوان الاستضافة محظور من ديسكورد (Cloudflare 1015) مرّر طلبات ديسكورد عبر Cloudflare Worker (ملف discord-proxy-worker.js)
+    DISCORD_API_BASE: (process.env.DISCORD_API_BASE || "https://discord.com/api").replace(/\/+$/, ""),   // مثال: https://xxxx.workers.dev/api
+    DISCORD_PROXY_KEY: process.env.DISCORD_PROXY_KEY || "",
     PORT: process.env.PORT || 7800,
     SITE_NAME: "الأمن السيبراني",
     SITE_SUB: "وزارة الداخلية",
@@ -131,10 +134,21 @@ VoiceChunkSchema.index({ sid: 1, uid: 1, seq: 1 });
 const VoiceChunk = mongoose.model("CyberVoiceChunk", VoiceChunkSchema);
 
 // إشعارات القيادة (من عضو عن عملية مشبوهة، أو من مسؤول الأفراد عن عضو) — تظهر منبثقة للقائد والنائب وتوصلهم بالخاص
+// مهام القيادة للأعضاء (العداد يبدأ من لحظة ما العضو يضغط «استلمت المهمة»)
+const Task = mongoose.model("CyberTask", new mongoose.Schema({
+    assignerId: String, assignerTag: String, assignerAvatar: String,
+    targetId: { type: String, index: true }, targetTag: String,
+    text: String, minutes: Number,
+    status: { type: String, default: "pending", index: true },   // pending | active | done | cancelled
+    ackAt: Date, dueAt: Date, doneAt: Date, cancelledBy: String,
+    overdueNotified: { type: Boolean, default: false },
+    createdAt: { type: Date, default: Date.now, index: true, expires: 60 * 60 * 24 * 30 },
+}));
 const Notice = mongoose.model("CyberNotice", new mongoose.Schema({
     type: String,                                   // op | member
     eventId: String, eventTitle: String, eventDetails: String,
     subjectId: String, subjectTag: String, reason: String,
+    rule: String, allowedBy: { type: String, default: null }, allowedByTag: String, allowedAt: Date,   // السماح للعضو بالتعامل مع حالة «حساب جديد»
     senderId: String, senderTag: String, senderAvatar: String,
     recipients: { type: [String], index: true }, seenBy: { type: [String], default: [] },
     dm: { type: mongoose.Schema.Types.Mixed, default: {} },
@@ -380,7 +394,7 @@ const OAUTH_UA = "DiscordBot (https://discord.com, 1.0)";
 async function oauthFetch(kind, url, opt) {
     for (let i = 0; i < 3; i++) {
         let r, txt;
-        try { r = await fetch(url, { ...opt, headers: { Accept: "application/json", "User-Agent": OAUTH_UA, ...(opt.headers || {}) } }); txt = await r.text(); }
+        try { r = await fetch(url.replace("https://discord.com/api", CONFIG.DISCORD_API_BASE), { ...opt, headers: { Accept: "application/json", "User-Agent": OAUTH_UA, ...(CONFIG.DISCORD_PROXY_KEY ? { "x-proxy-key": CONFIG.DISCORD_PROXY_KEY } : {}), ...(opt.headers || {}) } }); txt = await r.text(); }
         catch (e) { console.error("❌ OAuth " + kind + " شبكة:", e.message); if (i < 2) { await sleep(800); continue; } throw new Error(kind + "_network"); }
         let j = {}; try { j = JSON.parse(txt); } catch { }
         const ra = Number(j.retry_after || r.headers.get("retry-after") || 0);
@@ -455,7 +469,15 @@ app.delete("/api/events/:id", auth, wrap(async (req, res) => {
 app.get("/api/me", auth, wrap(async (req, res) => {
     const openOp = req.session.openOp || null;
     if (openOp) delete req.session.openOp;
-    res.json({ user: req.session.user, presence: await getPresence(), recAdmin: req.session.user.id === REC_ADMIN_ID, logDel: req.session.user.id === LOG_DELETE_ID, openOp });
+    let allowInfo = null;
+    if (req.session.openAllow) {
+        const aid = req.session.openAllow; delete req.session.openAllow;
+        if (req.session.user.level === "full" && mongoose.isValidObjectId(aid)) {
+            const n = await Notice.findById(aid).lean().catch(() => null);
+            if (n && n.type === "op" && n.rule === "new_account" && (n.recipients || []).includes(req.session.user.id)) allowInfo = { id: String(n._id), senderTag: n.senderTag, subjectTag: n.subjectTag || "—", allowed: !!n.allowedBy };
+        }
+    }
+    res.json({ user: req.session.user, presence: await getPresence(), recAdmin: req.session.user.id === REC_ADMIN_ID, logDel: req.session.user.id === LOG_DELETE_ID, openOp, allowInfo });
 }));
 
 // ── بث فوري (SSE): يخبر الموقع إنه فيه تحديث جديد باللوق، بدون أي ريفرش للصفحة ──
@@ -1234,7 +1256,7 @@ const SITE_ORIGIN = (() => { try { return new URL(CONFIG.DISCORD_CALLBACK_URL).o
 const clip = (t, n) => { t = String(t == null ? "" : t).trim(); return t.length > n ? t.slice(0, n - 1) + "…" : t; };
 async function discordApi(path, method, body) {
     for (let i = 0; i < 2; i++) {
-        const r = await fetch("https://discord.com/api/v10" + path, { method, headers: { Authorization: "Bot " + CONFIG.NOTIFY_BOT_TOKEN, "Content-Type": "application/json" }, body: body ? JSON.stringify(body) : undefined });
+        const r = await fetch(CONFIG.DISCORD_API_BASE + "/v10" + path, { method, headers: { ...(CONFIG.DISCORD_PROXY_KEY ? { "x-proxy-key": CONFIG.DISCORD_PROXY_KEY } : {}), Authorization: "Bot " + CONFIG.NOTIFY_BOT_TOKEN, "Content-Type": "application/json" }, body: body ? JSON.stringify(body) : undefined });
         const j = await r.json().catch(() => ({}));
         if (r.status === 429 && i === 0) { await sleep(Math.min(5000, Math.ceil((j.retry_after || 1) * 1000))); continue; }
         if (!r.ok) { const e = new Error(j.message || ("Discord " + r.status)); e.code = j.code; throw e; }
@@ -1246,37 +1268,76 @@ async function dmUser(uid, message) {
     return discordApi("/channels/" + ch.id + "/messages", "POST", message);
 }
 function noticePublic(n) {
-    return { id: String(n._id), type: n.type, eventId: n.eventId || null, eventTitle: n.eventTitle || "", eventDetails: n.eventDetails || "", subjectId: n.subjectId || null, subjectTag: n.subjectTag || "", reason: n.reason || "", senderId: n.senderId, senderTag: n.senderTag, senderAvatar: n.senderAvatar || "", createdAt: n.createdAt };
+    return { id: String(n._id), type: n.type, eventId: n.eventId || null, eventTitle: n.eventTitle || "", eventDetails: n.eventDetails || "", subjectId: n.subjectId || null, subjectTag: n.subjectTag || "", reason: n.reason || "", senderId: n.senderId, senderTag: n.senderTag, senderAvatar: n.senderAvatar || "", createdAt: n.createdAt, canAllow: n.type === "op" && n.rule === "new_account" && !n.allowedBy };
 }
 function noticeMessage(n) {
-    const isOp = n.type === "op";
-    const link = SITE_ORIGIN ? (isOp && n.eventId ? SITE_ORIGIN + "/?op=" + n.eventId : SITE_ORIGIN + "/") : "";
-    const e = isOp ? {
-        title: "🚨 إشعار عاجل — عملية مشبوهة",
-        description: "وصلكم هذا الإشعار من العضو **" + clip(n.senderTag, 60) + "** بخصوص عملية مشبوهة تحتاج مراجعتكم.\nاضغطوا على الزر بالأسفل لفتح العملية في اللوحة واتخاذ الإجراء المناسب.",
-        color: 0xef4444,
-        fields: [
-            { name: "👤 المرسل", value: clip(n.senderTag, 100) || "—", inline: true },
-            { name: "📌 العملية", value: clip(n.eventTitle, 200) || "—", inline: true },
-            ...(n.eventDetails ? [{ name: "📝 التفاصيل", value: clip(n.eventDetails, 900) }] : []),
-        ],
-    } : {
-        title: "📣 إشعار من مسؤول أفراد الأمن السيبراني",
-        description: "رفع لكم المسؤول **" + clip(n.senderTag, 60) + "** إشعاراً بخصوص العضو **" + clip(n.subjectTag, 60) + "**.\nنأمل الاطلاع على السبب أدناه واتخاذ ما ترونه مناسباً.",
-        color: 0x3b82f6,
-        fields: [
-            { name: "👤 المسؤول", value: clip(n.senderTag, 100) || "—", inline: true },
-            { name: "🎯 العضو", value: clip(n.subjectTag, 100) || "—", inline: true },
-            { name: "📝 سبب الإشعار", value: clip(n.reason, 1000) || "—" },
-        ],
-    };
+    const isOp = n.type === "op", isAllow = n.type === "allow";
+    const opLink = SITE_ORIGIN && n.eventId ? SITE_ORIGIN + "/?op=" + n.eventId : "";
+    const btns = [];
+    let e;
+    if (isOp) {
+        e = {
+            title: "🚨 إشعار عاجل — عملية مشبوهة",
+            description: "وصلكم هذا الإشعار من العضو **" + clip(n.senderTag, 60) + "** بخصوص عملية مشبوهة تحتاج مراجعتكم.\nاضغطوا على الزر بالأسفل لفتح العملية في اللوحة واتخاذ الإجراء المناسب.",
+            color: 0xef4444,
+            fields: [
+                { name: "👤 المرسل", value: clip(n.senderTag, 100) || "—", inline: true },
+                { name: "📌 العملية", value: clip(n.eventTitle, 200) || "—", inline: true },
+                ...(n.subjectTag ? [{ name: "🎯 العضو", value: clip(n.subjectTag, 100), inline: true }] : []),
+                ...(n.eventDetails ? [{ name: "📝 التفاصيل", value: clip(n.eventDetails, 900) }] : []),
+            ],
+        };
+        if (opLink) btns.push({ type: 2, style: 5, label: "🔍 عرض العملية", url: opLink });
+        if (n.rule === "new_account" && SITE_ORIGIN) btns.push({ type: 2, style: 5, label: "✅ السماح للعضو بالتعامل معه", url: SITE_ORIGIN + "/?allow=" + String(n._id) });
+    } else if (isAllow) {
+        e = {
+            title: "⚠️ ضع العضو في روم الأعضاء المشتبه بهم في الديسكورد",
+            description: "سمح لك **" + clip(n.senderTag, 60) + "** بالتعامل مع هذي الحالة.\nضع العضو المذكور أدناه في روم الأعضاء المشتبه بهم في الديسكورد.",
+            color: 0xf59e0b,
+            fields: [
+                { name: "🎯 العضو", value: (clip(n.subjectTag, 100) || "—") + (n.subjectId ? "\n`" + n.subjectId + "`" : ""), inline: true },
+                { name: "✅ السماح من", value: clip(n.senderTag, 100) || "—", inline: true },
+                { name: "📌 العملية", value: clip(n.eventTitle, 200) || "—" },
+            ],
+        };
+        if (opLink) btns.push({ type: 2, style: 5, label: "🔍 عرض العملية", url: opLink });
+    } else if (n.type === "lead") {
+        e = {
+            title: "📣 إشعار من القيادة",
+            description: "وصلك إشعار من **" + clip(n.senderTag, 60) + "**:\n\n" + clip(n.reason, 1500),
+            color: 0xef4444,
+            fields: [{ name: "👤 من", value: clip(n.senderTag, 100) || "—", inline: true }],
+        };
+        if (SITE_ORIGIN) btns.push({ type: 2, style: 5, label: "🔗 فتح لوحة الأمن السيبراني", url: SITE_ORIGIN + "/" });
+    } else if (n.type === "taskdone" || n.type === "taskdue") {
+        const done = n.type === "taskdone";
+        e = {
+            title: done ? "✅ تم إنجاز مهمة" : "⏰ انتهى وقت مهمة",
+            description: done ? "العضو **" + clip(n.subjectTag, 60) + "** أنجز المهمة." : "انتهى وقت مهمة العضو **" + clip(n.subjectTag, 60) + "** ولم يسلّمها بعد.",
+            color: done ? 0x22c55e : 0xf59e0b,
+            fields: [
+                { name: "📝 المهمة", value: clip(n.reason, 1000) || "—" },
+                ...(n.eventDetails ? [{ name: "⏳ التفاصيل", value: clip(n.eventDetails, 300), inline: true }] : []),
+            ],
+        };
+        if (SITE_ORIGIN) btns.push({ type: 2, style: 5, label: "📋 فتح اللوحة", url: SITE_ORIGIN + "/" });
+    } else {
+        e = {
+            title: "📣 إشعار من مسؤول أفراد الأمن السيبراني",
+            description: "رفع لكم المسؤول **" + clip(n.senderTag, 60) + "** إشعاراً بخصوص العضو **" + clip(n.subjectTag, 60) + "**.\nنأمل الاطلاع على السبب أدناه واتخاذ ما ترونه مناسباً.",
+            color: 0x3b82f6,
+            fields: [
+                { name: "👤 المسؤول", value: clip(n.senderTag, 100) || "—", inline: true },
+                { name: "🎯 العضو", value: clip(n.subjectTag, 100) || "—", inline: true },
+                { name: "📝 سبب الإشعار", value: clip(n.reason, 1000) || "—" },
+            ],
+        };
+        if (SITE_ORIGIN) btns.push({ type: 2, style: 5, label: "🔗 فتح لوحة الأمن السيبراني", url: SITE_ORIGIN + "/" });
+    }
     e.footer = { text: "الأمن السيبراني — وزارة الداخلية" };
     e.timestamp = new Date().toISOString();
     if (/^https:\/\//.test(n.senderAvatar || "")) e.thumbnail = { url: n.senderAvatar };
-    return {
-        embeds: [e], allowed_mentions: { parse: [] },
-        components: link ? [{ type: 1, components: [{ type: 2, style: 5, label: isOp ? "🔍 عرض العملية" : "🔗 فتح لوحة الأمن السيبراني", url: link }] }] : [],
-    };
+    return { embeds: [e], allowed_mentions: { parse: [] }, components: btns.length ? [{ type: 1, components: btns }] : [] };
 }
 async function createNotice(fields) {
     const rec = (await Access.find({ level: "full" }).select("_id").lean()).map(d => String(d._id)).filter(id => id !== fields.senderId);
@@ -1295,6 +1356,45 @@ async function createNotice(fields) {
     Notice.updateOne({ _id: n._id }, { $set: { dm } }).catch(() => {});
     return { n, dm, to: rec.length };
 }
+// إرسال إشعار مباشر لأشخاص محددين (منبثق + خاص) بدون تحديد القيادة تلقائياً
+async function createDirect(fields, rec) {
+    const n = await Notice.create({ ...fields, recipients: rec });
+    const pub = noticePublic(n);
+    rec.forEach(id => pushToUser(id, "notice", pub));
+    const msg = noticeMessage(n);
+    const dmJob = (async () => {
+        if (!CONFIG.NOTIFY_BOT_TOKEN) return { sent: 0, failed: rec.length, noToken: true };
+        let sent = 0, failed = 0;
+        await Promise.all(rec.map(async uid => { try { await dmUser(uid, msg); sent++; } catch (e) { failed++; console.error("notice DM:", uid, e.message); } }));
+        return { sent, failed };
+    })();
+    const dm = await Promise.race([dmJob, sleep(7000).then(() => ({ pending: true }))]);
+    Notice.updateOne({ _id: n._id }, { $set: { dm } }).catch(() => {});
+    return { n, dm };
+}
+const minLabel = m => { m = Number(m) || 0; return m % 1440 === 0 && m ? (m / 1440) + " يوم" : (m % 60 === 0 && m ? (m / 60) + " ساعة" : m + " دقيقة"); };
+function taskPublic(t) {
+    const due = t.dueAt ? new Date(t.dueAt).getTime() : null;
+    return { id: String(t._id), text: t.text, minutes: t.minutes, status: t.status, assignerId: t.assignerId, assignerTag: t.assignerTag, assignerAvatar: t.assignerAvatar || "", targetId: t.targetId, targetTag: t.targetTag, ackAt: t.ackAt ? new Date(t.ackAt).getTime() : null, dueAt: due, doneAt: t.doneAt ? new Date(t.doneAt).getTime() : null, createdAt: t.createdAt, cancelledBy: t.cancelledBy || null, overdue: t.status === "active" && due != null && due < Date.now() };
+}
+function taskMessage(t) {
+    return {
+        embeds: [{
+            title: "📋 مهمة جديدة من القيادة",
+            description: "كلّفك **" + clip(t.assignerTag, 60) + "** بمهمة جديدة.\nافتح اللوحة واضغط «استلمت المهمة» عشان يبدأ العداد.",
+            color: 0xf59e0b,
+            fields: [
+                { name: "📝 المهمة", value: clip(t.text, 1000) || "—" },
+                { name: "⏳ المدة", value: minLabel(t.minutes) + " (تبدأ من لحظة الاستلام)", inline: true },
+                { name: "👤 من", value: clip(t.assignerTag, 100) || "—", inline: true },
+            ],
+            footer: { text: "الأمن السيبراني — وزارة الداخلية" }, timestamp: new Date().toISOString(),
+            ...(/^https:\/\//.test(t.assignerAvatar || "") ? { thumbnail: { url: t.assignerAvatar } } : {}),
+        }],
+        allowed_mentions: { parse: [] },
+        components: SITE_ORIGIN ? [{ type: 1, components: [{ type: 2, style: 5, label: "📥 فتح اللوحة لاستلام المهمة", url: SITE_ORIGIN + "/" }] }] : [],
+    };
+}
 const noticeCool = new Map();
 // عضو يرسل إشعار للقيادة عن عملية مشبوهة
 app.post("/api/notices/op", auth, wrap(async (req, res) => {
@@ -1302,13 +1402,14 @@ app.post("/api/notices/op", auth, wrap(async (req, res) => {
     if (me.level === "full") return res.status(400).json({ error: "أنت من القيادة — ما تحتاج ترسل إشعار" });
     const id = String(req.body.eventId || "");
     if (!mongoose.isValidObjectId(id)) return res.status(400).json({ error: "عملية غير صحيحة" });
-    const e = await Event.findById(id).select("title details kind actorTag").lean();
+    const e = await Event.findById(id).select("title details kind actorTag actorId rule targetId targetTag").lean();
     if (!e) return res.status(404).json({ error: "العملية غير موجودة" });
     if (e.kind !== "suspicious") return res.status(400).json({ error: "الإشعار للعمليات المشبوهة فقط" });
     const ck = me.id + "|" + id;
     if (Date.now() - (noticeCool.get(ck) || 0) < 60000) return res.status(429).json({ error: "أرسلت إشعار لهذي العملية قبل شوي — انتظر دقيقة" });
     noticeCool.set(ck, Date.now());
-    const r = await createNotice({ type: "op", eventId: id, eventTitle: clip(e.title, 200), eventDetails: clip(e.details, 600), senderId: me.id, senderTag: me.tag, senderAvatar: me.avatar });
+    const subj = e.targetId ? { id: e.targetId, tag: e.targetTag } : { id: e.actorId, tag: e.actorTag };
+    const r = await createNotice({ type: "op", rule: e.rule || null, subjectId: subj.id || null, subjectTag: clip(subj.tag, 60), eventId: id, eventTitle: clip(e.title, 200), eventDetails: clip(e.details, 600), senderId: me.id, senderTag: me.tag, senderAvatar: me.avatar });
     await panelLog(req, "إشعار القيادة عن عملية مشبوهة", "العملية: " + e.title);
     res.json({ ok: true, to: r.to, dm: r.dm });
 }));
@@ -1334,12 +1435,97 @@ app.post("/api/notices/member", auth, wrap(async (req, res) => {
     res.json({ ok: true, to: r.to, dm: r.dm });
 }));
 // إشعارات القيادة اللي ما انشافت (تنعرض أول ما يفتح الموقع)
-app.get("/api/notices/pending", auth, full, wrap(async (req, res) => {
+// ═══ القائد والنائب: إشعار أو مهمة لعضو ═══
+app.post("/api/members/:id/notify", auth, full, wrap(async (req, res) => {
+    const me = req.session.user, id = req.params.id;
+    if (!/^\d{5,25}$/.test(id)) return res.status(400).json({ error: "آيدي غير صالح" });
+    if (id === me.id) return res.status(400).json({ error: "ما تقدر ترسل لنفسك" });
+    const kind = req.body.kind === "task" ? "task" : "notice";
+    const text = String(req.body.text || "").trim();
+    if (text.length < 3) return res.status(400).json({ error: kind === "task" ? "اكتب نص المهمة" : "اكتب نص الإشعار" });
+    const acc = await Access.findById(id).lean();
+    if (!acc || !acc.level) return res.status(404).json({ error: "هذا الشخص مو من أفراد الأمن السيبراني" });
+    const pm = await PanelMember.findById(id).lean();
+    const tag = clip((pm && pm.tag) || req.body.tag || id, 60);
+    if (kind === "notice") {
+        const r = await createDirect({ type: "lead", reason: clip(text, 1500), subjectId: id, subjectTag: tag, senderId: me.id, senderTag: me.tag, senderAvatar: me.avatar }, [id]);
+        await panelLog(req, "إشعار من القيادة لعضو", "العضو: " + tag + "\nالنص: " + clip(text, 300), { targetId: id, targetTag: tag });
+        return res.json({ ok: true, dm: r.dm });
+    }
+    const minutes = Math.round(Number(req.body.minutes));
+    if (!(minutes >= 1 && minutes <= 10080)) return res.status(400).json({ error: "مدة المهمة من دقيقة إلى 7 أيام" });
+    const t = await Task.create({ assignerId: me.id, assignerTag: me.tag, assignerAvatar: me.avatar, targetId: id, targetTag: tag, text: clip(text, 1500), minutes });
+    pushToUser(id, "task", taskPublic(t));
+    let dm = { skipped: true };
+    if (CONFIG.NOTIFY_BOT_TOKEN) { try { await dmUser(id, taskMessage(t)); dm = { sent: 1 }; } catch (e) { dm = { failed: 1 }; console.error("task DM:", e.message); } }
+    await panelLog(req, "مهمة جديدة لعضو", "العضو: " + tag + " — المدة: " + minLabel(minutes) + "\nالمهمة: " + clip(text, 300), { targetId: id, targetTag: tag });
+    res.json({ ok: true, task: taskPublic(t), dm });
+}));
+app.get("/api/tasks/mine", auth, wrap(async (req, res) => {
+    const list = await Task.find({ targetId: req.session.user.id, status: { $in: ["pending", "active"] } }).sort({ createdAt: 1 }).limit(20).lean();
+    res.json({ now: Date.now(), tasks: list.map(taskPublic) });
+}));
+app.get("/api/tasks", auth, full, wrap(async (req, res) => {
+    const list = await Task.find({ createdAt: { $gte: new Date(Date.now() - 3 * 864e5) } }).sort({ createdAt: -1 }).limit(60).lean();
+    res.json({ now: Date.now(), tasks: list.map(taskPublic) });
+}));
+app.post("/api/tasks/:id/ack", auth, wrap(async (req, res) => {
+    const me = req.session.user;
+    if (!mongoose.isValidObjectId(req.params.id)) return res.status(400).json({ error: "مهمة غير صحيحة" });
+    const t0 = await Task.findOne({ _id: req.params.id, targetId: me.id, status: "pending" }).lean();
+    if (!t0) return res.status(409).json({ error: "المهمة مو متاحة (انلغت أو انستلمت)" });
+    const now = Date.now();
+    const t = await Task.findOneAndUpdate({ _id: t0._id, status: "pending" }, { $set: { status: "active", ackAt: new Date(now), dueAt: new Date(now + t0.minutes * 60000) } }, { new: true }).lean();
+    if (!t) return res.status(409).json({ error: "المهمة مو متاحة" });
+    pushToUser(t.assignerId, "taskupd", { ev: "ack", toAssigner: true, targetTag: t.targetTag, id: String(t._id) });
+    pushToUser(t.targetId, "taskupd", { ev: "ack", id: String(t._id) });
+    res.json({ ok: true, task: taskPublic(t), now });
+}));
+app.post("/api/tasks/:id/done", auth, wrap(async (req, res) => {
+    const me = req.session.user;
+    if (!mongoose.isValidObjectId(req.params.id)) return res.status(400).json({ error: "مهمة غير صحيحة" });
+    const t = await Task.findOneAndUpdate({ _id: req.params.id, targetId: me.id, status: "active" }, { $set: { status: "done", doneAt: new Date() } }, { new: true }).lean();
+    if (!t) return res.status(409).json({ error: "المهمة مو متاحة" });
+    const late = t.doneAt.getTime() - new Date(t.dueAt).getTime();
+    const det = late > 0 ? "⚠️ أُنجزت متأخرة بـ " + (late >= 3600000 ? Math.floor(late / 3600000) + " ساعة و" : "") + Math.max(1, Math.round((late % 3600000) / 60000)) + " دقيقة" : "✅ أُنجزت في الوقت (المدة: " + minLabel(t.minutes) + ")";
+    await createDirect({ type: "taskdone", reason: t.text, eventDetails: det, subjectId: t.targetId, subjectTag: t.targetTag, senderId: t.targetId, senderTag: t.targetTag, senderAvatar: me.avatar }, [t.assignerId]);
+    pushToUser(t.targetId, "taskupd", { ev: "done", id: String(t._id) });
+    res.json({ ok: true });
+}));
+app.post("/api/tasks/:id/cancel", auth, full, wrap(async (req, res) => {
+    const me = req.session.user;
+    if (!mongoose.isValidObjectId(req.params.id)) return res.status(400).json({ error: "مهمة غير صحيحة" });
+    const t = await Task.findOneAndUpdate({ _id: req.params.id, status: { $in: ["pending", "active"] } }, { $set: { status: "cancelled", cancelledBy: me.tag } }, { new: true }).lean();
+    if (!t) return res.status(409).json({ error: "المهمة مو متاحة للإلغاء" });
+    pushToUser(t.targetId, "taskupd", { ev: "cancel", toTarget: true, id: String(t._id) });
+    pushToUser(t.assignerId, "taskupd", { ev: "cancel", id: String(t._id) });
+    await panelLog(req, "إلغاء مهمة", "العضو: " + t.targetTag + "\nالمهمة: " + clip(t.text, 200), { targetId: t.targetId, targetTag: t.targetTag });
+    res.json({ ok: true });
+}));
+
+// القيادة تسمح للعضو اللي أرسل الإشعار بالتعامل مع الحالة (فقط لعمليات «حساب جديد») — يوصله رسالة «ضع العضو في روم الأعضاء المشتبه بهم»
+app.post("/api/notices/:id/allow", auth, full, wrap(async (req, res) => {
+    const me = req.session.user;
+    if (!mongoose.isValidObjectId(req.params.id)) return res.status(400).json({ error: "إشعار غير صحيح" });
+    const n = await Notice.findById(req.params.id).lean();
+    if (!n || n.type !== "op" || n.rule !== "new_account") return res.status(404).json({ error: "هذا الإشعار ما يدعم السماح" });
+    if (!(n.recipients || []).includes(me.id)) return res.status(403).json({ error: "هذا الإشعار مو موجّه لك" });
+    const upd = await Notice.findOneAndUpdate({ _id: n._id, allowedBy: null }, { $set: { allowedBy: me.id, allowedByTag: me.tag, allowedAt: new Date() }, $addToSet: { seenBy: me.id } }, { new: true });
+    if (!upd) return res.status(409).json({ error: "تم السماح لهذي الحالة قبل من " + (n.allowedByTag || "القيادة") });
+    const a = await Notice.create({ type: "allow", eventId: n.eventId, eventTitle: n.eventTitle, subjectId: n.subjectId, subjectTag: n.subjectTag, senderId: me.id, senderTag: me.tag, senderAvatar: me.avatar, recipients: [n.senderId] });
+    pushToUser(n.senderId, "notice", noticePublic(a));
+    let dm = { skipped: true };
+    if (CONFIG.NOTIFY_BOT_TOKEN) { try { await dmUser(n.senderId, noticeMessage(a)); dm = { sent: 1 }; } catch (e) { dm = { failed: 1 }; console.error("allow DM:", e.message); } }
+    Notice.updateOne({ _id: a._id }, { $set: { dm } }).catch(() => {});
+    await panelLog(req, "السماح للعضو بالتعامل مع حالة", "العضو المشتبه: " + (n.subjectTag || "—") + " — المسموح له: " + n.senderTag, { targetId: n.senderId, targetTag: n.senderTag });
+    res.json({ ok: true, dm });
+}));
+app.get("/api/notices/pending", auth, wrap(async (req, res) => {
     const me = req.session.user.id;
     const list = await Notice.find({ recipients: me, seenBy: { $ne: me }, createdAt: { $gte: new Date(Date.now() - 7 * 864e5) } }).sort({ createdAt: 1 }).limit(20).lean();
     res.json({ notices: list.map(noticePublic) });
 }));
-app.post("/api/notices/:id/seen", auth, full, wrap(async (req, res) => {
+app.post("/api/notices/:id/seen", auth, wrap(async (req, res) => {
     if (!mongoose.isValidObjectId(req.params.id)) return res.status(400).json({ error: "إشعار غير صحيح" });
     await Notice.updateOne({ _id: req.params.id }, { $addToSet: { seenBy: req.session.user.id } });
     res.json({ ok: true });
@@ -1371,6 +1557,18 @@ async function pollBotSignals() {
     finally { sigBusy = false; }
 }
 function startSiteJobs() {
+    // مهام انتهى وقتها بدون تسليم: ننبّه اللي كلّف بها
+    setInterval(async () => {
+        try {
+            const due = await Task.find({ status: "active", dueAt: { $lt: new Date() }, overdueNotified: { $ne: true } }).limit(20).lean();
+            for (const t of due) {
+                const up = await Task.updateOne({ _id: t._id, overdueNotified: { $ne: true } }, { $set: { overdueNotified: true } });
+                if (!up.modifiedCount) continue;
+                await createDirect({ type: "taskdue", reason: t.text, eventDetails: "المدة: " + minLabel(t.minutes), subjectId: t.targetId, subjectTag: t.targetTag, senderId: t.targetId, senderTag: t.targetTag }, [t.assignerId]);
+                pushToUser(t.targetId, "taskupd", { ev: "due", id: String(t._id) });
+            }
+        } catch (e) { console.error("task due:", e.message); }
+    }, 30000);
     setInterval(() => refreshMgr(), 20000);
     refreshMgr(0);
     setInterval(pollBotSignals, 1500);
@@ -1387,7 +1585,7 @@ const CSS = String.raw`
 :root { --bg1:#0a1628; --bg2:#0d1f3c; --panel:rgba(255,255,255,0.04); --border:rgba(59,130,246,0.25); --gold:#3b82f6; --gold-soft:#60a5fa; --green:#1d4ed8; --green2:#3b82f6; --red:#ef4444; --amber:#eab308; --text:#e2e8f0; --muted:#64748b; }
 * { box-sizing:border-box; margin:0; padding:0; font-family:'Tajawal','Tahoma','Segoe UI',sans-serif; }
 body { background:linear-gradient(135deg,#0a1628 0%,#0d1f3c 40%,#0a2744 70%,#0d3060 100%); color:var(--text); min-height:100vh; background-attachment:fixed; }
-nav { background:rgba(5,15,30,0.95); backdrop-filter:blur(15px); border-bottom:1px solid rgba(59,130,246,0.3); padding:0 1.2rem; display:flex; align-items:center; justify-content:space-between; height:62px; position:sticky; top:0; z-index:900; gap:10px; }
+nav { background:rgba(5,15,30,0.95); backdrop-filter:blur(15px); border-bottom:1px solid rgba(59,130,246,0.3); padding:0 1.2rem; display:flex; align-items:center; justify-content:space-between; height:62px; position:sticky; top:var(--tbar-h,0px); z-index:900; gap:10px; }
 .nav-start { display:flex; align-items:center; gap:12px; }
 .logo { font-size:1.2rem; font-weight:900; background:linear-gradient(90deg,#3b82f6,#60a5fa,#93c5fd); -webkit-background-clip:text; -webkit-text-fill-color:transparent; letter-spacing:1px; white-space:nowrap; }
 .nav-links { display:flex; gap:0.3rem; list-style:none; }
@@ -1571,6 +1769,28 @@ nav { height:auto; min-height:62px; padding-top:env(safe-area-inset-top,0px); }
 .nbox.info { border-color:#3b82f6; animation:none; box-shadow:0 0 30px rgba(59,130,246,.3); }
 .nbox h3 { color:#f87171; margin-bottom:12px; font-size:1.1rem; }
 .nbox.info h3 { color:#60a5fa; }
+.nbox.warn { border-color:#f59e0b; animation:none; box-shadow:0 0 34px rgba(245,158,11,.4); }
+.nbox.warn h3 { color:#fbbf24; }
+#tbar { position:sticky; top:0; z-index:950; background:linear-gradient(180deg,#1b2a4a,#12203a); border-bottom:2px solid #f59e0b; padding:calc(6px + env(safe-area-inset-top,0px)) 10px 6px; box-shadow:0 4px 18px rgba(0,0,0,.5); }
+#tbar .trow { display:flex; align-items:center; gap:8px; flex-wrap:wrap; padding:4px 0; }
+#tbar .trow + .trow { border-top:1px solid rgba(255,255,255,.08); }
+#tbar .ttxt { flex:1; min-width:140px; cursor:pointer; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; font-size:13px; }
+#tbar .ttxt.open { white-space:normal; }
+.ttim { font-variant-numeric:tabular-nums; font-weight:700; color:#fbbf24; white-space:nowrap; }
+.pov { position:fixed; inset:0; z-index:5500; background:rgba(0,0,0,.62); display:flex; align-items:center; justify-content:center; padding:16px; }
+.pbox { background:#0d1f3c; border:1px solid rgba(59,130,246,.45); border-radius:14px; padding:16px; width:100%; max-width:380px; max-height:80vh; overflow-y:auto; }
+.pbox h3 { margin-bottom:10px; color:#60a5fa; }
+.pit { display:block; width:100%; text-align:right; background:rgba(255,255,255,.05); border:1px solid transparent; border-radius:10px; color:#e2e8f0; padding:11px 12px; margin-bottom:6px; font:inherit; cursor:pointer; }
+.pit.on { border-color:#3b82f6; background:rgba(59,130,246,.18); }
+.selbtn { display:inline-block; min-width:80px; background:rgba(255,255,255,.06); border:1px solid rgba(59,130,246,.35); border-radius:10px; color:#e2e8f0; padding:9px 12px; font:inherit; cursor:pointer; text-align:right; }
+.pcal { display:grid; grid-template-columns:repeat(7,1fr); gap:4px; margin:8px 0; text-align:center; }
+.pcal .pd { padding:9px 0; border-radius:8px; background:rgba(255,255,255,.05); border:1px solid transparent; color:#e2e8f0; font:inherit; cursor:pointer; }
+.pcal .pd.on { background:#3b82f6; }
+.pcal .pd.td { border-color:#f59e0b; }
+.pcal .ph { color:#60a5fa; font-size:12px; padding:4px 0; }
+.segb { display:flex; gap:8px; margin:10px 0; }
+.segb .btn { flex:1; }
+.chips { display:flex; gap:6px; flex-wrap:wrap; margin:6px 0; }
 .nbox .nq { background:rgba(255,255,255,.05); border-radius:10px; padding:10px 12px; margin:10px 0; line-height:1.9; white-space:pre-wrap; word-break:break-word; }
 .nbox .nfrom { display:flex; align-items:center; gap:10px; margin-bottom:8px; }
 .nbox .nfrom img { width:38px; height:38px; border-radius:50%; border:2px solid var(--gold); }
@@ -2822,7 +3042,7 @@ async function evRemedy(id,b){
 S.nq=[];S.nShown=null;
 function noticeSeen(n){api('/api/notices/'+n.id+'/seen',{method:'POST'}).catch(function(){});}
 function noticeEnqueue(n){
-  if(S.level!=='full'||!n||!n.id)return;
+  if(!n||!n.id||(n.type!=='allow'&&n.type!=='lead'&&n.type!=='task'&&S.level!=='full'))return;
   if(S.nq.some(function(x){return x.id===n.id;})||(S.nShown&&S.nShown.id===n.id))return;
   S.nq.push(n);
   if(!S.nShown)noticeNext();
@@ -2832,32 +3052,225 @@ function noticeNext(){
   var n=S.nq.shift();
   if(!n){S.nShown=null;if(!$('ov'))unlockScroll();return;}
   S.nShown=n;
-  var isOp=n.type==='op';
+  var ty=n.type,isOp=ty==='op',isAllow=ty==='allow',isTask=ty==='task';
   var from='<div class="nfrom">'+(n.senderAvatar?'<img src="'+esc(n.senderAvatar)+'" alt="">':'')+'<div><b>'+esc(n.senderTag)+'</b><div class="log-meta">🕒 '+esc(ago(n.createdAt))+'</div></div></div>';
-  var body=isOp
-    ?'<p style="line-height:1.9">وصلك إشعار من العضو <b>'+esc(n.senderTag)+'</b> بخصوص عملية مشبوهة تحتاج مراجعتك.</p>'
-      +'<div class="nq"><b>📌 '+esc(n.eventTitle||'عملية مشبوهة')+'</b>'+(n.eventDetails?'<div class="log-meta" style="margin-top:4px">'+esc(n.eventDetails)+'</div>':'')+'</div>'
-    :'<p style="line-height:1.9">رفع لك المسؤول <b>'+esc(n.senderTag)+'</b> إشعاراً بخصوص العضو <b>'+esc(n.subjectTag)+'</b>.</p>'
+  var title,body,btns,cls='';
+  if(isOp){
+    title='🚨 إشعار عاجل من الأمن السيبراني';
+    body='<p style="line-height:1.9">وصلك إشعار من العضو <b>'+esc(n.senderTag)+'</b> بخصوص عملية مشبوهة تحتاج مراجعتك.</p>'
+      +'<div class="nq"><b>📌 '+esc(n.eventTitle||'عملية مشبوهة')+'</b>'+(n.subjectTag?'<div class="log-meta" style="margin-top:6px">🎯 العضو: <b>'+esc(n.subjectTag)+'</b></div>':'')+(n.eventDetails?'<div class="log-meta" style="margin-top:4px">'+esc(n.eventDetails)+'</div>':'')+'</div>';
+    btns='<button class="btn" id="nv-view">👁️ شوفها</button>'+(n.canAllow?'<button class="btn ok" id="nv-allow">✅ السماح للعضو بالتعامل معه</button>':'')+'<button class="btn gray" id="nv-close">إغلاق</button>';
+  }else if(isAllow){
+    cls=' warn';title='⚠️ ضع العضو في روم الأعضاء المشتبه بهم في الديسكورد';
+    body='<p style="line-height:1.9">سمح لك <b>'+esc(n.senderTag)+'</b> بالتعامل مع هذي الحالة.</p>'
+      +'<div class="nq">🎯 العضو: <b>'+esc(n.subjectTag||'—')+'</b>'+(n.subjectId?'<div class="log-meta" dir="ltr" style="margin-top:4px">'+esc(n.subjectId)+'</div>':'')+'<div class="log-meta" style="margin-top:6px">📌 '+esc(n.eventTitle||'')+'</div></div>';
+    btns='<button class="btn" id="nv-view">👁️ شوفها</button><button class="btn gray" id="nv-ok">✔️ تم</button>';
+  }else if(ty==='lead'){
+    title='📣 إشعار من القيادة';
+    body='<p style="line-height:1.9">وصلك إشعار من <b>'+esc(n.senderTag)+'</b>:</p><div class="nq">'+esc(n.reason)+'</div>';
+    btns='<button class="btn" id="nv-ok">✔️ تم الاطلاع</button>';
+  }else if(isTask){
+    var t=n.task;cls=' warn';title='📋 مهمة جديدة من القيادة';
+    body='<p style="line-height:1.9">كلّفك <b>'+esc(t.assignerTag)+'</b> بمهمة:</p><div class="nq">'+esc(t.text)+'</div>'
+      +'<div class="log-meta">⏳ المدة: <b>'+esc(minLabel(t.minutes))+'</b> — يبدأ العداد من لحظة ما تضغط «استلمت المهمة»</div>';
+    btns='<button class="btn ok" id="nv-ack">✅ استلمت المهمة</button>';
+  }else if(ty==='taskdone'||ty==='taskdue'){
+    var dn=ty==='taskdone';cls=dn?' info':' warn';title=dn?'✅ تم إنجاز مهمة':'⏰ انتهى وقت مهمة';
+    body='<p style="line-height:1.9">'+(dn?'العضو <b>'+esc(n.subjectTag)+'</b> أنجز المهمة:':'انتهى وقت مهمة العضو <b>'+esc(n.subjectTag)+'</b> ولم يسلّمها بعد:')+'</p><div class="nq">'+esc(n.reason)+(n.eventDetails?'<div class="log-meta" style="margin-top:6px">'+esc(n.eventDetails)+'</div>':'')+'</div>';
+    btns='<button class="btn" id="nv-ok">✔️ تم الاطلاع</button><button class="btn gray" id="nv-tasks">📋 المهام</button>';
+  }else{
+    cls=' info';title='📣 إشعار من مسؤول الأفراد';
+    body='<p style="line-height:1.9">رفع لك المسؤول <b>'+esc(n.senderTag)+'</b> إشعاراً بخصوص العضو <b>'+esc(n.subjectTag)+'</b>.</p>'
       +'<div class="nq"><div class="muted" style="font-size:12px;margin-bottom:4px">📝 سبب الإشعار</div>'+esc(n.reason)+'</div>';
-  var btns=isOp
-    ?'<button class="btn" id="nv-view">👁️ شوفها</button><button class="btn gray" id="nv-close">إغلاق</button>'
-    :'<button class="btn" id="nv-ok">✔️ تم الاطلاع</button><button class="btn gray" id="nv-mem">👥 صفحة الأعضاء</button>';
+    btns='<button class="btn" id="nv-ok">✔️ تم الاطلاع</button><button class="btn gray" id="nv-mem">👥 صفحة الأعضاء</button>';
+  }
   var o=document.createElement('div');o.className='nov';o.id='nov';
-  o.innerHTML='<div class="nbox'+(isOp?'':' info')+'"><h3>'+(isOp?'🚨 إشعار عاجل من الأمن السيبراني':'📣 إشعار من مسؤول الأفراد')+'</h3>'+from+body
+  o.innerHTML='<div class="nbox'+cls+'"><h3>'+title+'</h3>'+from+body
     +'<div class="row" style="justify-content:flex-start;gap:8px;margin-top:14px;flex-wrap:wrap">'+btns+'</div></div>';
   document.body.appendChild(o);lockScroll();
-  var done=function(){noticeSeen(n);S.nShown=null;var x=$('nov');if(x)x.remove();};
-  if(isOp){
-    $('nv-view').onclick=function(){done();openEv(n.eventId);setTimeout(noticeNext,0);};
-    $('nv-close').onclick=function(){done();noticeNext();};
-  }else{
-    $('nv-ok').onclick=function(){done();noticeNext();};
-    $('nv-mem').onclick=function(){done();go('members');noticeNext();};
-  }
+  var done=function(){if(!isTask)noticeSeen(n);S.nShown=null;var x=$('nov');if(x)x.remove();};
+  if($('nv-view'))$('nv-view').onclick=function(){done();openEv(n.eventId);setTimeout(noticeNext,0);};
+  if($('nv-close'))$('nv-close').onclick=function(){done();noticeNext();};
+  if($('nv-ok'))$('nv-ok').onclick=function(){done();noticeNext();};
+  if($('nv-mem'))$('nv-mem').onclick=function(){done();go('members');noticeNext();};
+  if($('nv-tasks'))$('nv-tasks').onclick=function(){done();go('members');noticeNext();setTimeout(openTasks,200);};
+  if($('nv-allow'))$('nv-allow').onclick=function(){var b=this;b.disabled=true;allowNotice(n.id,function(ok){if(ok){done();noticeNext();}else b.disabled=false;});};
+  if($('nv-ack'))$('nv-ack').onclick=async function(){
+    var b=this;b.disabled=true;
+    try{var j=await api('/api/tasks/'+n.task.id+'/ack',{method:'POST'});S.tOff=(j.now||Date.now())-Date.now();S.tasks=(S.tasks||[]).filter(function(x){return x.id!==j.task.id;});S.tasks.push(j.task);renderTaskBar();done();noticeNext();toast('تم استلام المهمة — بدأ العداد');}
+    catch(e){toast(e.message);b.disabled=false;if(/مو متاحة/.test(e.message)){done();noticeNext();}}
+  };
+}
+async function allowNotice(id,cb){
+  try{await api('/api/notices/'+id+'/allow',{method:'POST'});toast('✅ تم السماح — وصلت العضو رسالة');if(cb)cb(true);}
+  catch(e){toast(e.message);if(cb)cb(false);}
+}
+async function allowConfirm(a){
+  if(a.allowed){toast('تم السماح لهذي الحالة من قبل');return;}
+  if(await ask('تسمح للعضو '+a.senderTag+' بالتعامل مع العضو '+a.subjectTag+'؟'))allowNotice(a.id);
 }
 async function loadNotices(){
   try{var j=await api('/api/notices/pending');(j.notices||[]).forEach(noticeEnqueue);}catch(e){}
 }
+/* ══ مهام القيادة ══ */
+function minLabel(m){m=+m||0;return (m&&m%1440===0)?(m/1440)+' يوم':((m&&m%60===0)?(m/60)+' ساعة':m+' دقيقة');}
+function fmtLeft(ms){var neg=ms<0,s=Math.floor(Math.abs(ms)/1000),d=Math.floor(s/86400);s%=86400;var h=Math.floor(s/3600);s%=3600;var m=Math.floor(s/60);s%=60;var p=function(x){return (x<10?'0':'')+x;};return (neg?'+':'')+(d?d+'ي ':'')+((h||d)?p(h)+':':'')+p(m)+':'+p(s);}
+function taskPop(t){return {id:'t'+t.id,type:'task',task:t,senderTag:t.assignerTag,senderAvatar:t.assignerAvatar||'',createdAt:t.createdAt};}
+function tickTasks(){
+  var now=Date.now()+(S.tOff||0);
+  document.querySelectorAll('.ttim[data-due]').forEach(function(el){
+    var due=+el.getAttribute('data-due'),left=due-now;
+    el.textContent=left>=0?'⏳ '+fmtLeft(left):'⚠️ متأخرة '+fmtLeft(left);
+    el.style.color=left>=0?(left<60000?'#f87171':'#fbbf24'):'#f87171';
+  });
+}
+function renderTaskBar(){
+  var bar=$('tbar'),list=(S.tasks||[]).filter(function(t){return t.status==='active';});
+  if(!list.length){if(bar)bar.remove();document.documentElement.style.setProperty('--tbar-h','0px');return;}
+  if(!bar){bar=document.createElement('div');bar.id='tbar';document.body.insertBefore(bar,document.body.firstChild);}
+  bar.innerHTML=list.map(function(t){
+    return '<div class="trow"><div class="ttxt" onclick="this.classList.toggle(\'open\')">📋 '+esc(t.text)+'<span class="log-meta"> — من '+esc(t.assignerTag)+'</span></div>'
+      +'<div class="ttim" data-due="'+t.dueAt+'">⏳ --:--</div>'
+      +'<button class="btn sm ok" onclick="taskDone(\''+t.id+'\',this)">✅ سوّيت المهمة</button></div>';
+  }).join('');
+  tickTasks();
+  document.documentElement.style.setProperty('--tbar-h',bar.offsetHeight+'px');
+}
+async function loadTasks(){
+  try{
+    var j=await api('/api/tasks/mine');S.tOff=(j.now||Date.now())-Date.now();
+    S.tasks=(j.tasks||[]).filter(function(t){return t.status==='active';});
+    (j.tasks||[]).filter(function(t){return t.status==='pending';}).forEach(function(t){noticeEnqueue(taskPop(t));});
+    renderTaskBar();
+  }catch(e){}
+}
+async function taskDone(id,b){
+  if(!(await ask('تأكيد إنك خلّصت المهمة؟')))return;
+  try{await api('/api/tasks/'+id+'/done',{method:'POST'});toast('✅ تم تسليم المهمة للقيادة');}catch(e){toast(e.message);}
+  loadTasks();
+}
+async function refreshTaskList(){
+  var box=$('tk-list');if(!box)return;
+  try{
+    var j=await api('/api/tasks');S.tOff=(j.now||Date.now())-Date.now();
+    if(!$('tk-list'))return;
+    var ST={pending:['بانتظار الاستلام','medium'],active:['جارية','low'],done:['✅ منجزة','low'],cancelled:['🚫 ملغاة','high']};
+    box.innerHTML=(j.tasks||[]).map(function(t){
+      var st=ST[t.status]||['',''],cancelable=t.status==='pending'||t.status==='active';
+      return '<div class="card" style="margin:8px 0;padding:12px"><div class="log-title">'+esc(t.targetTag)+' <span class="badge '+st[1]+'">'+st[0]+'</span></div>'
+        +'<div class="nq" style="margin:6px 0;padding:8px">'+esc(t.text)+'</div>'
+        +'<div class="log-meta">من '+esc(t.assignerTag)+' · '+esc(minLabel(t.minutes))+' · '+esc(ago(t.createdAt))+'</div>'
+        +(t.status==='active'?'<div class="ttim" data-due="'+t.dueAt+'" style="margin-top:4px"></div>':'')
+        +(t.status==='done'&&t.doneAt?'<div class="log-meta">🏁 أُنجزت: '+esc(fmt(t.doneAt))+'</div>':'')
+        +(cancelable?'<div style="margin-top:8px"><button class="btn sm danger" onclick="cancelTask(\''+t.id+'\')">🚫 إلغاء المهمة</button></div>':'')+'</div>';
+    }).join('')||'<div class="muted center" style="padding:14px">ما فيه مهام (آخر 3 أيام)</div>';
+    tickTasks();
+  }catch(e){box.innerHTML='<div class="muted">'+esc(e.message)+'</div>';}
+}
+function openTasks(){
+  modal('<h3>📋 مهام الأعضاء</h3><div id="tk-list" class="muted center" style="padding:14px">جاري التحميل...</div><div class="row" style="justify-content:flex-start;margin-top:10px"><button class="btn gray" onclick="closeModal()">إغلاق</button></div>');
+  refreshTaskList();
+}
+async function cancelTask(id){
+  if(!(await ask('تلغي هذي المهمة؟')))return openTasks();
+  try{await api('/api/tasks/'+id+'/cancel',{method:'POST'});toast('تم إلغاء المهمة');}catch(e){toast(e.message);}
+  openTasks();
+}
+function leadNotify(id){
+  var m=(S.memMap||{})[id]||{},kind='notice';
+  var lb='display:block;color:#60a5fa;font-size:13px;margin:12px 0 6px';
+  var chips=[[5,'5 د'],[10,'10 د'],[30,'30 د'],[60,'ساعة'],[180,'3 ساعات'],[1440,'يوم'],[10080,'أسبوع']];
+  modal('<h3>🔔 إرسال للعضو</h3><div class="muted" style="font-size:13px">إلى: <b>'+esc(m.tag||id)+'</b></div>'
+    +'<div class="segb"><button class="btn sm" id="ln-k1">📣 إشعار</button><button class="btn sm gray" id="ln-k2">📋 مهمة</button></div>'
+    +'<label style="'+lb+'" id="ln-lbl">نص الإشعار</label>'
+    +'<textarea id="lnT" rows="5" maxlength="1500" placeholder="اكتب الإشعار اللي تبيه يوصل للعضو..." style="width:100%;background:rgba(255,255,255,.06);border:1px solid rgba(59,130,246,.35);border-radius:10px;color:#e2e8f0;padding:10px;font-family:inherit;font-size:14px;resize:vertical"></textarea>'
+    +'<div id="ln-dur" style="display:none"><label style="'+lb+'">مدة المهمة (تبدأ من لحظة استلام العضو لها)</label>'
+    +'<div class="chips">'+chips.map(function(c){return '<button class="btn sm gray" data-m="'+c[0]+'">'+c[1]+'</button>';}).join('')+'</div>'
+    +'<div class="row" style="justify-content:flex-start;gap:8px;align-items:center"><input type="number" id="lnN" min="1" value="10" style="width:90px;background:rgba(255,255,255,.06);border:1px solid rgba(59,130,246,.35);border-radius:10px;color:#e2e8f0;padding:9px 10px;font:inherit">'
+    +'<select id="lnU"><option value="1">دقيقة</option><option value="60">ساعة</option><option value="1440">يوم</option></select></div></div>'
+    +'<div class="row" style="justify-content:flex-start;gap:8px;margin-top:14px"><button class="btn" id="lnGo">📤 إرسال</button><button class="btn gray" onclick="closeModal()">إلغاء</button></div>');
+  var setK=function(k){kind=k;$('ln-k1').className='btn sm'+(k==='notice'?'':' gray');$('ln-k2').className='btn sm'+(k==='task'?'':' gray');
+    $('ln-lbl').textContent=k==='task'?'نص المهمة':'نص الإشعار';$('ln-dur').style.display=k==='task'?'block':'none';
+    $('lnT').placeholder=k==='task'?'مثال: اقعد راقب الشات 10 دقايق / عطني تقرير الإحصائيات حق الأسبوع الماضي':'اكتب الإشعار اللي تبيه يوصل للعضو...';};
+  $('ln-k1').onclick=function(){setK('notice');};$('ln-k2').onclick=function(){setK('task');};
+  document.querySelectorAll('#ov .chips [data-m]').forEach(function(b){b.onclick=function(){
+    var v=+b.getAttribute('data-m'),u=(v%1440===0)?1440:((v%60===0)?60:1);
+    $('lnU').value=String(u);$('lnN').value=String(v/u);if($('lnU')._sync)$('lnU')._sync();};});
+  $('lnGo').onclick=async function(){
+    var t=($('lnT').value||'').trim();
+    if(t.length<3){toast(kind==='task'?'اكتب نص المهمة':'اكتب نص الإشعار');return;}
+    var mins=Math.round((+$('lnN').value||0)*(+$('lnU').value||1));
+    if(kind==='task'&&!(mins>=1&&mins<=10080)){toast('مدة المهمة من دقيقة إلى 7 أيام');return;}
+    this.disabled=true;
+    try{await api('/api/members/'+id+'/notify',{method:'POST',body:JSON.stringify({kind:kind,text:t,minutes:mins,tag:m.tag||''})});closeModal();toast(kind==='task'?'📋 تم إرسال المهمة':'📣 تم إرسال الإشعار');}
+    catch(e){toast(e.message);this.disabled=false;}
+  };
+}
+
+/* ══ قوائم الموقع بدل قوائم الآيفون (اختيار + تاريخ) ══ */
+function pickList(title,items,cur,cb){
+  var old=$('pov');if(old)old.remove();
+  var o=document.createElement('div');o.className='pov';o.id='pov';
+  o.innerHTML='<div class="pbox"><h3>'+esc(title||'اختر')+'</h3>'+items.map(function(x,i){return '<button class="pit'+(String(x.v)===String(cur)?' on':'')+'" data-i="'+i+'">'+esc(x.t)+'</button>';}).join('')+'<button class="btn gray" id="pov-x" style="width:100%;margin-top:6px">إلغاء</button></div>';
+  o.addEventListener('mousedown',function(e){if(e.target===o)o.remove();});
+  document.body.appendChild(o);
+  o.querySelectorAll('.pit').forEach(function(b){b.onclick=function(){var x=items[+b.getAttribute('data-i')];o.remove();cb(x);};});
+  $('pov-x').onclick=function(){o.remove();};
+  var on=o.querySelector('.pit.on');if(on&&on.scrollIntoView)on.scrollIntoView({block:'center'});
+}
+function pickDate(cur,cb){
+  var d=cur?new Date(cur+'T00:00:00'):new Date(),y=d.getFullYear(),m=d.getMonth();
+  var MN=['يناير','فبراير','مارس','أبريل','مايو','يونيو','يوليو','أغسطس','سبتمبر','أكتوبر','نوفمبر','ديسمبر'],WD=['أحد','اثنين','ثلاثاء','أربعاء','خميس','جمعة','سبت'];
+  var old=$('pov');if(old)old.remove();
+  var o=document.createElement('div');o.className='pov';o.id='pov';
+  o.addEventListener('mousedown',function(e){if(e.target===o)o.remove();});
+  document.body.appendChild(o);
+  var p2=function(x){return (x<10?'0':'')+x;},tdy=new Date(),tds=tdy.getFullYear()+'-'+p2(tdy.getMonth()+1)+'-'+p2(tdy.getDate());
+  function draw(){
+    var first=new Date(y,m,1).getDay(),days=new Date(y,m+1,0).getDate(),h='';
+    WD.forEach(function(w){h+='<div class="ph">'+w+'</div>';});
+    for(var i=0;i<first;i++)h+='<div></div>';
+    for(var k=1;k<=days;k++){var v=y+'-'+p2(m+1)+'-'+p2(k);h+='<button class="pd'+(v===cur?' on':'')+(v===tds?' td':'')+'" data-v="'+v+'">'+k+'</button>';}
+    o.innerHTML='<div class="pbox"><div class="row" style="justify-content:space-between;align-items:center"><button class="btn sm gray" id="pd-p">السابق</button><b>'+MN[m]+' '+y+'</b><button class="btn sm gray" id="pd-n">التالي</button></div><div class="pcal">'+h+'</div><div class="row" style="justify-content:flex-start;gap:8px"><button class="btn sm" id="pd-t">اليوم</button><button class="btn sm gray" id="pd-x">إلغاء</button></div></div>';
+    $('pd-p').onclick=function(){m--;if(m<0){m=11;y--;}draw();};
+    $('pd-n').onclick=function(){m++;if(m>11){m=0;y++;}draw();};
+    $('pd-t').onclick=function(){o.remove();cb(tds);};
+    $('pd-x').onclick=function(){o.remove();};
+    o.querySelectorAll('.pd').forEach(function(b){b.onclick=function(){o.remove();cb(b.getAttribute('data-v'));};});
+  }
+  draw();
+}
+function upgradeUI(root){
+  (root||document).querySelectorAll('select:not([data-ui])').forEach(function(sel){
+    sel.setAttribute('data-ui','1');sel.style.display='none';
+    var b=document.createElement('button');b.type='button';b.className='selbtn';
+    var sync=function(){var op=sel.options[sel.selectedIndex];b.textContent=(op?op.text:'اختر')+' ▾';};
+    sync();sel._sync=sync;
+    b.onclick=function(){
+      var items=[].map.call(sel.options,function(op){return {v:op.value,t:op.text};});
+      pickList(sel.getAttribute('aria-label')||'اختر',items,sel.value,function(x){sel.value=x.v;sync();sel.dispatchEvent(new Event('change',{bubbles:true}));});
+    };
+    sel.parentNode.insertBefore(b,sel.nextSibling);
+  });
+  (root||document).querySelectorAll('input[type=date]:not([data-ui])').forEach(function(inp){
+    inp.setAttribute('data-ui','1');inp.style.display='none';
+    var b=document.createElement('button');b.type='button';b.className='selbtn';b.style.gridColumn=inp.style.gridColumn||'';
+    var MN=['يناير','فبراير','مارس','أبريل','مايو','يونيو','يوليو','أغسطس','سبتمبر','أكتوبر','نوفمبر','ديسمبر'];
+    var sync=function(){var v=inp.value;if(v){var a=v.split('-');b.textContent=(+a[2])+' '+MN[(+a[1])-1]+' '+a[0]+' 📅';}else b.textContent='اختر التاريخ 📅';};
+    sync();inp._sync=sync;
+    b.onclick=function(){pickDate(inp.value,function(v){inp.value=v;sync();inp.dispatchEvent(new Event('input',{bubbles:true}));inp.dispatchEvent(new Event('change',{bubbles:true}));});};
+    inp.parentNode.insertBefore(b,inp.nextSibling);
+  });
+}
+function startUI(){
+  if(S.uiOn)return;S.uiOn=true;
+  var t=null;
+  new MutationObserver(function(){clearTimeout(t);t=setTimeout(function(){upgradeUI(document.body);},30);}).observe(document.body,{childList:true,subtree:true});
+  upgradeUI(document.body);
+  setInterval(function(){document.querySelectorAll('[data-ui]').forEach(function(x){if(x._sync)x._sync();});},700);
+  setInterval(tickTasks,1000);
+}
+
 function memberNotice(id){
   var m=(S.memMap||{})[id]||{};
   var lb='display:block;color:#60a5fa;font-size:13px;margin:12px 0 6px';
@@ -2883,7 +3296,7 @@ async function pgMembers(){
   try{
     var j=await api('/api/members');if(S.page!=='members')return;
     S.meRank=j.meRank;S.memMap={};
-    var html='<h2>👥 أعضاء الأمن السيبراني ('+j.members.length+')</h2><div class="muted" style="font-size:12px;margin:-4px 0 8px">👆 اضغط على بطاقة العضو لعرض آخر نشاط له في السيرفر</div>';
+    var html='<h2>👥 أعضاء الأمن السيبراني ('+j.members.length+')</h2><div class="muted" style="font-size:12px;margin:-4px 0 8px">👆 اضغط على بطاقة العضو لعرض آخر نشاط له في السيرفر</div>'+(S.level==='full'?'<div class="row" style="justify-content:flex-start;margin:6px 0 10px"><button class="btn sm" onclick="openTasks()">📋 مهام الأعضاء</button></div>':'');
     html+=j.members.map(function(m){
       S.memMap[m.id]=m;
       var last=m.lastLoginAt?fmt(m.lastLoginAt):'لم يسجّل الدخول للوحة بعد';
@@ -2895,6 +3308,7 @@ async function pgMembers(){
         +(dur?'<div class="log-meta">'+dur+'</div>':'')
         +'<div class="log-meta" style="color:#60a5fa">🕵️ اضغط لعرض نشاطه في السيرفر</div></div>'
         +((S.level==='mgr'&&m.id!==S.meId&&m.rank==='member')?'<button class="btn sm" onclick="memberNotice(\''+m.id+'\')">📣 إشعار القيادة</button>':'')
+        +((S.level==='full'&&m.id!==S.meId)?'<button class="btn sm" onclick="leadNotify(\''+m.id+'\')">🔔 إشعار</button>':'')
         +(canDismiss?'<button class="btn sm danger" onclick="dismissMember(\''+m.id+'\',\''+esc(m.tag).replace(/'/g,'')+'\')">🚫 فصل</button>':(S.level==='full'?'<span class="muted" style="font-size:12px">'+(m.id===S.meId?'أنت':'🔒 القائد')+'</span>':(m.id===S.meId?'<span class="muted" style="font-size:12px">أنت</span>':'')))+'</div></div>';
     }).join('')||'<div class="card center muted">ما فيه أعضاء بعد</div>';
     $('main').innerHTML=html;
@@ -3093,11 +3507,19 @@ async function recDel(id,isMain){
     var me=await api('/api/me');S.presence=me.presence;S.level=me.user.level||'view';S.meId=me.user.id;S.recAdmin=!!me.recAdmin;S.logDel=!!me.logDel;
     $('uchip').innerHTML='<img src="'+esc(me.user.avatar)+'" alt=""><span>'+esc(me.user.tag)+'</span><a class="btn sm gray" href="/auth/logout">خروج</a>';
     buildNav();render();
-    if(S.level==='full')loadNotices();
+    loadNotices();loadTasks();startUI();
     if(me.openOp)openEv(me.openOp);
+    if(me.allowInfo)allowConfirm(me.allowInfo);
     try{
       var es=S.es=new EventSource('/api/events/stream');
       es.addEventListener('notice',function(e){try{noticeEnqueue(JSON.parse(e.data));}catch(x){}});
+      es.addEventListener('task',function(e){try{var t=JSON.parse(e.data);S.tasks=(S.tasks||[]).filter(function(x){return x.id!==t.id;});if(t.status==='pending')noticeEnqueue(taskPop(t));else S.tasks.push(t);renderTaskBar();}catch(x){}});
+      es.addEventListener('taskupd',function(e){try{
+        var d=JSON.parse(e.data);
+        if(d.ev==='ack'&&d.toAssigner)toast('📋 '+d.targetTag+' استلم المهمة');
+        if(d.ev==='cancel'&&d.toTarget)toast('🚫 القيادة ألغت المهمة');
+        loadTasks();if($('tk-list'))refreshTaskList();
+      }catch(x){}});
       es.addEventListener('changed',function(){ if(S.page==='logs')loadEvents(true); });
       es.addEventListener('dismissed',function(){showDismissed();});
       es.addEventListener('evdeleted',function(e){
@@ -3134,11 +3556,11 @@ function appPage() {
 }
 
 app.get("/", (req, res) => {
-    const op = String(req.query.op || "");
-    if (/^[a-f0-9]{24}$/i.test(op)) {
-        req.session.openOp = op;
-        return req.session.save(() => res.redirect("/"));
-    }
+    const op = String(req.query.op || ""), al = String(req.query.allow || "");
+    let redir = false;
+    if (/^[a-f0-9]{24}$/i.test(op)) { req.session.openOp = op; redir = true; }
+    if (/^[a-f0-9]{24}$/i.test(al)) { req.session.openAllow = al; redir = true; }
+    if (redir) return req.session.save(() => res.redirect("/"));
     if (req.session.user) return res.send(appPage());
     const mode = req.query.denied ? "denied" : req.query.err ? "err" : "login";
     res.send(loginPage(mode, String(req.query.err || "")));
