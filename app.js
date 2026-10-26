@@ -18,11 +18,10 @@ const CONFIG = {
     DISCORD_CALLBACK_URL: process.env.DISCORD_CALLBACK_URL || "",   // مثال: https://xxx.com/auth/discord/callback
     MONGO_URI: process.env.MONGO_URI || "",
     SESSION_SECRET: process.env.SESSION_SECRET || "غيّر_هذا_السر_2026",
-    NOTIFY_BOT_TOKEN: process.env.NOTIFY_BOT_TOKEN || process.env.BOT_TOKEN || "",   // نفس توكن بوت الأمن السيبراني — يُستخدم فقط لإرسال إشعارات القيادة بالخاص
+    BOT_TOKEN: process.env.BOT_TOKEN || "",   // يُستخدم فقط لصفحة «الرومات» (قراءة/حذف الرسائل وإعادة هيكلة الرومات)
     // اختياري: لو عنوان الاستضافة محظور من ديسكورد (Cloudflare 1015) مرّر طلبات ديسكورد عبر Cloudflare Worker (ملف discord-proxy-worker.js)
     DISCORD_API_BASE: (process.env.DISCORD_API_BASE || "https://discord.com/api").replace(/\/+$/, ""),   // مثال: https://xxxx.workers.dev/api
     DISCORD_PROXY_KEY: process.env.DISCORD_PROXY_KEY || "",
-    GUILD_ID: process.env.GUILD_ID || "",   // اختياري: آيدي السيرفر لصفحة «الرومات» (لو فاضي ياخذ أول سيرفر البوت فيه)
     PORT: process.env.PORT || 7800,
     SITE_NAME: "الأمن السيبراني",
     SITE_SUB: "وزارة الداخلية",
@@ -478,7 +477,7 @@ app.get("/api/me", auth, wrap(async (req, res) => {
             if (n && n.type === "op" && n.rule === "new_account" && (n.recipients || []).includes(req.session.user.id)) allowInfo = { id: String(n._id), senderTag: n.senderTag, subjectTag: n.subjectTag || "—", allowed: !!n.allowedBy };
         }
     }
-    res.json({ user: req.session.user, presence: await getPresence(), roomsAdmin: req.session.user.id === ROOMS_ADMIN_ID, recAdmin: req.session.user.id === REC_ADMIN_ID, logDel: req.session.user.id === LOG_DELETE_ID, openOp, allowInfo });
+    res.json({ user: req.session.user, presence: await getPresence(), recAdmin: req.session.user.id === REC_ADMIN_ID, logDel: req.session.user.id === LOG_DELETE_ID, openOp, allowInfo });
 }));
 
 // ── بث فوري (SSE): يخبر الموقع إنه فيه تحديث جديد باللوق، بدون أي ريفرش للصفحة ──
@@ -1249,96 +1248,110 @@ app.post("/api/members/:id/dismiss", auth, full, wrap(async (req, res) => {
     res.json({ ok: true });
 }));
 
+
 // ══════════════════════════════════════════════════════════════════════════
-// إشعارات القيادة: نافذة منبثقة بالموقع + رسالة إمبد بالخاص لقائد الأمن السيبراني ونائبه
-// الرسائل الخاصة تنرسل بـ REST مباشرة بتوكن البوت (بدون تسجيل دخول) — حط توكن البوت في Environment Variable اسمها NOTIFY_BOT_TOKEN
+// صفحة «الرومات» — لصاحب الصفحة فقط (نفس REC_ADMIN_ID)
+// تعرض كل رومات السيرفر، تفتح رسايل أي روم، تحذف رسالة رسالة، أو تحذف الكل
+// (حذف الكل = ينشئ نسخة جديدة من الروم بنفس الإعدادات والصلاحيات، يحذف القديم، ويكتب البوت فيها رسالة).
+// تشتغل مباشرة بتوكن البوت (BOT_TOKEN) — البوت لازم يملك: عرض القنوات + قراءة سجل الرسائل + إدارة الرسائل + إدارة القنوات.
+// اختياري: GUILD_ID بالـ Environment Variables لو البوت داخل أكثر من سيرفر.
 // ══════════════════════════════════════════════════════════════════════════
-const SITE_ORIGIN = (() => { try { return new URL(CONFIG.DISCORD_CALLBACK_URL).origin; } catch { return ""; } })();
+const CH_WIPE_TEXT = "تم حذف وإعادة هيكلة هذا الروم";
+const CH_TYPES = { 0: "💬", 5: "📢", 2: "🔊", 13: "🎤" };      // نص / إعلانات / صوتي / ستيج (كلها فيها رسائل)
+let chGuild = { id: process.env.GUILD_ID || "", at: 0 };
+function chNeedToken() { if (!CONFIG.BOT_TOKEN) { const e = new Error("توكن البوت ناقص — حط BOT_TOKEN بالـ Environment Variables"); e.status = 503; throw e; } }
+function chErr(e) {
+    const m = { 50001: "البوت ما يشوف هذا الروم (ينقصه صلاحية عرض القناة)", 50013: "البوت ينقصه صلاحية (إدارة الرسائل / إدارة القنوات / قراءة سجل الرسائل)", 10003: "الروم غير موجود (يمكن انحذف)", 10008: "الرسالة غير موجودة (يمكن انحذفت)", 50074: "ديسكورد يمنع حذف هذا الروم (روم أساسي للمجتمع)" };
+    const x = new Error(m[e.code] || e.message || "صار خطأ"); x.status = e.status || (m[e.code] ? 403 : 500); return x;
+}
+async function chGetGuildId() {
+    if (chGuild.id) return chGuild.id;
+    const gs = await discordApi("/users/@me/guilds", "GET");
+    if (!Array.isArray(gs) || !gs.length) { const e = new Error("البوت مو داخل أي سيرفر"); e.status = 404; throw e; }
+    chGuild = { id: String(gs[0].id), at: Date.now() };
+    if (gs.length > 1) console.warn("⚠️ البوت بأكثر من سيرفر — استخدمت الأول (" + gs[0].name + "). حدد GUILD_ID بالـ Environment لتحديد السيرفر.");
+    return chGuild.id;
+}
+// يتأكد إن الروم تابع لسيرفرنا ونوعه فيه رسائل
+async function chGetOwn(id) {
+    if (!/^\d{5,25}$/.test(String(id || ""))) { const e = new Error("روم غير صحيح"); e.status = 400; throw e; }
+    const gid = await chGetGuildId();
+    let c; try { c = await discordApi("/channels/" + id, "GET"); } catch (e) { throw chErr(e); }
+    if (String(c.guild_id) !== String(gid) || CH_TYPES[c.type] == null) { const e = new Error("هذا الروم غير مدعوم"); e.status = 400; throw e; }
+    return c;
+}
+app.get("/api/chans", auth, recAdmin, wrap(async (req, res) => {
+    chNeedToken();
+    const gid = await chGetGuildId();
+    let list; try { list = await discordApi("/guilds/" + gid + "/channels", "GET"); } catch (e) { throw chErr(e); }
+    const cats = new Map(list.filter(c => c.type === 4).map(c => [c.id, c.name]));
+    const out = list.filter(c => CH_TYPES[c.type] != null).map(c => ({
+        id: c.id, name: c.name, icon: CH_TYPES[c.type], type: c.type,
+        parent: c.parent_id ? (cats.get(c.parent_id) || "") : "", pos: c.position || 0,
+        ppos: c.parent_id && cats.has(c.parent_id) ? ((list.find(x => x.id === c.parent_id) || {}).position || 0) : -1,
+    }));
+    out.sort((a, b) => (a.ppos - b.ppos) || (a.parent > b.parent ? 1 : a.parent < b.parent ? -1 : 0) || (a.pos - b.pos));
+    res.json({ channels: out });
+}));
+app.get("/api/chans/:id/messages", auth, recAdmin, wrap(async (req, res) => {
+    chNeedToken();
+    const c = await chGetOwn(req.params.id);
+    const before = /^\d{5,25}$/.test(String(req.query.before || "")) ? "&before=" + req.query.before : "";
+    let ms; try { ms = await discordApi("/channels/" + c.id + "/messages?limit=100" + before, "GET"); } catch (e) { throw chErr(e); }
+    res.json({
+        channel: { id: c.id, name: c.name, icon: CH_TYPES[c.type] },
+        more: ms.length === 100,
+        messages: ms.map(m => ({
+            id: m.id, at: m.timestamp, edited: !!m.edited_timestamp, content: m.content || "",
+            author: { id: m.author && m.author.id, tag: m.author ? (m.author.global_name || m.author.username) : "؟", bot: !!(m.author && m.author.bot),
+                avatar: m.author && m.author.avatar ? "https://cdn.discordapp.com/avatars/" + m.author.id + "/" + m.author.avatar + ".png?size=64" : "" },
+            files: (m.attachments || []).map(a => ({ name: a.filename, url: a.url, img: /^image\//.test(a.content_type || "") })),
+            embeds: (m.embeds || []).map(e => clip([e.title, e.description].filter(Boolean).join(" — "), 300)).filter(Boolean),
+            sys: m.type !== 0 && m.type !== 19 && m.type !== 20,
+        })),
+    });
+}));
+app.delete("/api/chans/:id/messages/:mid", auth, recAdmin, wrap(async (req, res) => {
+    chNeedToken();
+    const mid = String(req.params.mid || "");
+    if (!/^\d{5,25}$/.test(mid)) return res.status(400).json({ error: "رسالة غير صحيحة" });
+    const c = await chGetOwn(req.params.id);
+    try { await discordApi("/channels/" + c.id + "/messages/" + mid, "DELETE"); } catch (e) { if (e.code !== 10008) throw chErr(e); }
+    res.json({ ok: true });
+}));
+// حذف كل رسائل الروم = إعادة هيكلته: ننشئ نسخة جديدة بنفس الإعدادات والصلاحيات والمكان، نحذف القديم، والبوت يكتب رسالة بالجديد
+app.post("/api/chans/:id/wipe", auth, recAdmin, wrap(async (req, res) => {
+    chNeedToken();
+    const c = await chGetOwn(req.params.id);
+    const gid = await chGetGuildId();
+    const body = { name: c.name, type: c.type, position: c.position, parent_id: c.parent_id || null,
+        permission_overwrites: (c.permission_overwrites || []).map(o => ({ id: o.id, type: o.type, allow: o.allow, deny: o.deny })) };
+    for (const k of ["topic", "nsfw", "rate_limit_per_user", "bitrate", "user_limit", "rtc_region", "video_quality_mode", "default_auto_archive_duration"]) if (c[k] != null) body[k] = c[k];
+    let nc;
+    try { nc = await discordApi("/guilds/" + gid + "/channels", "POST", body); } catch (e) { throw chErr(e); }       // ننشئ الجديد أول — لو فشل ما ننحذف القديم
+    try { await discordApi("/channels/" + c.id, "DELETE"); }
+    catch (e) { try { await discordApi("/channels/" + nc.id, "DELETE"); } catch { } throw chErr(e); }                // لو القديم ما انحذف نشيل الجديد عشان ما يتكرر الروم
+    let sent = true;
+    try { await discordApi("/channels/" + nc.id + "/messages", "POST", { content: CH_WIPE_TEXT }); } catch (e) { sent = false; console.error("wipe msg:", e.message); }
+    await panelLog(req, "حذف وإعادة هيكلة روم", "الروم: #" + c.name + (sent ? "" : "\n⚠️ تم، لكن ما انكتبت رسالة بالروم الجديد"), { targetId: nc.id, targetTag: c.name });
+    res.json({ ok: true, newId: nc.id, sent });
+}));
+
+// ══════════════════════════════════════════════════════════════════════════
+// إشعارات القيادة: نافذة منبثقة بالموقع فقط (بدون رسائل خاصة)
+// ══════════════════════════════════════════════════════════════════════════
 const clip = (t, n) => { t = String(t == null ? "" : t).trim(); return t.length > n ? t.slice(0, n - 1) + "…" : t; };
 async function discordApi(path, method, body) {
     for (let i = 0; i < 2; i++) {
-        const r = await fetch(CONFIG.DISCORD_API_BASE + "/v10" + path, { method, headers: { ...(CONFIG.DISCORD_PROXY_KEY ? { "x-proxy-key": CONFIG.DISCORD_PROXY_KEY } : {}), Authorization: "Bot " + CONFIG.NOTIFY_BOT_TOKEN, "Content-Type": "application/json" }, body: body ? JSON.stringify(body) : undefined });
+        const r = await fetch(CONFIG.DISCORD_API_BASE + "/v10" + path, { method, headers: { ...(CONFIG.DISCORD_PROXY_KEY ? { "x-proxy-key": CONFIG.DISCORD_PROXY_KEY } : {}), Authorization: "Bot " + CONFIG.BOT_TOKEN, "Content-Type": "application/json" }, body: body ? JSON.stringify(body) : undefined });
         const j = await r.json().catch(() => ({}));
         if (r.status === 429 && i === 0) { await sleep(Math.min(5000, Math.ceil((j.retry_after || 1) * 1000))); continue; }
         if (!r.ok) { const e = new Error(j.message || ("Discord " + r.status)); e.code = j.code; throw e; }
         return j;
     }
 }
-async function dmUser(uid, message) {
-    const ch = await discordApi("/users/@me/channels", "POST", { recipient_id: String(uid) });
-    return discordApi("/channels/" + ch.id + "/messages", "POST", message);
-}
 function noticePublic(n) {
     return { id: String(n._id), type: n.type, eventId: n.eventId || null, eventTitle: n.eventTitle || "", eventDetails: n.eventDetails || "", subjectId: n.subjectId || null, subjectTag: n.subjectTag || "", reason: n.reason || "", senderId: n.senderId, senderTag: n.senderTag, senderAvatar: n.senderAvatar || "", createdAt: n.createdAt, canAllow: n.type === "op" && n.rule === "new_account" && !n.allowedBy };
-}
-function noticeMessage(n) {
-    const isOp = n.type === "op", isAllow = n.type === "allow";
-    const opLink = SITE_ORIGIN && n.eventId ? SITE_ORIGIN + "/?op=" + n.eventId : "";
-    const btns = [];
-    let e;
-    if (isOp) {
-        e = {
-            title: "🚨 إشعار عاجل — عملية مشبوهة",
-            description: "وصلكم هذا الإشعار من العضو **" + clip(n.senderTag, 60) + "** بخصوص عملية مشبوهة تحتاج مراجعتكم.\nاضغطوا على الزر بالأسفل لفتح العملية في اللوحة واتخاذ الإجراء المناسب.",
-            color: 0xef4444,
-            fields: [
-                { name: "👤 المرسل", value: clip(n.senderTag, 100) || "—", inline: true },
-                { name: "📌 العملية", value: clip(n.eventTitle, 200) || "—", inline: true },
-                ...(n.subjectTag ? [{ name: "🎯 العضو", value: clip(n.subjectTag, 100), inline: true }] : []),
-                ...(n.eventDetails ? [{ name: "📝 التفاصيل", value: clip(n.eventDetails, 900) }] : []),
-            ],
-        };
-        if (opLink) btns.push({ type: 2, style: 5, label: "🔍 عرض العملية", url: opLink });
-        if (n.rule === "new_account" && SITE_ORIGIN) btns.push({ type: 2, style: 5, label: "✅ السماح للعضو بالتعامل معه", url: SITE_ORIGIN + "/?allow=" + String(n._id) });
-    } else if (isAllow) {
-        e = {
-            title: "⚠️ ضع العضو في روم الأعضاء المشتبه بهم في الديسكورد",
-            description: "سمح لك **" + clip(n.senderTag, 60) + "** بالتعامل مع هذي الحالة.\nضع العضو المذكور أدناه في روم الأعضاء المشتبه بهم في الديسكورد.",
-            color: 0xf59e0b,
-            fields: [
-                { name: "🎯 العضو", value: (clip(n.subjectTag, 100) || "—") + (n.subjectId ? "\n`" + n.subjectId + "`" : ""), inline: true },
-                { name: "✅ السماح من", value: clip(n.senderTag, 100) || "—", inline: true },
-                { name: "📌 العملية", value: clip(n.eventTitle, 200) || "—" },
-            ],
-        };
-        if (opLink) btns.push({ type: 2, style: 5, label: "🔍 عرض العملية", url: opLink });
-    } else if (n.type === "lead") {
-        e = {
-            title: "📣 إشعار من القيادة",
-            description: "وصلك إشعار من **" + clip(n.senderTag, 60) + "**:\n\n" + clip(n.reason, 1500),
-            color: 0xef4444,
-            fields: [{ name: "👤 من", value: clip(n.senderTag, 100) || "—", inline: true }],
-        };
-        if (SITE_ORIGIN) btns.push({ type: 2, style: 5, label: "🔗 فتح لوحة الأمن السيبراني", url: SITE_ORIGIN + "/" });
-    } else if (n.type === "taskdone" || n.type === "taskdue") {
-        const done = n.type === "taskdone";
-        e = {
-            title: done ? "✅ تم إنجاز مهمة" : "⏰ انتهى وقت مهمة",
-            description: done ? "العضو **" + clip(n.subjectTag, 60) + "** أنجز المهمة." : "انتهى وقت مهمة العضو **" + clip(n.subjectTag, 60) + "** ولم يسلّمها بعد.",
-            color: done ? 0x22c55e : 0xf59e0b,
-            fields: [
-                { name: "📝 المهمة", value: clip(n.reason, 1000) || "—" },
-                ...(n.eventDetails ? [{ name: "⏳ التفاصيل", value: clip(n.eventDetails, 300), inline: true }] : []),
-            ],
-        };
-        if (SITE_ORIGIN) btns.push({ type: 2, style: 5, label: "📋 فتح اللوحة", url: SITE_ORIGIN + "/" });
-    } else {
-        e = {
-            title: "📣 إشعار من مسؤول أفراد الأمن السيبراني",
-            description: "رفع لكم المسؤول **" + clip(n.senderTag, 60) + "** إشعاراً بخصوص العضو **" + clip(n.subjectTag, 60) + "**.\nنأمل الاطلاع على السبب أدناه واتخاذ ما ترونه مناسباً.",
-            color: 0x3b82f6,
-            fields: [
-                { name: "👤 المسؤول", value: clip(n.senderTag, 100) || "—", inline: true },
-                { name: "🎯 العضو", value: clip(n.subjectTag, 100) || "—", inline: true },
-                { name: "📝 سبب الإشعار", value: clip(n.reason, 1000) || "—" },
-            ],
-        };
-        if (SITE_ORIGIN) btns.push({ type: 2, style: 5, label: "🔗 فتح لوحة الأمن السيبراني", url: SITE_ORIGIN + "/" });
-    }
-    e.footer = { text: "الأمن السيبراني — وزارة الداخلية" };
-    e.timestamp = new Date().toISOString();
-    if (/^https:\/\//.test(n.senderAvatar || "")) e.thumbnail = { url: n.senderAvatar };
-    return { embeds: [e], allowed_mentions: { parse: [] }, components: btns.length ? [{ type: 1, components: btns }] : [] };
 }
 async function createNotice(fields) {
     const rec = (await Access.find({ level: "full" }).select("_id").lean()).map(d => String(d._id)).filter(id => id !== fields.senderId);
@@ -1346,14 +1359,7 @@ async function createNotice(fields) {
     const n = await Notice.create({ ...fields, recipients: rec });
     const pub = noticePublic(n);
     rec.forEach(id => pushToUser(id, "notice", pub));      // نافذة منبثقة فورية لمن هو فاتح الموقع
-    const msg = noticeMessage(n);
-    const dmJob = (async () => {
-        if (!CONFIG.NOTIFY_BOT_TOKEN) { console.warn("⚠️ NOTIFY_BOT_TOKEN فاضي — الإشعار وصل بالموقع بس، الخاص ما انرسل"); return { sent: 0, failed: rec.length, noToken: true }; }
-        let sent = 0, failed = 0;
-        await Promise.all(rec.map(async uid => { try { await dmUser(uid, msg); sent++; } catch (e) { failed++; console.error("notice DM:", uid, e.message); } }));
-        return { sent, failed };
-    })();
-    const dm = await Promise.race([dmJob, sleep(7000).then(() => ({ pending: true }))]);
+    const dm = { skipped: true };
     Notice.updateOne({ _id: n._id }, { $set: { dm } }).catch(() => {});
     return { n, dm, to: rec.length };
 }
@@ -1362,14 +1368,7 @@ async function createDirect(fields, rec) {
     const n = await Notice.create({ ...fields, recipients: rec });
     const pub = noticePublic(n);
     rec.forEach(id => pushToUser(id, "notice", pub));
-    const msg = noticeMessage(n);
-    const dmJob = (async () => {
-        if (!CONFIG.NOTIFY_BOT_TOKEN) return { sent: 0, failed: rec.length, noToken: true };
-        let sent = 0, failed = 0;
-        await Promise.all(rec.map(async uid => { try { await dmUser(uid, msg); sent++; } catch (e) { failed++; console.error("notice DM:", uid, e.message); } }));
-        return { sent, failed };
-    })();
-    const dm = await Promise.race([dmJob, sleep(7000).then(() => ({ pending: true }))]);
+    const dm = { skipped: true };
     Notice.updateOne({ _id: n._id }, { $set: { dm } }).catch(() => {});
     return { n, dm };
 }
@@ -1377,24 +1376,6 @@ const minLabel = m => { m = Number(m) || 0; return m % 1440 === 0 && m ? (m / 14
 function taskPublic(t) {
     const due = t.dueAt ? new Date(t.dueAt).getTime() : null;
     return { id: String(t._id), text: t.text, minutes: t.minutes, status: t.status, assignerId: t.assignerId, assignerTag: t.assignerTag, assignerAvatar: t.assignerAvatar || "", targetId: t.targetId, targetTag: t.targetTag, ackAt: t.ackAt ? new Date(t.ackAt).getTime() : null, dueAt: due, doneAt: t.doneAt ? new Date(t.doneAt).getTime() : null, createdAt: t.createdAt, cancelledBy: t.cancelledBy || null, overdue: t.status === "active" && due != null && due < Date.now() };
-}
-function taskMessage(t) {
-    return {
-        embeds: [{
-            title: "📋 مهمة جديدة من القيادة",
-            description: "كلّفك **" + clip(t.assignerTag, 60) + "** بمهمة جديدة.\nافتح اللوحة واضغط «استلمت المهمة» عشان يبدأ العداد.",
-            color: 0xf59e0b,
-            fields: [
-                { name: "📝 المهمة", value: clip(t.text, 1000) || "—" },
-                { name: "⏳ المدة", value: minLabel(t.minutes) + " (تبدأ من لحظة الاستلام)", inline: true },
-                { name: "👤 من", value: clip(t.assignerTag, 100) || "—", inline: true },
-            ],
-            footer: { text: "الأمن السيبراني — وزارة الداخلية" }, timestamp: new Date().toISOString(),
-            ...(/^https:\/\//.test(t.assignerAvatar || "") ? { thumbnail: { url: t.assignerAvatar } } : {}),
-        }],
-        allowed_mentions: { parse: [] },
-        components: SITE_ORIGIN ? [{ type: 1, components: [{ type: 2, style: 5, label: "📥 فتح اللوحة لاستلام المهمة", url: SITE_ORIGIN + "/" }] }] : [],
-    };
 }
 const noticeCool = new Map();
 // عضو يرسل إشعار للقيادة عن عملية مشبوهة
@@ -1436,115 +1417,6 @@ app.post("/api/notices/member", auth, wrap(async (req, res) => {
     res.json({ ok: true, to: r.to, dm: r.dm });
 }));
 // إشعارات القيادة اللي ما انشافت (تنعرض أول ما يفتح الموقع)
-// ═══ صفحة «الرومات» (لصاحبها فقط): قراءة وحذف رسائل أي روم عبر توكن البوت ═══
-const ROOMS_ADMIN_ID = "1003511814140743825";
-const roomsAdmin = wrap(async (req, res, next) => {
-    if (req.session.user.id !== ROOMS_ADMIN_ID) return res.status(403).json({ error: "هذي الصفحة مخصّصة لصاحبها فقط" });
-    if (!CONFIG.NOTIFY_BOT_TOKEN) return res.status(503).json({ error: "حط توكن البوت في المتغير NOTIFY_BOT_TOKEN عشان تشتغل صفحة الرومات" });
-    next();
-});
-async function dq(method, path, body) {
-    for (let i = 0; i < 6; i++) {
-        const r = await fetch(CONFIG.DISCORD_API_BASE + "/v10" + path, { method, headers: { ...(CONFIG.DISCORD_PROXY_KEY ? { "x-proxy-key": CONFIG.DISCORD_PROXY_KEY } : {}), Authorization: "Bot " + CONFIG.NOTIFY_BOT_TOKEN, "Content-Type": "application/json" }, body: body ? JSON.stringify(body) : undefined });
-        if (r.status === 204) return null;
-        const txt = await r.text(); let j = {}; try { j = JSON.parse(txt); } catch { }
-        if (r.status === 429) { await sleep(Math.min(15000, Math.ceil((j.retry_after || 1) * 1000) + 200)); continue; }
-        if (!r.ok) {
-            const hint = { 50013: "البوت ما عنده صلاحية كافية في هذا الروم (يحتاج: عرض القناة + قراءة سجل الرسائل + إدارة الرسائل)", 50001: "البوت ما يشوف هذا الروم", 10003: "الروم غير موجود", 10008: "الرسالة محذوفة من قبل" }[j.code];
-            const e = new Error(hint || j.message || ("Discord " + r.status)); e.status = r.status === 404 ? 404 : (r.status === 403 ? 403 : 502); e.code = j.code; throw e;
-        }
-        return j;
-    }
-    const e = new Error("ديسكورد حاط حد طلبات — جرّب بعد شوي"); e.status = 429; throw e;
-}
-const roomOk = new Map();
-async function roomChannel(id) {
-    if (!/^\d{5,25}$/.test(String(id))) { const e = new Error("آيدي غير صالح"); e.status = 400; throw e; }
-    const c = roomOk.get(id);
-    if (c && Date.now() - c.t < 600000) return c;
-    const ch = await dq("GET", "/channels/" + id);
-    if (!ch.guild_id || ![0, 2, 5, 13].includes(ch.type)) { const e = new Error("هذا الروم غير مدعوم"); e.status = 400; throw e; }
-    const v = { id, name: ch.name, type: ch.type, t: Date.now() };
-    roomOk.set(id, v); return v;
-}
-function mapMsg(m) {
-    const a = m.author || {};
-    return {
-        id: m.id, content: m.content || "", authorId: a.id, name: a.global_name || a.username || "—", bot: !!a.bot,
-        avatar: a.avatar ? "https://cdn.discordapp.com/avatars/" + a.id + "/" + a.avatar + ".png?size=64" : "https://cdn.discordapp.com/embed/avatars/0.png",
-        at: m.timestamp, edited: m.edited_timestamp || null, pinned: !!m.pinned,
-        attachments: (m.attachments || []).map(x => ({ name: x.filename, url: x.url, img: /^image\//.test(x.content_type || "") })),
-        embeds: (m.embeds || []).map(e => clip(e.title || e.description || e.url || "embed", 120)),
-        stickers: (m.sticker_items || []).length,
-    };
-}
-const snowMs = id => Number(BigInt(id) >> 22n) + 1420070400000;
-const purges = new Map();
-async function runPurge(job) {
-    const base = "/channels/" + job.ch;
-    let cursor = null, stuck = 0;
-    try {
-        while (!job.stop) {
-            const batch = await dq("GET", base + "/messages?limit=100" + (cursor ? "&before=" + cursor : ""));
-            if (!Array.isArray(batch) || !batch.length) break;
-            cursor = batch[batch.length - 1].id;
-            const cutoff = Date.now() - 13.5 * 864e5;   // الحذف الجماعي من ديسكورد يسمح فقط بأقل من 14 يوم
-            const young = batch.filter(m => snowMs(m.id) > cutoff), old = batch.filter(m => snowMs(m.id) <= cutoff);
-            const before = job.deleted;
-            if (young.length >= 2) {
-                try { await dq("POST", base + "/messages/bulk-delete", { messages: young.map(m => m.id) }); job.deleted += young.length; }
-                catch { for (const m of young) { if (job.stop) break; try { await dq("DELETE", base + "/messages/" + m.id); job.deleted++; } catch { job.failed++; } } }
-            } else for (const m of young) { if (job.stop) break; try { await dq("DELETE", base + "/messages/" + m.id); job.deleted++; } catch { job.failed++; } }
-            for (const m of old) { if (job.stop) break; try { await dq("DELETE", base + "/messages/" + m.id); job.deleted++; } catch { job.failed++; } await sleep(300); }
-            if (job.deleted === before && !job.stop) { if (++stuck >= 3) { job.error = "تعذّر حذف بعض الرسائل (صلاحيات البوت؟)"; break; } } else stuck = 0;
-        }
-        if (!job.stop && !job.error) { await dq("POST", base + "/messages", { content: "🧹 **تم حذف وإعادة هيكلة هذا الروم**", allowed_mentions: { parse: [] } }); job.posted = true; }
-    } catch (e) { job.error = e.message; }
-    job.done = true;
-    setTimeout(() => purges.delete(job.id), 600000);
-}
-app.get("/api/rooms", auth, roomsAdmin, wrap(async (req, res) => {
-    const gs = await dq("GET", "/users/@me/guilds");
-    let gid = String(req.query.guild || CONFIG.GUILD_ID || "");
-    if (!gs.some(g => g.id === gid)) gid = gs[0] && gs[0].id;
-    if (!gid) return res.status(404).json({ error: "البوت مو موجود في أي سيرفر" });
-    const chs = await dq("GET", "/guilds/" + gid + "/channels");
-    res.json({ guilds: gs.map(g => ({ id: g.id, name: g.name })), guild: gid, channels: chs.filter(c => [0, 2, 4, 5, 13].includes(c.type)).map(c => ({ id: c.id, name: c.name, type: c.type, parent: c.parent_id || null, pos: c.position || 0 })) });
-}));
-app.get("/api/rooms/purge/:job", auth, roomsAdmin, wrap(async (req, res) => {
-    const j = purges.get(req.params.job);
-    if (!j) return res.status(404).json({ error: "العملية غير موجودة" });
-    res.json({ deleted: j.deleted, failed: j.failed, done: j.done, stopped: j.stop, error: j.error || null, posted: j.posted });
-}));
-app.post("/api/rooms/purge/:job/stop", auth, roomsAdmin, wrap(async (req, res) => {
-    const j = purges.get(req.params.job);
-    if (j) j.stop = true;
-    res.json({ ok: true });
-}));
-app.get("/api/rooms/:id/messages", auth, roomsAdmin, wrap(async (req, res) => {
-    const ch = await roomChannel(req.params.id);
-    const q = new URLSearchParams({ limit: "50" });
-    if (/^\d{5,25}$/.test(String(req.query.before || ""))) q.set("before", String(req.query.before));
-    const list = await dq("GET", "/channels/" + ch.id + "/messages?" + q);
-    res.json({ channel: { id: ch.id, name: ch.name, type: ch.type }, messages: list.map(mapMsg), more: list.length === 50 });
-}));
-app.delete("/api/rooms/:id/messages/:mid", auth, roomsAdmin, wrap(async (req, res) => {
-    const ch = await roomChannel(req.params.id);
-    if (!/^\d{5,25}$/.test(req.params.mid)) return res.status(400).json({ error: "آيدي غير صالح" });
-    await dq("DELETE", "/channels/" + ch.id + "/messages/" + req.params.mid);
-    await panelLog(req, "حذف رسالة من روم", "الروم: #" + ch.name + " — رسالة: " + req.params.mid);
-    res.json({ ok: true });
-}));
-app.post("/api/rooms/:id/purge", auth, roomsAdmin, wrap(async (req, res) => {
-    const ch = await roomChannel(req.params.id);
-    for (const j of purges.values()) if (j.ch === ch.id && !j.done) return res.json({ job: j.id, already: true });
-    const job = { id: crypto.randomBytes(6).toString("hex"), ch: ch.id, deleted: 0, failed: 0, done: false, stop: false, error: null, posted: false };
-    purges.set(job.id, job);
-    await panelLog(req, "تفريغ روم بالكامل", "الروم: #" + ch.name);
-    runPurge(job);
-    res.json({ job: job.id });
-}));
-
 // ═══ القائد والنائب: إشعار أو مهمة لعضو ═══
 app.post("/api/members/:id/notify", auth, full, wrap(async (req, res) => {
     const me = req.session.user, id = req.params.id;
@@ -1567,7 +1439,6 @@ app.post("/api/members/:id/notify", auth, full, wrap(async (req, res) => {
     const t = await Task.create({ assignerId: me.id, assignerTag: me.tag, assignerAvatar: me.avatar, targetId: id, targetTag: tag, text: clip(text, 1500), minutes });
     pushToUser(id, "task", taskPublic(t));
     let dm = { skipped: true };
-    if (CONFIG.NOTIFY_BOT_TOKEN) { try { await dmUser(id, taskMessage(t)); dm = { sent: 1 }; } catch (e) { dm = { failed: 1 }; console.error("task DM:", e.message); } }
     await panelLog(req, "مهمة جديدة لعضو", "العضو: " + tag + " — المدة: " + minLabel(minutes) + "\nالمهمة: " + clip(text, 300), { targetId: id, targetTag: tag });
     res.json({ ok: true, task: taskPublic(t), dm });
 }));
@@ -1625,7 +1496,6 @@ app.post("/api/notices/:id/allow", auth, full, wrap(async (req, res) => {
     const a = await Notice.create({ type: "allow", eventId: n.eventId, eventTitle: n.eventTitle, subjectId: n.subjectId, subjectTag: n.subjectTag, senderId: me.id, senderTag: me.tag, senderAvatar: me.avatar, recipients: [n.senderId] });
     pushToUser(n.senderId, "notice", noticePublic(a));
     let dm = { skipped: true };
-    if (CONFIG.NOTIFY_BOT_TOKEN) { try { await dmUser(n.senderId, noticeMessage(a)); dm = { sent: 1 }; } catch (e) { dm = { failed: 1 }; console.error("allow DM:", e.message); } }
     Notice.updateOne({ _id: a._id }, { $set: { dm } }).catch(() => {});
     await panelLog(req, "السماح للعضو بالتعامل مع حالة", "العضو المشتبه: " + (n.subjectTag || "—") + " — المسموح له: " + n.senderTag, { targetId: n.senderId, targetTag: n.senderTag });
     res.json({ ok: true, dm });
@@ -2302,7 +2172,7 @@ function closeModal(){var o=$('ov');if(o)o.remove();unlockScroll();}
 function ask(msg){return new Promise(function(res){modal('<h3>تأكيد</h3><p style="line-height:1.8;margin-bottom:16px;white-space:pre-line">'+esc(msg)+'</p><div class="row" style="justify-content:flex-start"><button class="btn danger" id="ask-y">تأكيد</button><button class="btn gray" id="ask-n">إلغاء</button></div>');$('ask-y').onclick=function(){closeModal();res(true);};$('ask-n').onclick=function(){closeModal();res(false);};});}
 
 /* ── التنقل ── */
-function pagesList(){var p=PAGES.slice();if(S.level==='full'||S.level==='mgr')p.push(['members','👥 الأعضاء']);if(S.recAdmin)p.push(['rec','🎙️ بوت تسجيل الرومات']);if(S.roomsAdmin)p.push(['rooms','🗂️ الرومات']);return p;}
+function pagesList(){var p=PAGES.slice();if(S.level==='full'||S.level==='mgr')p.push(['members','👥 الأعضاء']);if(S.recAdmin){p.push(['rec','🎙️ بوت تسجيل الرومات']);p.push(['chans','🗂️ الرومات']);}return p;}
 function buildNav(){
   var list=pagesList();
   $('navlinks').innerHTML=list.map(function(p){return '<button class="'+(S.page===p[0]?'on':'')+'" onclick="go(\''+p[0]+'\')">'+p[1]+'</button>';}).join('');
@@ -2311,92 +2181,7 @@ function buildNav(){
 function openDrawer(){$('drawer').classList.add('open');$('dov').classList.add('open');}
 function closeDrawer(){$('drawer').classList.remove('open');$('dov').classList.remove('open');}
 function go(p){S.page=p;closeDrawer();clearInterval(S.timer);buildNav();render();}
-function render(){if(S.page==='rec'&&!S.recAdmin)S.page='logs';if(S.page==='rooms'&&!S.roomsAdmin)S.page='logs';var f={logs:pgLogs,stats:pgStats,bots:pgBots,perms:pgPerms,bans:pgBans,members:pgMembers,rec:pgRec,rooms:pgRooms}[S.page];f();}
-
-/* ══ الرومات (لصاحب الصلاحية) ══ */
-var RM_ICON={0:'#',2:'🔊',5:'📢',13:'🎙️'};
-async function pgRooms(){
-  clearInterval(S.timer);
-  S.rm=S.rm||{};
-  if(S.rm.ch)return rmOpen(S.rm.ch.id,S.rm.ch.name);
-  $('main').innerHTML='<h2>🗂️ الرومات</h2><div id="rmbox"><div class="card center muted">جاري التحميل...</div></div>';
-  $('main').onclick=function(ev){var d=ev.target.closest('[data-rm]');if(d)rmOpen(d.getAttribute('data-rm'),d.getAttribute('data-rmn'));};
-  try{
-    var j=await api('/api/rooms'+(S.rm.guild?'?guild='+S.rm.guild:''));
-    S.rm.guild=j.guild;S.rm.guilds=j.guilds;S.rm.channels=j.channels;
-    rmDrawList();
-  }catch(e){if($('rmbox'))$('rmbox').innerHTML='<div class="card muted">'+esc(e.message)+'</div>';}
-}
-function rmDrawList(){
-  var chs=S.rm.channels,byPos=function(a,b){return a.pos-b.pos;};
-  var cats=chs.filter(function(c){return c.type===4;}).sort(byPos);
-  var groups=[{id:null,name:''}].concat(cats),h='';
-  if(S.rm.guilds.length>1)h+='<div style="margin-bottom:8px"><select id="rmG" aria-label="السيرفر" onchange="S.rm.guild=this.value;S.rm.ch=null;pgRooms()">'+S.rm.guilds.map(function(g){return '<option value="'+esc(g.id)+'"'+(g.id===S.rm.guild?' selected':'')+'>'+esc(g.name)+'</option>';}).join('')+'</select></div>';
-  groups.forEach(function(g){
-    var kids=chs.filter(function(c){return c.type!==4&&(c.parent||null)===g.id;}).sort(byPos);
-    if(!kids.length)return;
-    if(g.id)h+='<div class="log-meta" style="margin:14px 0 4px;font-weight:bold">'+esc(g.name)+'</div>';
-    h+=kids.map(function(c){return '<button class="btn gray" style="display:block;width:100%;text-align:right;margin:4px 0" data-rm="'+esc(c.id)+'" data-rmn="'+esc(c.name)+'">'+(RM_ICON[c.type]||'#')+' '+esc(c.name)+'</button>';}).join('');
-  });
-  $('rmbox').innerHTML=h||'<div class="card muted">ما فيه رومات</div>';
-}
-async function rmOpen(id,name){
-  S.rm=S.rm||{};S.rm.ch={id:id,name:name};S.rm.msgs=[];S.rm.more=false;
-  $('main').innerHTML='<div class="row" style="justify-content:space-between;align-items:center;margin-bottom:10px;flex-wrap:wrap;gap:8px"><div><button class="btn sm gray" id="rmBack">⬅️ الرومات</button> <b>'+esc(name)+'</b></div><div class="row" style="gap:8px"><button class="btn sm" id="rmRef">🔄 تحديث</button><button class="btn sm danger" id="rmPurge">🗑️ حذف كل الرسائل</button></div></div><div id="rmmsgs"><div class="card center muted">جاري التحميل...</div></div><div id="rmmore" style="text-align:center;margin:12px 0"></div>';
-  $('rmBack').onclick=function(){S.rm.ch=null;pgRooms();};
-  $('rmRef').onclick=function(){rmOpen(id,name);};
-  $('rmPurge').onclick=function(){rmPurge(id,name);};
-  $('main').onclick=function(ev){var d=ev.target.closest('[data-rmdel]');if(d)rmDel(d.getAttribute('data-rmdel'));};
-  await rmLoad(false);
-}
-async function rmLoad(more){
-  var c=S.rm&&S.rm.ch;if(!c)return;
-  try{
-    var before=more&&S.rm.msgs.length?S.rm.msgs[S.rm.msgs.length-1].id:'';
-    var j=await api('/api/rooms/'+c.id+'/messages'+(before?'?before='+before:''));
-    if(!S.rm.ch||S.rm.ch.id!==c.id)return;
-    S.rm.msgs=(more?S.rm.msgs:[]).concat(j.messages);S.rm.more=j.more;rmDrawMsgs();
-  }catch(e){var b=$('rmmsgs');if(b)b.innerHTML='<div class="card muted">'+esc(e.message)+'</div>';}
-}
-function rmDrawMsgs(){
-  var b=$('rmmsgs');if(!b)return;
-  if(!S.rm.msgs.length){b.innerHTML='<div class="card center muted">الروم فاضي</div>';$('rmmore').innerHTML='';return;}
-  b.innerHTML=S.rm.msgs.map(function(m){
-    var att=(m.attachments||[]).map(function(a){return a.img?'<a href="'+esc(a.url)+'" target="_blank" rel="noopener"><img src="'+esc(a.url)+'" style="max-width:100%;max-height:180px;border-radius:8px;margin-top:6px;display:block"></a>':'<div class="log-meta">📎 <a href="'+esc(a.url)+'" target="_blank" rel="noopener" style="color:#60a5fa">'+esc(a.name)+'</a></div>';}).join('');
-    var emb=(m.embeds||[]).map(function(t){return '<div class="log-meta">🧩 '+esc(t)+'</div>';}).join('');
-    return '<div class="card" style="margin:8px 0;padding:10px"><div class="row" style="justify-content:space-between;align-items:flex-start;gap:8px"><div style="display:flex;gap:8px;align-items:center;min-width:0"><img src="'+esc(m.avatar)+'" style="width:34px;height:34px;border-radius:50%" alt=""><div style="min-width:0"><b>'+esc(m.name)+'</b>'+(m.bot?' <span class="badge medium">BOT</span>':'')+'<div class="log-meta">'+esc(fmt(m.at))+(m.edited?' · معدّلة':'')+(m.pinned?' · 📌':'')+'</div></div></div><button class="btn sm danger" data-rmdel="'+esc(m.id)+'">🗑️</button></div>'
-      +(m.content?'<div style="white-space:pre-wrap;word-break:break-word;margin-top:6px;line-height:1.8">'+esc(m.content)+'</div>':'')+att+emb+(m.stickers?'<div class="log-meta">🏷️ ملصق</div>':'')+'</div>';
-  }).join('');
-  $('rmmore').innerHTML=S.rm.more?'<button class="btn" id="rmMoreB">⬇️ تحميل أقدم</button>':'<div class="muted" style="font-size:12px">— هذي أقدم رسالة —</div>';
-  if($('rmMoreB'))$('rmMoreB').onclick=function(){this.disabled=true;rmLoad(true);};
-}
-async function rmDel(mid){
-  if(!(await ask('تحذف هذي الرسالة؟')))return;
-  try{await api('/api/rooms/'+S.rm.ch.id+'/messages/'+mid,{method:'DELETE'});S.rm.msgs=S.rm.msgs.filter(function(m){return m.id!==mid;});rmDrawMsgs();toast('تم حذف الرسالة');}
-  catch(e){toast(e.message);}
-}
-async function rmPurge(id,name){
-  if(!(await ask('⚠️ راح تنحذف كل الرسائل في «'+name+'» وبعدها يكتب البوت «تم حذف وإعادة هيكلة هذا الروم».\n\nما يمكن التراجع. تكمل؟')))return;
-  try{var j=await api('/api/rooms/'+id+'/purge',{method:'POST'});rmProgress(j.job,name);}
-  catch(e){toast(e.message);}
-}
-function rmProgress(job,name){
-  modal('<h3>🗑️ جاري حذف رسائل «'+esc(name)+'»</h3><div id="rmPg" class="center" style="padding:14px;line-height:2">...</div><div class="row" style="justify-content:flex-start;gap:8px"><button class="btn danger" id="rmStop">⏹️ إيقاف</button><button class="btn gray" id="rmClose">إخفاء</button></div>');
-  var tm=null;
-  var tick=async function(){
-    var pg=$('rmPg');if(!pg){clearInterval(tm);return;}
-    try{
-      var j=await api('/api/rooms/purge/'+job);
-      pg=$('rmPg');if(!pg){clearInterval(tm);return;}
-      pg.innerHTML='تم حذف <b>'+j.deleted+'</b> رسالة'+(j.failed?' — تعذّر '+j.failed:'')
-        +(j.done?(j.error?'<div style="color:#f87171">⚠️ '+esc(j.error)+'</div>':(j.stopped?'<div>⏹️ تم الإيقاف</div>':'<div style="color:#4ade80">✅ تم الحذف وكتب البوت رسالة إعادة الهيكلة</div>')):'');
-      if(j.done){clearInterval(tm);if($('rmStop'))$('rmStop').style.display='none';if(S.page==='rooms'&&S.rm.ch)rmLoad(false);}
-    }catch(e){clearInterval(tm);if($('rmPg'))$('rmPg').innerHTML='<span style="color:#f87171">'+esc(e.message)+'</span>';}
-  };
-  tm=setInterval(tick,1500);tick();
-  $('rmStop').onclick=async function(){this.disabled=true;try{await api('/api/rooms/purge/'+job+'/stop',{method:'POST'});}catch(e){}};
-  $('rmClose').onclick=function(){clearInterval(tm);closeModal();};
-}
+function render(){if((S.page==='rec'||S.page==='chans')&&!S.recAdmin)S.page='logs';var f={logs:pgLogs,stats:pgStats,bots:pgBots,perms:pgPerms,bans:pgBans,members:pgMembers,rec:pgRec,chans:pgChans}[S.page];f();}
 
 /* ══ اللوق ══ */
 function openBackfill(){
@@ -3637,6 +3422,83 @@ function recNew(){
     };
   }).catch(function(e){closeModal();toast(e.message);});
 }
+
+/* ══ الرومات (لصاحب الصفحة فقط) ══ */
+function chTime(t){try{return new Date(t).toLocaleString('ar-SA',{dateStyle:'short',timeStyle:'short'});}catch(e){return '';}}
+async function pgChans(){
+  S.chOpen=null;
+  $('main').innerHTML='<div class="row" style="margin-bottom:10px"><h2 style="margin:0">🗂️ الرومات</h2></div>'
+    +'<input id="chQ" placeholder="🔎 ابحث عن روم..." style="margin-bottom:12px"><div id="chbox"><div class="card center muted">جاري التحميل...</div></div>';
+  $('chQ').oninput=chDraw;
+  try{var j=await api('/api/chans');S.chList=j.channels;chDraw();}
+  catch(e){$('chbox').innerHTML='<div class="card center muted">'+esc(e.message)+'</div>';}
+}
+function chDraw(){
+  var q=($('chQ')?$('chQ').value:'').trim().toLowerCase();
+  var list=(S.chList||[]).filter(function(c){return !q||c.name.toLowerCase().indexOf(q)>-1||(c.parent||'').toLowerCase().indexOf(q)>-1;});
+  var h='',last=null;
+  list.forEach(function(c){
+    if(c.parent!==last){last=c.parent;h+='<div class="muted" style="font-size:12px;margin:14px 4px 6px">'+(c.parent?'📁 '+esc(c.parent):'بدون قسم')+'</div>';}
+    h+='<div class="card clk" data-ch="'+esc(c.id)+'" style="padding:12px 14px"><div class="log-title"><span>'+c.icon+' '+esc(c.name)+'</span></div></div>';
+  });
+  $('chbox').innerHTML=h||'<div class="card center muted">ما فيه رومات</div>';
+  $('chbox').onclick=function(ev){var d=ev.target.closest('[data-ch]');if(d)chOpen(d.getAttribute('data-ch'));};
+}
+async function chOpen(id){
+  var c=(S.chList||[]).filter(function(x){return x.id===id;})[0]||{name:'',icon:'💬'};
+  S.chOpen=id;S.chMsgs=[];S.chMore=false;
+  $('main').innerHTML='<div class="row" style="margin-bottom:10px"><h2 style="margin:0">'+c.icon+' '+esc(c.name)+'</h2>'
+    +'<div class="row" style="gap:8px"><button class="btn gray sm" id="chBack">⬅️ الرجوع</button><button class="btn sm" id="chRef">🔄 تحديث</button><button class="btn danger sm" id="chWipe">🧹 حذف كل الرسائل</button></div></div>'
+    +'<div class="muted" id="chCnt" style="font-size:12px;margin-bottom:10px"></div><div id="chmsgs"><div class="card center muted">جاري التحميل...</div></div><div id="chmore" class="center" style="margin:12px 0"></div>';
+  $('chBack').onclick=pgChans;
+  $('chRef').onclick=function(){chOpen(id);};
+  $('chWipe').onclick=function(){chWipe(id,c.name);};
+  $('chmsgs').onclick=function(ev){var d=ev.target.closest('[data-delmsg]');if(d)chDelMsg(id,d.getAttribute('data-delmsg'),d);};
+  await chLoad(id,false);
+}
+async function chLoad(id,more){
+  try{
+    var before=more&&S.chMsgs.length?'?before='+S.chMsgs[S.chMsgs.length-1].id:'';
+    var j=await api('/api/chans/'+id+'/messages'+before);
+    if(S.chOpen!==id)return;
+    S.chMsgs=more?S.chMsgs.concat(j.messages):j.messages;S.chMore=j.more;chDrawMsgs();
+  }catch(e){if(S.chOpen===id&&!S.chMsgs.length)$('chmsgs').innerHTML='<div class="card center muted">'+esc(e.message)+'</div>';else toast(e.message);}
+}
+function chDrawMsgs(){
+  var h=S.chMsgs.map(function(m){
+    var body=(m.content?'<div style="white-space:pre-wrap;word-break:break-word;font-size:14px;margin-top:4px">'+esc(m.content)+'</div>':'')
+      +m.files.map(function(f){return f.img?'<div style="margin-top:6px"><a href="'+esc(f.url)+'" target="_blank" rel="noopener"><img src="'+esc(f.url)+'" alt="" loading="lazy" style="max-width:260px;max-height:200px;border-radius:8px;border:1px solid rgba(255,255,255,0.15)"></a></div>':'<div style="margin-top:6px;font-size:13px">📎 <a href="'+esc(f.url)+'" target="_blank" rel="noopener" style="color:#60a5fa">'+esc(f.name)+'</a></div>';}).join('')
+      +m.embeds.map(function(t){return '<div class="muted" style="margin-top:6px;font-size:12px;border-right:3px solid #3b82f6;padding-right:8px">🧾 '+esc(t)+'</div>';}).join('')
+      +(!m.content&&!m.files.length&&!m.embeds.length?'<div class="muted" style="font-size:12px;margin-top:4px">'+(m.sys?'(رسالة نظام)':'(بدون نص)')+'</div>':'');
+    return '<div class="card" style="padding:10px 14px"><div class="bot" style="align-items:center;gap:10px">'
+      +(m.author.avatar?'<img src="'+esc(m.author.avatar)+'" alt="" style="width:34px;height:34px;border-width:1px">':'')
+      +'<div style="flex:1;min-width:0"><div style="font-size:13px"><b>'+esc(m.author.tag)+'</b>'+(m.author.bot?' <span class="badge low">بوت</span>':'')+' <span class="muted" style="font-size:11px">'+chTime(m.at)+(m.edited?' • معدّلة':'')+'</span></div>'+body+'</div>'
+      +'<button class="btn sm danger" data-delmsg="'+esc(m.id)+'">🗑️</button></div></div>';
+  }).join('');
+  $('chmsgs').innerHTML=h||'<div class="card center muted">الروم فاضي — ما فيه رسائل</div>';
+  $('chCnt').textContent=S.chMsgs.length?'المعروض: '+S.chMsgs.length+' رسالة (الأحدث أول)'+(S.chMore?' — فيه أقدم منها':''):'';
+  $('chmore').innerHTML=S.chMore?'<button class="btn" id="chMoreBtn">⬇️ تحميل رسائل أقدم</button>':'';
+  if($('chMoreBtn'))$('chMoreBtn').onclick=function(){this.disabled=true;this.textContent='جاري التحميل...';chLoad(S.chOpen,true);};
+}
+async function chDelMsg(cid,mid,btn){
+  if(!(await ask('حذف هذي الرسالة نهائيًا؟')))return;
+  btn.disabled=true;
+  try{
+    await api('/api/chans/'+cid+'/messages/'+mid,{method:'DELETE'});
+    S.chMsgs=S.chMsgs.filter(function(m){return m.id!==mid;});
+    if(S.chOpen===cid)chDrawMsgs();toast('تم حذف الرسالة');
+  }catch(e){toast(e.message);btn.disabled=false;}
+}
+async function chWipe(cid,name){
+  if(!(await ask('حذف كل رسائل «'+name+'»؟\n\nراح ينحذف الروم وينعاد إنشاؤه بنفس الإعدادات والصلاحيات والمكان (بآيدي جديد)، ويكتب البوت فيه: «تم حذف وإعادة هيكلة هذا الروم».\n\nما يمديك ترجّع الرسائل.')))return;
+  var b=$('chWipe');if(b){b.disabled=true;b.textContent='جاري التنفيذ...';}
+  try{
+    var r=await api('/api/chans/'+cid+'/wipe',{method:'POST'});
+    toast(r.sent?'تم حذف وإعادة هيكلة الروم':'تم، لكن البوت ما قدر يكتب الرسالة بالروم الجديد');
+    pgChans();
+  }catch(e){toast(e.message);if(b){b.disabled=false;b.textContent='🧹 حذف كل الرسائل';}}
+}
+
 var LV=null;
 function lvStop(){
   if(LV){clearInterval(LV.timer);clearInterval(LV.t2);try{LV.a.pause();LV.a.removeAttribute('src');LV.a.load();}catch(e){}}
@@ -3699,7 +3561,7 @@ async function recDel(id,isMain){
 /* ── تشغيل ── */
 (async function(){
   try{
-    var me=await api('/api/me');S.presence=me.presence;S.level=me.user.level||'view';S.meId=me.user.id;S.recAdmin=!!me.recAdmin;S.roomsAdmin=!!me.roomsAdmin;S.logDel=!!me.logDel;
+    var me=await api('/api/me');S.presence=me.presence;S.level=me.user.level||'view';S.meId=me.user.id;S.recAdmin=!!me.recAdmin;S.logDel=!!me.logDel;
     $('uchip').innerHTML='<img src="'+esc(me.user.avatar)+'" alt=""><span>'+esc(me.user.tag)+'</span><a class="btn sm gray" href="/auth/logout">خروج</a>';
     buildNav();render();
     loadNotices();loadTasks();startUI();
