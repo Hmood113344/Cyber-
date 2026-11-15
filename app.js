@@ -156,8 +156,8 @@ const Notice = mongoose.model("CyberNotice", new mongoose.Schema({
 
 // ── بث فوري للوحة (Server-Sent Events) — بدون أي تحديث كامل للصفحة ──
 const sseClients = new Set();
-function broadcastChanged() {
-    const line = "event: changed\ndata: {}\n\n";
+function broadcastChanged(extra) {
+    const line = "event: changed\ndata: " + JSON.stringify(extra || {}) + "\n\n";
     for (const res of sseClients) { try { res.write(line); } catch { sseClients.delete(res); } }
 }
 
@@ -291,6 +291,14 @@ app.use(session({
     secret: CONFIG.SESSION_SECRET, resave: false, saveUninitialized: false,
     cookie: { maxAge: 7 * 864e5, httpOnly: true, sameSite: "lax", secure: "auto" },
 }));
+// ── أي تعديل (POST/PUT/DELETE) ينجح من أي شخص → يتحدّث الموقع عند كل المتصلين بدون ريفرش ──
+app.use("/api", (req, res, next) => {
+    if (req.method === "GET" || req.method === "HEAD" || req.method === "OPTIONS") return next();
+    if (/\/notices\/[^/]+\/seen$/.test(req.path)) return next();
+    const by = req.session && req.session.user ? req.session.user.id : null;
+    res.on("finish", () => { if (res.statusCode < 400) setTimeout(() => broadcastChanged({ src: "user", by }), 250); });
+    next();
+});
 const wrap = fn => (req, res, next) => Promise.resolve(fn(req, res, next)).catch(e => { console.error("❌", req.method, req.path, e.message); if (!res.headersSent) res.status(e.status || 500).json({ error: e.message || "صار خطأ بالسيرفر" }); });
 
 // الصلاحية تجي من جدول CyberAccess اللي البوت يحدّثه لحظياً من رتب ديسكورد
@@ -476,7 +484,7 @@ app.get("/api/me", auth, wrap(async (req, res) => {
             if (n && n.type === "op" && n.rule === "new_account" && (n.recipients || []).includes(req.session.user.id)) allowInfo = { id: String(n._id), senderTag: n.senderTag, subjectTag: n.subjectTag || "—", allowed: !!n.allowedBy };
         }
     }
-    res.json({ user: req.session.user, presence: await getPresence(), recAdmin: req.session.user.id === REC_ADMIN_ID, logDel: req.session.user.id === LOG_DELETE_ID, openOp, allowInfo });
+    res.json({ user: req.session.user, presence: await getPresence(), recAdmin: req.session.user.id === REC_ADMIN_ID, danger: req.session.user.id === DANGER_ID, logDel: req.session.user.id === LOG_DELETE_ID, openOp, allowInfo });
 }));
 
 // ── بث فوري (SSE): يخبر الموقع إنه فيه تحديث جديد باللوق، بدون أي ريفرش للصفحة ──
@@ -1463,6 +1471,79 @@ async function pollBotSignals() {
     } catch (e) { console.error("pollBotSignals:", e.message); }
     finally { sigBusy = false; }
 }
+
+// ══════════════════════════════════════════════════════════════════════════
+// نظام الخطر — زر لصاحب الصفحة فقط: يرسل إنذار خطر للوق (مكتوب بوضوح إنه إنذار يدوي من القائد)
+// ══════════════════════════════════════════════════════════════════════════
+const DANGER_ID = "1003511814140743825";
+const dangerOnly = wrap(async (req, res, next) => {
+    if (req.session.user.id !== DANGER_ID) return res.status(403).json({ error: "نظام الخطر مخصّص لصاحب الصفحة فقط" });
+    next();
+});
+app.post("/api/danger", auth, dangerOnly, wrap(async (req, res) => {
+    const text = String(req.body.text || "").trim().slice(0, 300) || "شخص مشبوه";
+    const ev = await Event.create({
+        kind: "suspicious", cat: "danger", rule: "danger_manual", key: "danger:" + Date.now(), severity: "high",
+        title: "خطر",
+        details: text,
+        actorId: null, actorTag: null, targetId: null, targetTag: null,
+        data: { act: "danger_manual", manual: true }, updatedAt: new Date(),
+    });
+    res.json({ ok: true, id: String(ev._id) });
+}));
+
+// ══════════════════════════════════════════════════════════════════════════
+// إصلاح «بدون تسجيل»: أي عملية دخول/خروج من الروم المسجّل ما انربطت بجلسة تنربط بجلستها الحقيقية،
+// وإذا ما فيه جلسة أصلاً تنبني لها جلسة توضيحية (مين دخل ومتى طلع) بدل ما تبقى «بدون تسجيل»
+// ══════════════════════════════════════════════════════════════════════════
+let healBusy = false;
+async function healRecEvents() {
+    if (healBusy) return;
+    healBusy = true;
+    let fixed = 0;
+    try {
+        const now = Date.now();
+        const evs = await Event.find({ "data.recRoom": true, "data.sid": null, createdAt: { $gte: new Date(now - 29 * 864e5) } }).sort({ createdAt: 1 }).limit(300).lean();
+        for (const e of evs) {
+            try {
+                const t = new Date(e.createdAt).getTime(), uid = e.actorId;
+                if (!uid) continue;
+                // 1) جلسة حقيقية موجودة وقت العملية؟
+                const real = await VoiceSess.findOne({
+                    startedAt: { $lte: new Date(t + 120000) }, $or: [{ endedAt: null }, { endedAt: { $gte: new Date(t - 120000) } }], "stays.uid": uid,
+                }).sort({ startedAt: -1 }).select("sid").lean();
+                if (real) { await Event.updateOne({ _id: e._id }, { $set: { "data.sid": real.sid } }); fixed++; continue; }
+                // 2) ما فيه جلسة: نستنى 3 دقايق (يمكن البوت يتأخر) وبعدها نبني جلسة توضيحية من عمليات الدخول/الخروج
+                if (now - t < 180000) continue;
+                const isIn = e.data && e.data.dir === "in";
+                let tin = null, tout = null, partner = null;
+                if (isIn) {
+                    tin = t;
+                    partner = await Event.findOne({ "data.recRoom": true, "data.dir": "out", actorId: uid, createdAt: { $gt: new Date(t), $lt: new Date(t + 12 * 3600 * 1000) } }).sort({ createdAt: 1 }).select("createdAt").lean();
+                    tout = partner ? new Date(partner.createdAt).getTime() : t + 60000;
+                } else {
+                    tout = t;
+                    partner = await Event.findOne({ "data.recRoom": true, "data.dir": "in", actorId: uid, createdAt: { $lt: new Date(t), $gt: new Date(t - 12 * 3600 * 1000) } }).sort({ createdAt: -1 }).select("createdAt").lean();
+                    tin = partner ? new Date(partner.createdAt).getTime() : t - 60000;
+                }
+                const sid = "meta-" + Math.min(tin, tout) + "-" + uid;
+                const rm = /الروم:\s*([^\n]+)/.exec(String(e.details || ""));
+                await VoiceSess.updateOne({ sid }, { $setOnInsert: {
+                    sid, chId: null, chName: rm ? rm[1].trim() : "الروم المسجّل", startedAt: new Date(tin), endedAt: new Date(tout), lastAt: new Date(tout),
+                    chunks: 0, bytes: 0, pkts: 0, speech: [], speechN: 0, tracks: {},
+                    stays: [{ uid, name: e.actorTag || uid, tag: e.actorTag || uid, avatar: null, start: tin, end: tout }],
+                    dbg: "جلسة توضيحية: البوت ما كان يستقبل الصوت وقتها — فقط مين دخل ومتى طلع (بدون صوت)", dep: null, decErr: null,
+                } }, { upsert: true });
+                const ids = [e._id].concat(partner ? [partner._id] : []);
+                await Event.updateMany({ _id: { $in: ids }, "data.sid": null }, { $set: { "data.sid": sid } });
+                fixed += ids.length;
+            } catch (x) { console.error("healRecEvents item:", x.message); }
+        }
+    } catch (e) { console.error("healRecEvents:", e.message); }
+    finally { healBusy = false; }
+    if (fixed) { console.log("🩹 ربط " + fixed + " عملية بتسجيل"); broadcastChanged({ src: "heal" }); }
+}
+
 function startSiteJobs() {
     // مهام انتهى وقتها بدون تسليم: ننبّه اللي كلّف بها
     setInterval(async () => {
@@ -1481,6 +1562,8 @@ function startSiteJobs() {
     setInterval(pollBotSignals, 1500);
     pollBotSignals();
     // أرشفة الأسابيع المكتملة (كانت تتم من البوت — الحين من الموقع)
+    setTimeout(healRecEvents, 15000);
+    setInterval(healRecEvents, 2 * 60 * 1000);
     setTimeout(archiveWeeks, 8000);
     setInterval(archiveWeeks, 15 * 60 * 1000);
 }
@@ -1495,13 +1578,17 @@ body { background:linear-gradient(135deg,#0a1628 0%,#0d1f3c 40%,#0a2744 70%,#0d3
 nav { background:rgba(5,15,30,0.95); backdrop-filter:blur(15px); border-bottom:1px solid rgba(59,130,246,0.3); padding:0 1.2rem; display:flex; align-items:center; justify-content:space-between; height:62px; position:sticky; top:var(--tbar-h,0px); z-index:900; gap:10px; }
 .nav-start { display:flex; align-items:center; gap:12px; }
 .logo { font-size:1.2rem; font-weight:900; background:linear-gradient(90deg,#3b82f6,#60a5fa,#93c5fd); -webkit-background-clip:text; -webkit-text-fill-color:transparent; letter-spacing:1px; white-space:nowrap; }
-.nav-links { display:flex; gap:0.3rem; list-style:none; }
+.nav-links { display:none !important; gap:0.3rem; list-style:none; }
 .nav-links button { background:transparent; border:1px solid transparent; color:#94a3b8; padding:0.4rem 0.9rem; border-radius:8px; cursor:pointer; font-family:inherit; font-size:0.88rem; transition:all .2s; }
 .nav-links button:hover, .nav-links button.on { background:rgba(59,130,246,0.2); border-color:#3b82f6; color:#60a5fa; }
-.hamburger-btn { display:none; background:rgba(59,130,246,0.15); border:1px solid #3b82f6; color:#60a5fa; padding:0.35rem 0.7rem; border-radius:8px; cursor:pointer; font-size:1.3rem; line-height:1; }
+.hamburger-btn { display:inline-block; background:rgba(59,130,246,0.15); border:1px solid #3b82f6; color:#60a5fa; padding:0.35rem 0.7rem; border-radius:8px; cursor:pointer; font-size:1.3rem; line-height:1; }
 .userchip { display:flex; align-items:center; gap:8px; font-size:13px; color:#94a3b8; }
 .userchip img { width:30px; height:30px; border-radius:50%; border:2px solid var(--gold); }
-@media (max-width:1024px) { .nav-links { display:none !important; } .hamburger-btn { display:inline-block; } .userchip span { display:none; } }
+@media (max-width:1024px) { .userchip span { display:none; } }
+.danger-btn { display:none; background:rgba(239,68,68,0.18); border:1px solid #ef4444; color:#fca5a5; padding:0.35rem 0.8rem; border-radius:8px; cursor:pointer; font-family:inherit; font-size:0.85rem; font-weight:bold; white-space:nowrap; animation:dgpulse 2s infinite; }
+.danger-btn.show { display:inline-block; }
+@keyframes dgpulse { 0%,100% { box-shadow:0 0 0 0 rgba(239,68,68,0.45); } 50% { box-shadow:0 0 0 7px rgba(239,68,68,0); } }
+.logo.tg { cursor:pointer; user-select:none; -webkit-tap-highlight-color:transparent; }
 .dov { display:none; position:fixed; inset:0; background:rgba(5,10,20,0.65); backdrop-filter:blur(2px); z-index:1400; }
 .dov.open { display:block; }
 .drawer { position:fixed; top:0; right:0; height:100%; width:270px; max-width:82vw; background:rgba(5,15,30,0.98); border-left:1px solid rgba(59,130,246,0.35); z-index:1500; transform:translateX(100%); transition:transform .25s ease; padding:14px 0; box-shadow:-8px 0 30px rgba(0,0,0,0.6); display:flex; flex-direction:column; }
@@ -1756,7 +1843,7 @@ const CLIENT = String.raw`
 var PAGES=[['logs','📜 اللوق'],['stats','📊 الإحصائيات'],['bots','🤖 البوتات'],['perms','🔐 صلاحيات السيرفر'],['bans','🔨 الباندات']];
 var S={page:'logs',q:'',cat:'',unres:false,cu:false,events:[],sig:'',timer:null,permsTab:'roles',permsView:'danger',permsQ:'',meta:null,presence:true,level:'view',meId:null,tf:null};
 var CATS=[['','الكل'],['sus','⚠️ العمليات المشبوهة'],['newacc','🆕 حسابات جديدة'],['join','دخول'],['leave','خروج'],['kick','طرد'],['ban','حظر'],['role','الرتب'],['inquiry','📩 استفسارات الرتب'],['channel','القنوات'],['voice','🎙️ الرومات الصوتية'],['message','الرسائل المحذوفة'],['probot','🧹 حذف عبر ProBot'],['bot','البوتات'],['webhook','ويبهوكس'],['everyone','منشن everyone'],['server','إعدادات السيرفر'],['panel','عمليات اللوحة']];
-var RULE_AR={new_account:'حساب جديد',mass_roles_created:'رتب جماعية',mass_role_delete:'حذف رتب',mass_channel_create:'إنشاء قنوات',mass_channel_delete:'حذف قنوات',mass_ban:'حظر جماعي',mass_kick:'طرد جماعي',dangerous_perm_grant:'صلاحيات خطيرة',dangerous_role_assigned:'رتبة خطيرة',bot_added:'بوت جديد',webhook_created:'ويبهوك',everyone_spam:'منشن everyone',mass_join:'غارة دخول',mass_msg_delete:'مسح ضخم',server_changed:'إعدادات السيرفر'};
+var RULE_AR={danger_manual:'خطر',new_account:'حساب جديد',mass_roles_created:'رتب جماعية',mass_role_delete:'حذف رتب',mass_channel_create:'إنشاء قنوات',mass_channel_delete:'حذف قنوات',mass_ban:'حظر جماعي',mass_kick:'طرد جماعي',dangerous_perm_grant:'صلاحيات خطيرة',dangerous_role_assigned:'رتبة خطيرة',bot_added:'بوت جديد',webhook_created:'ويبهوك',everyone_spam:'منشن everyone',mass_join:'غارة دخول',mass_msg_delete:'مسح ضخم',server_changed:'إعدادات السيرفر'};
 function $(id){return document.getElementById(id);}
 function esc(s){return String(s==null?'':s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;');}
 function toast(m){var t=$('toast');t.textContent=m;t.style.display='block';clearTimeout(t._t);t._t=setTimeout(function(){t.style.display='none';},3200);}
@@ -3485,10 +3572,45 @@ async function recDel(id,isMain){
   try{await api('/api/rec/'+encodeURIComponent(id),{method:'DELETE'});toast(isMain?'تم الإرجاع':'تم الحذف');recLoad();}catch(e){toast(e.message);}
 }
 
+
+/* ══ نظام الخطر (لصاحب الصفحة فقط) — الزر مخفي، ويظهر/يختفي بالضغط على كلام «الأمن السيبراني» ══ */
+function logoTap(){if(!S.danger)return;var b=$('dangerBtn');if(b)b.classList.toggle('show');}
+async function openDanger(){
+  var inp='width:100%;background:rgba(255,255,255,.06);border:1px solid rgba(239,68,68,.45);border-radius:10px;color:#e2e8f0;padding:10px;font-family:inherit;font-size:14px;box-sizing:border-box';
+  modal('<h3 style="color:#fca5a5">🚨 نظام الخطر</h3>'
+   +'<div class="muted" style="font-size:13px;line-height:1.8">يرسل إنذار خطر عالي الخطورة للوق ويطلع عند الكل فوراً.</div>'
+   +'<label style="display:block;color:#fca5a5;font-size:13px;margin:12px 0 6px">وش الخطر؟</label>'
+   +'<input id="dgT" maxlength="300" value="شخص مشبوه" style="'+inp+'">'
+   +'<div class="row" style="justify-content:flex-start;gap:8px;margin-top:14px"><button class="btn danger" id="dgGo">🚨 إرسال الإنذار</button><button class="btn gray" onclick="closeModal()">إلغاء</button></div>');
+  $('dgGo').onclick=async function(){
+    this.disabled=true;
+    try{
+      await api('/api/danger',{method:'POST',body:JSON.stringify({text:($('dgT').value||'').trim()})});
+      closeModal();toast('🚨 انرسل إنذار الخطر للوق');
+    }catch(e){toast(e.message);this.disabled=false;}
+  };
+}
+
+/* ══ تحديث فوري عند الجميع بعد أي تعديل (بدون ريفرش) ══ */
+function liveRefresh(d){
+  if(S.page==='logs'){loadEvents(true);return;}
+  if(!d||d.src!=='user')return;
+  clearTimeout(S.lvT);
+  S.lvT=setTimeout(function(){
+    if($('ov')||$('dismissed'))return;
+    var a=document.activeElement;
+    if(a&&(a.tagName==='INPUT'||a.tagName==='TEXTAREA'||a.tagName==='SELECT'))return;
+    if(S.page==='rec'||S.page==='chans'||(S.page==='perms'&&S.chEdit))return;
+    var y=window.pageYOffset||0;
+    render();
+    setTimeout(function(){window.scrollTo(0,y);},350);
+  },700);
+}
+
 /* ── تشغيل ── */
 (async function(){
   try{
-    var me=await api('/api/me');S.presence=me.presence;S.level=me.user.level||'view';S.meId=me.user.id;S.recAdmin=!!me.recAdmin;S.logDel=!!me.logDel;
+    var me=await api('/api/me');S.presence=me.presence;S.level=me.user.level||'view';S.meId=me.user.id;S.recAdmin=!!me.recAdmin;S.logDel=!!me.logDel;S.danger=!!me.danger;
     $('uchip').innerHTML='<img src="'+esc(me.user.avatar)+'" alt=""><span>'+esc(me.user.tag)+'</span><a class="btn sm gray" href="/auth/logout">خروج</a>';
     buildNav();render();
     loadNotices();loadTasks();startUI();
@@ -3504,7 +3626,7 @@ async function recDel(id,isMain){
         if(d.ev==='cancel'&&d.toTarget)toast('🚫 القيادة ألغت المهمة');
         loadTasks();if($('tk-list'))refreshTaskList();
       }catch(x){}});
-      es.addEventListener('changed',function(){ if(S.page==='logs')loadEvents(true); });
+      es.addEventListener('changed',function(e){var d=null;try{d=JSON.parse(e.data);}catch(x){}liveRefresh(d);});
       es.addEventListener('dismissed',function(){showDismissed();});
       es.addEventListener('evdeleted',function(e){
         try{
@@ -3527,7 +3649,7 @@ async function recDel(id,isMain){
 function appPage() {
     return HEAD(CONFIG.SITE_NAME + " — " + CONFIG.SITE_SUB) + `<body>
 <nav>
-  <div class="nav-start"><button class="hamburger-btn" onclick="openDrawer()" aria-label="القائمة">☰</button><div class="logo">🛡️ ${CONFIG.SITE_NAME}<span class="hide-sm"> — ${CONFIG.SITE_SUB}</span></div></div>
+  <div class="nav-start"><button class="hamburger-btn" onclick="openDrawer()" aria-label="القائمة">☰</button><button class="danger-btn" id="dangerBtn" onclick="openDanger()">🚨 نظام الخطر</button><div class="logo" id="logoTg" onclick="logoTap()">🛡️ ${CONFIG.SITE_NAME}<span class="hide-sm"> — ${CONFIG.SITE_SUB}</span></div></div>
   <ul class="nav-links" id="navlinks"></ul>
   <div class="userchip" id="uchip"></div>
 </nav>
