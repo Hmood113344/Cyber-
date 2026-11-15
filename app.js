@@ -1139,36 +1139,6 @@ app.delete("/api/rec/:id", auth, recAdmin, wrap(async (req, res) => {
 }));
 
 
-// ── التنبيه الصوتي + الإعلان (للقائد والنائب) ──
-// النص يتخزّن عند البوت، والبوت هو اللي يتحقق من الرتبة (قائد/نائب) — تعديل نص التنبيه للقائد فقط، النائب يشوفه عرض فقط
-const annText = (v, min, max, what) => {
-    const t = String(v == null ? "" : v).replace(/\s+/g, " ").trim();
-    if (t.length < min || t.length > max) { const e = new Error(what + " لازم يكون بين " + min + " و " + max + " حرف"); e.status = 400; throw e; }
-    return t;
-};
-const annLast = new Map();
-app.get("/api/ann", auth, full, wrap(async (req, res) => res.json(await callRecBot("rec_ann_get", recWho(req), 30000))));
-app.get("/api/ann/rooms", auth, full, wrap(async (req, res) => res.json(await callRecBot("rec_ann_rooms", recWho(req), 30000))));
-app.put("/api/ann/notice", auth, full, wrap(async (req, res) => {
-    const reset = !!(req.body && req.body.reset === true);
-    const text = reset ? "" : annText(req.body && req.body.text, 5, 300, "نص التنبيه");
-    const r = await callRecBot("rec_ann_save", { text, reset, ...recWho(req) }, 60000);
-    await panelLog(req, reset ? "إرجاع نص التنبيه الصوتي للافتراضي" : "تعديل نص التنبيه الصوتي", "📝 القديم: " + clip(r.old, 200) + "\n📝 الجديد: " + clip(r.text, 200));
-    res.json({ ok: true, text: r.text, isDefault: r.isDefault });
-}));
-app.post("/api/ann/send", auth, full, wrap(async (req, res) => {
-    const uid = req.session.user.id;
-    if (Date.now() - (annLast.get(uid) || 0) < 4000) return res.status(429).json({ error: "استنى لحظات قبل ما ترسل إعلان ثاني" });
-    const text = annText(req.body && req.body.text, 3, 400, "نص الإعلان");
-    const all = !!(req.body && req.body.all === true);
-    const rooms = Array.isArray(req.body && req.body.rooms) ? req.body.rooms.map(String).filter(x => /^\d{5,25}$/.test(x)).slice(0, 20) : [];
-    if (!all && !rooms.length) return res.status(400).json({ error: "اختر روم أو «كل الرومات المسجّلة»" });
-    annLast.set(uid, Date.now());
-    const r = await callRecBot("rec_ann_send", { text, all, rooms, ...recWho(req) }, 90000);
-    await panelLog(req, "إعلان صوتي بالرومات", "📣 النص: " + clip(text, 300) + "\n🎙️ الرومات: " + (r.results || []).map(x => (x.ok ? "✅ " : "⚠️ ") + x.name).join("، "));
-    res.json({ ok: true, ...r });
-}));
-
 // ── استماع مباشر لبوت التسجيل: الجلسات الجارية الحين + معلومات الروم + بث الصوت الحي ──
 app.get("/api/rec/live", auth, recAdmin, wrap(async (req, res) => {
     const list = await VoiceSess.find({ endedAt: null, startedAt: { $gte: new Date(Date.now() - 12 * 3600 * 1000) } })
@@ -2217,7 +2187,7 @@ function closeModal(){var o=$('ov');if(o)o.remove();unlockScroll();}
 function ask(msg){return new Promise(function(res){modal('<h3>تأكيد</h3><p style="line-height:1.8;margin-bottom:16px;white-space:pre-line">'+esc(msg)+'</p><div class="row" style="justify-content:flex-start"><button class="btn danger" id="ask-y">تأكيد</button><button class="btn gray" id="ask-n">إلغاء</button></div>');$('ask-y').onclick=function(){closeModal();res(true);};$('ask-n').onclick=function(){closeModal();res(false);};});}
 
 /* ── التنقل ── */
-function pagesList(){var p=PAGES.slice();if(S.level==='full'||S.level==='mgr')p.push(['members','👥 الأعضاء']);if(S.level==='full')p.push(['ann','📢 التنبيه والإعلان']);if(S.recAdmin){p.push(['rec','🎙️ بوت تسجيل الرومات']);p.push(['chans','🗂️ الرومات']);}return p;}
+function pagesList(){var p=PAGES.slice();if(S.level==='full'||S.level==='mgr')p.push(['members','👥 الأعضاء']);if(S.recAdmin){p.push(['rec','🎙️ بوت تسجيل الرومات']);p.push(['chans','🗂️ الرومات']);}return p;}
 function buildNav(){
   var list=pagesList();
   $('navlinks').innerHTML=list.map(function(p){return '<button class="'+(S.page===p[0]?'on':'')+'" onclick="go(\''+p[0]+'\')">'+p[1]+'</button>';}).join('');
@@ -2226,7 +2196,7 @@ function buildNav(){
 function openDrawer(){$('drawer').classList.add('open');$('dov').classList.add('open');}
 function closeDrawer(){$('drawer').classList.remove('open');$('dov').classList.remove('open');}
 function go(p){S.page=p;closeDrawer();clearInterval(S.timer);buildNav();render();}
-function render(){if((S.page==='rec'||S.page==='chans')&&!S.recAdmin)S.page='logs';var f={logs:pgLogs,stats:pgStats,bots:pgBots,perms:pgPerms,bans:pgBans,members:pgMembers,rec:pgRec,chans:pgChans,ann:pgAnn}[S.page];if(S.page==='ann'&&S.level!=='full'){S.page='logs';f=pgLogs;}f();}
+function render(){if((S.page==='rec'||S.page==='chans')&&!S.recAdmin)S.page='logs';var f={logs:pgLogs,stats:pgStats,bots:pgBots,perms:pgPerms,bans:pgBans,members:pgMembers,rec:pgRec,chans:pgChans}[S.page];f();}
 
 /* ══ اللوق ══ */
 function openBackfill(){
@@ -3397,81 +3367,6 @@ async function dismissMember(id,name){
   try{await api('/api/members/'+id+'/dismiss',{method:'POST'});toast('تم الفصل');pgMembers();}catch(e){toast(e.message);}
 }
 
-/* ══ التنبيه والإعلان الصوتي (القائد والنائب) ══ */
-var ANN_TA='width:100%;background:rgba(255,255,255,.06);border:1px solid rgba(59,130,246,.35);border-radius:10px;color:#e2e8f0;padding:10px;font-family:inherit;font-size:14px;resize:vertical;line-height:1.8';
-var ANN_LB='display:block;color:#60a5fa;font-size:13px;margin:12px 0 6px';
-async function pgAnn(){
-  clearInterval(S.timer);$('main').onclick=null;
-  $('main').innerHTML='<h2 style="margin:0 0 6px">📢 التنبيه والإعلان الصوتي</h2><div class="muted" style="font-size:12px;margin-bottom:12px">كل التنبيهات والإعلانات تطلع بنفس الصوت واللهجة الثابتة.</div><div id="annbox"><div class="card center muted">جاري التحميل...</div></div>';
-  try{S.ann=await api('/api/ann');}catch(e){if(S.page==='ann'&&$('annbox'))$('annbox').innerHTML='<div class="card center muted">'+esc(e.message)+'</div>';return;}
-  if(S.page!=='ann')return;
-  annDraw();
-}
-function annRoomOpts(){
-  var rs=S.ann.rooms||[];
-  if(!rs.length)return '<option value="" disabled selected>ما فيه رومات مسجَّلة حالياً</option>';
-  return '<option value="__all">🌐 كل الرومات المسجّلة ('+rs.length+')</option>'+rs.map(function(r){return '<option value="'+esc(r.id)+'">🔊 '+esc(r.name)+(r.users?' — '+r.users+' بالروم':' — فاضي')+(r.recording?' 🔴':'')+'</option>';}).join('');
-}
-function annDraw(){
-  var a=S.ann,ed=!!a.canEdit;
-  var meta=a.updatedBy?'<div class="log-meta">✏️ آخر تعديل: '+esc(a.updatedBy)+(a.updatedAt?' — '+esc(new Date(a.updatedAt).toLocaleString('ar-SA')):'')+'</div>':'';
-  $('annbox').innerHTML=
-    '<div class="card"><div class="log-title">🔔 نص التنبيه الرسمي <span class="badge '+(ed?'done':'low')+'">'+(ed?'تعديل':'👁️ عرض فقط')+'</span></div>'
-    +'<div class="log-meta">يتشغّل أول ما أحد يدخل الروم المسجّل (ولو دخلوا كذا واحد مع بعض يتشغّل مرة وحدة).</div>'+meta
-    +'<label style="'+ANN_LB+'">نص التنبيه</label>'
-    +'<textarea id="annN" rows="3" maxlength="300" style="'+ANN_TA+'"'+(ed?'':' readonly')+'>'+esc(a.text||'')+'</textarea>'
-    +'<div class="muted" style="font-size:12px;margin-top:4px" id="annNc"></div>'
-    +(ed
-      ?'<div class="row" style="justify-content:flex-start;gap:8px;margin-top:12px"><button class="btn" id="annSave">💾 حفظ النص</button>'+(a.isDefault?'':'<button class="btn gray" id="annReset">↩️ الافتراضي</button>')+'</div>'
-      :'<div class="warn" style="margin:12px 0 0">تعديل نص التنبيه للقائد فقط — أنت تشوفه عرض فقط.</div>')
-    +'</div>'
-    +'<div class="card"><div class="log-title">📣 إعلان صوتي</div>'
-    +'<div class="log-meta">أي نص تكتبه يتحوّل لنفس الصوت ويتشغّل بالروم اللي تختاره.</div>'
-    +'<label style="'+ANN_LB+'">نص الإعلان</label>'
-    +'<textarea id="annT" rows="4" maxlength="400" placeholder="اكتب الإعلان اللي تبيه ينقال بالروم..." style="'+ANN_TA+'"></textarea>'
-    +'<div class="muted" style="font-size:12px;margin-top:4px" id="annTc"></div>'
-    +'<label style="'+ANN_LB+'">الروم</label><select id="annR">'+annRoomOpts()+'</select>'
-    +'<div class="row" style="justify-content:flex-start;gap:8px;margin-top:14px"><button class="btn" id="annSend">📣 إرسال الإعلان</button><button class="btn sm gray" id="annRef">🔄 تحديث الرومات</button></div>'
-    +'<div id="annRes" style="margin-top:12px"></div></div>';
-  function cnt(id,cid,mx){var t=$(id),c=$(cid);if(!t||!c)return;c.textContent=(t.value||'').length+' / '+mx;}
-  $('annN').oninput=function(){cnt('annN','annNc',300);};cnt('annN','annNc',300);
-  $('annT').oninput=function(){cnt('annT','annTc',400);};cnt('annT','annTc',400);
-  if(ed){
-    $('annSave').onclick=async function(){
-      var b=this,t=($('annN').value||'').trim();
-      if(t.length<5){toast('اكتب نص التنبيه (٥ أحرف على الأقل)');return;}
-      b.disabled=true;b.textContent='جاري توليد الصوت...';
-      try{var r=await api('/api/ann/notice',{method:'PUT',body:JSON.stringify({text:t})});S.ann.text=r.text;S.ann.isDefault=r.isDefault;toast('تم حفظ نص التنبيه');if(S.page==='ann')annDraw();}
-      catch(e){toast(e.message);b.disabled=false;b.textContent='💾 حفظ النص';}
-    };
-    if($('annReset'))$('annReset').onclick=async function(){
-      if(!(await ask('ترجّع نص التنبيه للنص الافتراضي؟')))return;
-      try{var r=await api('/api/ann/notice',{method:'PUT',body:JSON.stringify({reset:true})});S.ann.text=r.text;S.ann.isDefault=true;toast('رجع النص الافتراضي');if(S.page==='ann')annDraw();}catch(e){toast(e.message);}
-    };
-  }
-  $('annRef').onclick=async function(){
-    var b=this;b.disabled=true;
-    try{var r=await api('/api/ann/rooms');S.ann.rooms=r.rooms||[];var cur=$('annR').value;$('annR').innerHTML=annRoomOpts();if(cur&&$('annR').querySelector('option[value="'+cur+'"]'))$('annR').value=cur;toast('تم تحديث الرومات');}
-    catch(e){toast(e.message);}
-    b.disabled=false;
-  };
-  $('annSend').onclick=async function(){
-    var b=this,t=($('annT').value||'').trim(),v=$('annR').value;
-    if(t.length<3){toast('اكتب نص الإعلان');return;}
-    if(!v){toast('ما فيه رومات مسجَّلة حالياً');return;}
-    var all=v==='__all';
-    if(all&&(S.ann.rooms||[]).length>1&&!(await ask('راح يوصل الإعلان لـ '+S.ann.rooms.length+' رومات مسجَّلة. تأكيد؟')))return;
-    b.disabled=true;b.textContent='جاري التوليد والإرسال...';$('annRes').innerHTML='';
-    try{
-      var r=await api('/api/ann/send',{method:'POST',body:JSON.stringify({text:t,all:all,rooms:all?[]:[v]})});
-      $('annRes').innerHTML=(r.results||[]).map(function(x){return '<div class="log-meta" style="'+(x.ok?'color:#4ade80':'color:#fbbf24')+'">'+(x.ok?'✅ ':'⚠️ ')+esc(x.name)+' — '+(x.ok?'تشغّل الإعلان':esc(x.why||'ما تشغّل'))+'</div>';}).join('');
-      toast(r.ok?'تم إرسال الإعلان':'ما وصل الإعلان لأي روم — شوف التفاصيل');
-      if(r.ok)$('annT').value='',cnt('annT','annTc',400);
-    }catch(e){toast(e.message);}
-    b.disabled=false;b.textContent='📣 إرسال الإعلان';
-  };
-}
-
 /* ══ بوت تسجيل الرومات (لصاحب الصفحة فقط) ══ */
 var REC_ST={recording:'🔴 يسجّل الآن',live:'🟢 شغّال — ينتظر أحد يدخل الروم',starting:'🟡 جاري التشغيل...',error:'❌ فيه مشكلة',off:'⚫ متوقف'};
 async function pgRec(){
@@ -3703,7 +3598,7 @@ function liveRefresh(d){
     if($('ov')||$('dismissed'))return;
     var a=document.activeElement;
     if(a&&(a.tagName==='INPUT'||a.tagName==='TEXTAREA'||a.tagName==='SELECT'))return;
-    if(S.page==='rec'||S.page==='chans'||S.page==='ann'||(S.page==='perms'&&S.chEdit))return;
+    if(S.page==='rec'||S.page==='chans'||(S.page==='perms'&&S.chEdit))return;
     var y=window.pageYOffset||0;
     render();
     setTimeout(function(){window.scrollTo(0,y);},350);
@@ -3741,7 +3636,7 @@ function liveRefresh(d){
       });
       es.addEventListener('access',function(e){
         try{var d=JSON.parse(e.data);
-          if(d.level&&d.level!==S.level){S.level=d.level;if(S.page==='members'&&d.level!=='full'&&d.level!=='mgr')S.page='logs';if(S.page==='ann'&&d.level!=='full')S.page='logs';closeModal();buildNav();render();toast(d.level==='full'?'تمت ترقيتك — صارت عندك صلاحية التعديل':d.level==='mgr'?'صرت مسؤول أفراد الأمن السيبراني — انفتحت لك صفحة الأعضاء':'تغيّرت صلاحيتك إلى عرض فقط');if(d.level==='full')loadNotices();}
+          if(d.level&&d.level!==S.level){S.level=d.level;if(S.page==='members'&&d.level!=='full'&&d.level!=='mgr')S.page='logs';closeModal();buildNav();render();toast(d.level==='full'?'تمت ترقيتك — صارت عندك صلاحية التعديل':d.level==='mgr'?'صرت مسؤول أفراد الأمن السيبراني — انفتحت لك صفحة الأعضاء':'تغيّرت صلاحيتك إلى عرض فقط');if(d.level==='full')loadNotices();}
         }catch(x){}
       });
     }catch(e){}
