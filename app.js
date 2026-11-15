@@ -1352,6 +1352,76 @@ app.post("/api/notices/member", auth, wrap(async (req, res) => {
     res.json({ ok: true, to: r.to, dm: r.dm });
 }));
 // إشعارات القيادة اللي ما انشافت (تنعرض أول ما يفتح الموقع)
+// ══════════════════════════════════════════════════════════════════════════
+// صفحة «التنبيه الصوتي» (القائد والنائب)
+//   1) تنبيه الدخول الرسمي: يتشغّل أول ما يدخل أحد الروم المسجّل — النص والصوت يتغيّرون من هنا والبوت يطبّقهم فوراً
+//      (التعديل للقائد فقط، النائب يشوفه عرض فقط، وباقي الأعضاء ما يشوفونه أبداً)
+//   2) إعلان صوتي: أي نص يُقرأ صوتياً داخل الرومات المسجّلة الحين (روم أو أكثر أو الكل)
+// الموقع ما يولّد صوت: ينفّذ البوت عن طريق جدول CyberRecJob، وإعدادات التنبيه تنحفظ بجدول CyberVoiceNotice
+// ══════════════════════════════════════════════════════════════════════════
+const VN_LEADER_ID = REC_ADMIN_ID;      // قائد الأمن السيبراني — الوحيد اللي يعدّل نص التنبيه
+const VN_DEPUTY_CAN_SEND = true;         // النائب يقدر يرسل إعلان صوتي؟ (false = القائد فقط)
+const VN_VOICES = [
+    ["deep", "🎚️ عميق مع صدى (الافتراضي)"],
+    ["official", "🏛️ رسمي هادئ"],
+    ["plain", "🗣️ عادي بدون تأثيرات"],
+    ["radio", "📻 إذاعة / لاسلكي"],
+    ["robot", "🤖 صوت آلي تحذيري"],
+];
+const VN_DEFAULT_TEXT = "انتباه، انتباه. هذا الروم مسجّل صوتياً من الأمن السيبراني";
+const VoiceNotice = mongoose.model("CyberVoiceNotice", new mongoose.Schema({
+    _id: String, text: String, voice: String, enabled: { type: Boolean, default: true },
+    rev: { type: Number, default: 0 }, updatedBy: String, updatedAt: Date,
+}, { minimize: false }));
+const vnIsLeader = req => req.session.user.id === VN_LEADER_ID;
+const vnClean = t => String(t == null ? "" : t).replace(/\s+/g, " ").trim().slice(0, 400);
+const vnVoice = v => VN_VOICES.some(x => x[0] === v) ? v : null;
+const vnVoiceName = v => ((VN_VOICES.find(x => x[0] === v) || [])[1] || v).replace(/^\S+\s/, "");
+
+app.get("/api/vn", auth, full, wrap(async (req, res) => {
+    const d = await VoiceNotice.findById("main").lean();
+    res.json({
+        text: d && d.text ? d.text : VN_DEFAULT_TEXT,
+        voice: d && vnVoice(d.voice) ? d.voice : "deep",
+        enabled: !d || d.enabled !== false,
+        updatedBy: d ? d.updatedBy || null : null, updatedAt: d ? d.updatedAt || null : null,
+        voices: VN_VOICES.map(x => ({ id: x[0], ar: x[1] })),
+        canEdit: vnIsLeader(req), canSend: vnIsLeader(req) || VN_DEPUTY_CAN_SEND,
+    });
+}));
+app.put("/api/vn", auth, full, wrap(async (req, res) => {
+    if (!vnIsLeader(req)) return res.status(403).json({ error: "تعديل نص التنبيه للقائد فقط" });
+    const text = vnClean(req.body.text), voice = vnVoice(req.body.voice), enabled = req.body.enabled !== false;
+    if (text.length < 3) return res.status(400).json({ error: "نص التنبيه قصير" });
+    if (!voice) return res.status(400).json({ error: "اختر صوت صحيح" });
+    await VoiceNotice.updateOne({ _id: "main" }, { $set: { text, voice, enabled, updatedBy: req.session.user.tag, updatedAt: new Date() }, $inc: { rev: 1 } }, { upsert: true });
+    let applied = true;
+    try { await callRecBot("rec_vn_reload", recWho(req), 20000); } catch { applied = false; }   // لو البوت مقفول يطبّقه أول ما يشتغل
+    // نص التنبيه ما ينكتب باللوق (اللوق يشوفه كل الأعضاء) — بس نسجّل إنه تعدّل
+    await panelLog(req, "تعديل التنبيه الصوتي", "الصوت: " + vnVoiceName(voice) + "\n" + (enabled ? "التنبيه مفعّل" : "التنبيه موقوف"));
+    res.json({ ok: true, applied });
+}));
+app.post("/api/vn/preview", auth, full, wrap(async (req, res) => {
+    const text = vnClean(req.body.text), voice = vnVoice(req.body.voice);
+    if (text.length < 2) return res.status(400).json({ error: "اكتب النص أول" });
+    if (!voice) return res.status(400).json({ error: "اختر صوت صحيح" });
+    res.json(await callRecBot("rec_vn_preview", { text, voice, ...recWho(req) }, 60000));
+}));
+app.get("/api/vn/rooms", auth, full, wrap(async (req, res) => res.json(await callRecBot("rec_vn_rooms", recWho(req), 30000))));
+app.post("/api/vn/say", auth, full, wrap(async (req, res) => {
+    if (!vnIsLeader(req) && !VN_DEPUTY_CAN_SEND) return res.status(403).json({ error: "الإعلان الصوتي للقائد فقط" });
+    const text = vnClean(req.body.text), voice = vnVoice(req.body.voice);
+    if (text.length < 2) return res.status(400).json({ error: "اكتب نص الإعلان أول" });
+    if (!voice) return res.status(400).json({ error: "اختر صوت صحيح" });
+    const all = req.body.all === true;
+    const ids = Array.isArray(req.body.ids) ? req.body.ids.map(String).filter(x => /^[A-Za-z0-9_-]{1,30}$/.test(x)).slice(0, 30) : [];
+    if (!all && !ids.length) return res.status(400).json({ error: "اختر روم واحد على الأقل" });
+    const r = await callRecBot("rec_vn_say", { text, voice, all, ids, ...recWho(req) }, 150000);
+    const okNames = (r.results || []).filter(x => x.ok).map(x => x.chName || x.label);
+    await panelLog(req, "إعلان صوتي بالرومات", "النص: " + text + "\nالرومات اللي انقرأ فيها: " + (okNames.length ? okNames.join("، ") : "ولا روم (ما فيه أحد أو ما قدر البوت)"));
+    res.json(r);
+}));
+
 // ═══ القائد والنائب: إشعار أو مهمة لعضو ═══
 app.post("/api/members/:id/notify", auth, full, wrap(async (req, res) => {
     const me = req.session.user, id = req.params.id;
@@ -1694,6 +1764,19 @@ input:focus, select:focus { outline:none; border-color:var(--gold-soft); }
 .sw span:before { content:''; position:absolute; height:18px; width:18px; right:3px; top:3px; background:#fff; border-radius:50%; transition:.2s; }
 .sw input:checked + span { background:var(--green2); }
 .sw input:checked + span:before { transform:translateX(-20px); }
+.vn-ta { width:100%; background:rgba(255,255,255,0.06); border:1px solid var(--border); border-radius:10px; color:#fff; padding:10px 12px; font-family:inherit; font-size:14px; line-height:1.8; resize:vertical; min-height:96px; }
+.vn-ta:focus { outline:none; border-color:var(--gold-soft); }
+.vn-ta[readonly] { opacity:.75; cursor:default; }
+.vn-lb { display:block; color:#60a5fa; font-size:13px; margin:14px 0 6px; }
+.vn-hd { display:flex; align-items:center; justify-content:space-between; gap:10px; flex-wrap:wrap; }
+.vn-hd h3 { margin:0; }
+.vn-room { display:flex; align-items:center; gap:10px; padding:10px 12px; border:1px solid var(--border); border-radius:10px; margin-bottom:8px; cursor:pointer; background:rgba(255,255,255,0.03); }
+.vn-room.on { border-color:var(--gold-soft); background:rgba(59,130,246,0.12); }
+.vn-room input { width:auto; accent-color:#3b82f6; flex-shrink:0; }
+.vn-room .nm { flex:1; min-width:0; font-weight:bold; }
+.vn-cnt { font-size:11px; color:#64748b; text-align:left; margin-top:4px; }
+.vn-pl { margin-top:10px; }
+.vn-pl audio { width:100%; }
 .tri { display:flex; gap:4px; }
 .tri button { border:1px solid var(--border); background:rgba(255,255,255,0.05); color:#94a3b8; border-radius:6px; width:34px; height:28px; cursor:pointer; font-size:14px; font-family:inherit; }
 .tri button.a.on { background:#16a34a; color:#fff; border-color:#22c55e; }
@@ -2187,7 +2270,7 @@ function closeModal(){var o=$('ov');if(o)o.remove();unlockScroll();}
 function ask(msg){return new Promise(function(res){modal('<h3>تأكيد</h3><p style="line-height:1.8;margin-bottom:16px;white-space:pre-line">'+esc(msg)+'</p><div class="row" style="justify-content:flex-start"><button class="btn danger" id="ask-y">تأكيد</button><button class="btn gray" id="ask-n">إلغاء</button></div>');$('ask-y').onclick=function(){closeModal();res(true);};$('ask-n').onclick=function(){closeModal();res(false);};});}
 
 /* ── التنقل ── */
-function pagesList(){var p=PAGES.slice();if(S.level==='full'||S.level==='mgr')p.push(['members','👥 الأعضاء']);if(S.recAdmin){p.push(['rec','🎙️ بوت تسجيل الرومات']);p.push(['chans','🗂️ الرومات']);}return p;}
+function pagesList(){var p=PAGES.slice();if(S.level==='full'||S.level==='mgr')p.push(['members','👥 الأعضاء']);if(S.level==='full')p.push(['vn','🔊 التنبيه الصوتي']);if(S.recAdmin){p.push(['rec','🎙️ بوت تسجيل الرومات']);p.push(['chans','🗂️ الرومات']);}return p;}
 function buildNav(){
   var list=pagesList();
   $('navlinks').innerHTML=list.map(function(p){return '<button class="'+(S.page===p[0]?'on':'')+'" onclick="go(\''+p[0]+'\')">'+p[1]+'</button>';}).join('');
@@ -2196,7 +2279,7 @@ function buildNav(){
 function openDrawer(){$('drawer').classList.add('open');$('dov').classList.add('open');}
 function closeDrawer(){$('drawer').classList.remove('open');$('dov').classList.remove('open');}
 function go(p){S.page=p;closeDrawer();clearInterval(S.timer);buildNav();render();}
-function render(){if((S.page==='rec'||S.page==='chans')&&!S.recAdmin)S.page='logs';var f={logs:pgLogs,stats:pgStats,bots:pgBots,perms:pgPerms,bans:pgBans,members:pgMembers,rec:pgRec,chans:pgChans}[S.page];f();}
+function render(){if((S.page==='rec'||S.page==='chans')&&!S.recAdmin)S.page='logs';if(S.page==='vn'&&S.level!=='full')S.page='logs';var f={logs:pgLogs,stats:pgStats,bots:pgBots,perms:pgPerms,bans:pgBans,members:pgMembers,rec:pgRec,chans:pgChans,vn:pgVn}[S.page];f();}
 
 /* ══ اللوق ══ */
 function openBackfill(){
@@ -3367,6 +3450,121 @@ async function dismissMember(id,name){
   try{await api('/api/members/'+id+'/dismiss',{method:'POST'});toast('تم الفصل');pgMembers();}catch(e){toast(e.message);}
 }
 
+/* ══ التنبيه الصوتي (القائد والنائب) ══ */
+async function pgVn(){
+  clearInterval(S.timer);
+  $('main').innerHTML='<div class="row" style="margin-bottom:10px"><h2 style="margin:0">🔊 التنبيه الصوتي</h2></div><div id="vnbox"><div class="card center muted">جاري التحميل...</div></div>';
+  try{
+    S.vn=await api('/api/vn');S.vnRoomsErr='';S.vnRooms=[];
+    try{S.vnRooms=(await api('/api/vn/rooms')).rooms||[];}catch(e){S.vnRoomsErr=e.message;}
+    vnDraw();
+  }catch(e){if($('vnbox'))$('vnbox').innerHTML='<div class="card center muted">'+esc(e.message)+'</div>';}
+}
+function vnVoiceOpts(sel){return S.vn.voices.map(function(v){return '<option value="'+esc(v.id)+'"'+(v.id===sel?' selected':'')+'>'+esc(v.ar)+'</option>';}).join('');}
+function vnRoomsHtml(keep){
+  var rooms=S.vnRooms||[];
+  if(S.vnRoomsErr)return '<div class="muted" style="font-size:13px;line-height:1.8">⚠️ '+esc(S.vnRoomsErr)+'</div>';
+  if(!rooms.length)return '<div class="muted" style="font-size:13px;line-height:1.8">ما فيه رومات مسجّلة حالياً. الرومات تنضاف من صفحة «بوت تسجيل الرومات».</div>';
+  keep=keep||{};
+  return '<label class="vn-room'+(keep.all?' on':'')+'"><input type="checkbox" id="vnAll"'+(keep.all?' checked':'')+'><span class="nm">🌐 الكل <span class="muted" style="font-weight:normal;font-size:12px">— كل الرومات المسجّلة ('+rooms.length+')</span></span></label>'
+    +rooms.map(function(r){
+      var on=keep.all||keep[r.id];
+      return '<label class="vn-room'+(on?' on':'')+'"><input type="checkbox" class="vnRm" value="'+esc(r.id)+'"'+(on?' checked':'')+'>'
+        +'<span class="nm">🎙️ '+esc(r.chName||'روم غير موجود')+'<div class="muted" style="font-size:11px;font-weight:normal">'+esc(r.label)+(r.recording?' • 🔴 يسجّل':'')+'</div></span>'
+        +'<span class="badge '+(r.humans?'low':'')+'">'+(r.humans?'👥 '+r.humans:'فاضي')+'</span></label>';
+    }).join('');
+}
+function vnDraw(){
+  var j=S.vn,ro=!j.canEdit,rd=ro?' readonly':'',dis=ro?' disabled':'';
+  var upd=j.updatedAt?'<div class="muted" style="font-size:12px;margin-top:10px">🕒 آخر تعديل: '+esc(fmt(j.updatedAt))+(j.updatedBy?' — '+esc(j.updatedBy):'')+'</div>':'';
+  var s1='<div class="card"><div class="vn-hd"><h3>🚨 تنبيه الدخول الرسمي</h3>'+(ro?'<span class="badge medium">👁️ عرض فقط — التعديل للقائد</span>':'')+'</div>'
+    +'<div class="muted" style="font-size:13px;line-height:1.8;margin-top:6px">يتشغّل تلقائياً أول ما يدخل أحد الروم المسجّل. تغيّر النص والصوت من هنا ويطبّقه البوت فوراً بدون رفع ملف ولا إعادة تشغيل.</div>'
+    +'<div class="row" style="justify-content:space-between;align-items:center;margin-top:12px"><span>تشغيل التنبيه عند الدخول</span><label class="sw"><input type="checkbox" id="vnOn"'+(j.enabled?' checked':'')+dis+'><span></span></label></div>'
+    +'<label class="vn-lb">نص التنبيه</label><textarea class="vn-ta" id="vnT" maxlength="400"'+rd+'>'+esc(j.text)+'</textarea><div class="vn-cnt" id="vnTc"></div>'
+    +'<label class="vn-lb">الصوت</label><select id="vnV"'+dis+'>'+vnVoiceOpts(j.voice)+'</select>'
+    +'<div class="vn-pl" id="vnPl1"></div>'
+    +'<div class="row" style="justify-content:flex-start;gap:8px;margin-top:14px"><button class="btn gray" id="vnP1">🎧 تجربة الصوت</button>'+(ro?'':'<button class="btn" id="vnSave">💾 حفظ</button>')+'</div>'+upd+'</div>';
+  var s2;
+  if(!j.canSend)s2='<div class="card"><h3>📢 إعلان صوتي</h3><div class="muted" style="font-size:13px">الإعلان الصوتي للقائد فقط.</div></div>';
+  else s2='<div class="card"><div class="vn-hd"><h3>📢 إعلان صوتي</h3><button class="btn sm gray" id="vnRef">🔄 تحديث الرومات</button></div>'
+    +'<div class="muted" style="font-size:13px;line-height:1.8;margin-top:6px">أي نص تكتبه يُقرأ صوتياً داخل الرومات اللي تختارها — للرومات اللي فيها أحد الحين.</div>'
+    +'<label class="vn-lb">النص</label><textarea class="vn-ta" id="vnAT" maxlength="400" placeholder="اكتب الكلام اللي تبيه ينقرأ بالروم..."></textarea><div class="vn-cnt" id="vnAc"></div>'
+    +'<label class="vn-lb">الصوت</label><select id="vnAV">'+vnVoiceOpts(j.voice)+'</select>'
+    +'<label class="vn-lb">الرومات</label><div id="vnrooms">'+vnRoomsHtml()+'</div>'
+    +'<div class="vn-pl" id="vnPl2"></div>'
+    +'<div class="row" style="justify-content:flex-start;gap:8px;margin-top:14px"><button class="btn gray" id="vnP2">🎧 تجربة الصوت</button><button class="btn" id="vnSend">📢 إرسال</button></div></div>';
+  $('vnbox').innerHTML=s1+s2;
+  vnCount('vnT','vnTc');$('vnT').oninput=function(){vnCount('vnT','vnTc');};
+  $('vnP1').onclick=function(){vnPreview('vnT','vnV','vnPl1',this);};
+  if($('vnSave'))$('vnSave').onclick=vnSave;
+  if(j.canSend){
+    vnCount('vnAT','vnAc');$('vnAT').oninput=function(){vnCount('vnAT','vnAc');};
+    $('vnP2').onclick=function(){vnPreview('vnAT','vnAV','vnPl2',this);};
+    $('vnSend').onclick=vnSend;
+    $('vnRef').onclick=vnReloadRooms;
+    $('vnrooms').onchange=vnRoomSync;
+  }
+}
+function vnCount(t,c){var n=($(t).value||'').length;$(c).textContent=n+' / 400';}
+function vnRoomSync(ev){
+  var t=ev&&ev.target,rm=document.querySelectorAll('#vnrooms .vnRm'),all=$('vnAll');if(!all)return;
+  if(t&&t.id==='vnAll'){for(var i=0;i<rm.length;i++)rm[i].checked=all.checked;}
+  else{var every=rm.length>0;for(var k=0;k<rm.length;k++)if(!rm[k].checked)every=false;all.checked=every;}
+  var rows=document.querySelectorAll('#vnrooms .vn-room');
+  for(var r=0;r<rows.length;r++){var cb=rows[r].querySelector('input');rows[r].classList.toggle('on',!!(cb&&cb.checked));}
+}
+async function vnReloadRooms(){
+  var btn=$('vnRef');btn.disabled=true;
+  var keep={};var rm=document.querySelectorAll('#vnrooms .vnRm');
+  for(var i=0;i<rm.length;i++)if(rm[i].checked)keep[rm[i].value]=true;
+  try{S.vnRooms=(await api('/api/vn/rooms')).rooms||[];S.vnRoomsErr='';}catch(e){S.vnRoomsErr=e.message;}
+  if($('vnrooms')){$('vnrooms').innerHTML=vnRoomsHtml(keep);vnRoomSync();}
+  btn.disabled=false;
+}
+async function vnPreview(tId,vId,plId,btn){
+  var text=($(tId).value||'').trim();
+  if(text.length<2){toast('اكتب النص أول');return;}
+  var old=btn.textContent;btn.disabled=true;btn.textContent='جاري تجهيز الصوت...';
+  try{
+    var r=await api('/api/vn/preview',{method:'POST',body:JSON.stringify({text:text,voice:$(vId).value})});
+    $(plId).innerHTML='<audio controls src="data:audio/mpeg;base64,'+r.b64+'"></audio>';
+    try{$(plId).querySelector('audio').play();}catch(e){}
+  }catch(e){toast(e.message);}
+  btn.disabled=false;btn.textContent=old;
+}
+async function vnSave(){
+  var text=($('vnT').value||'').trim();
+  if(text.length<3){toast('نص التنبيه قصير');return;}
+  var btn=$('vnSave');btn.disabled=true;btn.textContent='جاري الحفظ...';
+  try{
+    var r=await api('/api/vn',{method:'PUT',body:JSON.stringify({text:text,voice:$('vnV').value,enabled:$('vnOn').checked})});
+    toast(r.applied?'✅ انحفظ وطبّقه البوت فوراً':'✅ انحفظ — البوت يطبّقه خلال ثواني');
+    if(S.page==='vn')pgVn();
+  }catch(e){toast(e.message);btn.disabled=false;btn.textContent='💾 حفظ';}
+}
+async function vnSend(){
+  var text=($('vnAT').value||'').trim();
+  if(text.length<2){toast('اكتب نص الإعلان أول');return;}
+  var all=!!($('vnAll')&&$('vnAll').checked),ids=[],rm=document.querySelectorAll('#vnrooms .vnRm');
+  for(var i=0;i<rm.length;i++)if(rm[i].checked)ids.push(rm[i].value);
+  if(!all&&!ids.length){toast('اختر روم واحد على الأقل');return;}
+  if(all&&!(await ask('راح ينقرأ الإعلان بكل الرومات المسجّلة اللي فيها أحد.\nمتأكد؟')))return;
+  var btn=$('vnSend');btn.disabled=true;btn.textContent='جاري الإعلان...';
+  try{
+    var r=await api('/api/vn/say',{method:'POST',body:JSON.stringify({text:text,voice:$('vnAV').value,all:all,ids:ids})});
+    vnShowResults(r);
+  }catch(e){toast(e.message);}
+  if($('vnSend')){$('vnSend').disabled=false;$('vnSend').textContent='📢 إرسال';}
+}
+function vnShowResults(r){
+  var h=(r.results||[]).map(function(x){
+    var ic=x.ok?'✅':(x.skipped?'⏭️':'❌');
+    return '<div class="prow"><span>'+ic+' '+esc(x.chName||x.label||x.id)+'</span><span class="muted" style="font-size:12px;text-align:left">'+(x.ok?'انقرأ':esc(x.why||''))+'</span></div>';
+  }).join('');
+  modal('<h3>📢 نتيجة الإعلان</h3><div class="muted" style="font-size:13px">انقرأ في '+(r.spoken||0)+' من '+(r.results||[]).length+' روم</div>'
+    +'<div class="card" style="padding:6px 12px;margin:10px 0">'+h+'</div><div class="row" style="justify-content:flex-start"><button class="btn" onclick="closeModal()">تمام</button></div>');
+}
+
 /* ══ بوت تسجيل الرومات (لصاحب الصفحة فقط) ══ */
 var REC_ST={recording:'🔴 يسجّل الآن',live:'🟢 شغّال — ينتظر أحد يدخل الروم',starting:'🟡 جاري التشغيل...',error:'❌ فيه مشكلة',off:'⚫ متوقف'};
 async function pgRec(){
@@ -3598,7 +3796,7 @@ function liveRefresh(d){
     if($('ov')||$('dismissed'))return;
     var a=document.activeElement;
     if(a&&(a.tagName==='INPUT'||a.tagName==='TEXTAREA'||a.tagName==='SELECT'))return;
-    if(S.page==='rec'||S.page==='chans'||(S.page==='perms'&&S.chEdit))return;
+    if(S.page==='rec'||S.page==='chans'||S.page==='vn'||(S.page==='perms'&&S.chEdit))return;
     var y=window.pageYOffset||0;
     render();
     setTimeout(function(){window.scrollTo(0,y);},350);
