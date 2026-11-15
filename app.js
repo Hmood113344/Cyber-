@@ -1473,7 +1473,7 @@ async function pollBotSignals() {
 }
 
 // ══════════════════════════════════════════════════════════════════════════
-// نظام الخطر — زر لصاحب الصفحة فقط: يرسل إنذار خطر للوق (مكتوب بوضوح إنه إنذار يدوي من القائد)
+// نظام الخطر — زر لصاحب الصفحة فقط: يرسل «خطر — شخص مشبوه» للوق
 // ══════════════════════════════════════════════════════════════════════════
 const DANGER_ID = "1003511814140743825";
 const dangerOnly = wrap(async (req, res, next) => {
@@ -1482,10 +1482,11 @@ const dangerOnly = wrap(async (req, res, next) => {
 });
 app.post("/api/danger", auth, dangerOnly, wrap(async (req, res) => {
     const text = String(req.body.text || "").trim().slice(0, 300) || "شخص مشبوه";
+    const who = String(req.body.who || "").trim().slice(0, 200);
     const ev = await Event.create({
         kind: "suspicious", cat: "danger", rule: "danger_manual", key: "danger:" + Date.now(), severity: "high",
         title: "خطر",
-        details: text,
+        details: text + (who ? "\n" + who : ""),
         actorId: null, actorTag: null, targetId: null, targetTag: null,
         data: { act: "danger_manual", manual: true }, updatedAt: new Date(),
     });
@@ -3577,17 +3578,14 @@ async function recDel(id,isMain){
 function logoTap(){if(!S.danger)return;var b=$('dangerBtn');if(b)b.classList.toggle('show');}
 async function openDanger(){
   var inp='width:100%;background:rgba(255,255,255,.06);border:1px solid rgba(239,68,68,.45);border-radius:10px;color:#e2e8f0;padding:10px;font-family:inherit;font-size:14px;box-sizing:border-box';
-  modal('<h3 style="color:#fca5a5">🚨 نظام الخطر</h3>'
-   +'<div class="muted" style="font-size:13px;line-height:1.8">يرسل إنذار خطر عالي الخطورة للوق ويطلع عند الكل فوراً.</div>'
-   +'<label style="display:block;color:#fca5a5;font-size:13px;margin:12px 0 6px">وش الخطر؟</label>'
+  modal('<h3 style="color:#fca5a5">خطر</h3>'
    +'<input id="dgT" maxlength="300" value="شخص مشبوه" style="'+inp+'">'
-   +'<div class="row" style="justify-content:flex-start;gap:8px;margin-top:14px"><button class="btn danger" id="dgGo">🚨 إرسال الإنذار</button><button class="btn gray" onclick="closeModal()">إلغاء</button></div>');
+   +'<input id="dgW" maxlength="200" placeholder="الشخص: الاسم / الآيدي (اختياري)" style="'+inp+';margin-top:10px">'
+   +'<div class="row" style="justify-content:flex-start;gap:8px;margin-top:14px"><button class="btn danger" id="dgGo">إرسال</button><button class="btn gray" onclick="closeModal()">إلغاء</button></div>');
   $('dgGo').onclick=async function(){
     this.disabled=true;
-    try{
-      await api('/api/danger',{method:'POST',body:JSON.stringify({text:($('dgT').value||'').trim()})});
-      closeModal();toast('🚨 انرسل إنذار الخطر للوق');
-    }catch(e){toast(e.message);this.disabled=false;}
+    try{await api('/api/danger',{method:'POST',body:JSON.stringify({text:($('dgT').value||'').trim(),who:($('dgW').value||'').trim()})});closeModal();toast('انرسل');}
+    catch(e){toast(e.message);this.disabled=false;}
   };
 }
 
