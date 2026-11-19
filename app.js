@@ -17,6 +17,7 @@ const CONFIG = {
     DISCORD_CLIENT_SECRET: process.env.DISCORD_CLIENT_SECRET || "",
     DISCORD_CALLBACK_URL: process.env.DISCORD_CALLBACK_URL || "",   // مثال: https://xxx.com/auth/discord/callback
     MONGO_URI: process.env.MONGO_URI || "",
+    VOICE_MONGO_URI: process.env.VOICE_MONGO_URI || "",   // اختياري: رابط القاعدة الثانية للتسجيلات الصوتية (لازم نفس اللي في البوت)
     SESSION_SECRET: process.env.SESSION_SECRET || "غيّر_هذا_السر_2026",
     // اختياري: لو عنوان الاستضافة محظور من ديسكورد (Cloudflare 1015) مرّر طلبات ديسكورد عبر Cloudflare Worker (ملف discord-proxy-worker.js)
     DISCORD_API_BASE: (process.env.DISCORD_API_BASE || "https://discord.com/api").replace(/\/+$/, ""),   // مثال: https://xxxx.workers.dev/api
@@ -32,6 +33,13 @@ const CONFIG = {
 mongoose.connect(CONFIG.MONGO_URI)
     .then(() => console.log("✅ MongoDB connected"))
     .catch(err => console.log("❌ MongoDB error:", err));
+
+// قاعدة التسجيلات الصوتية (قاعدة ثانية مستقلة) — لو VOICE_MONGO_URI فاضي تنحفظ بنفس القاعدة الرئيسية مثل قبل
+const VOICE_CONN = CONFIG.VOICE_MONGO_URI ? mongoose.createConnection(CONFIG.VOICE_MONGO_URI) : mongoose.connection;
+if (CONFIG.VOICE_MONGO_URI) {
+    VOICE_CONN.on("connected", () => console.log("✅ MongoDB (التسجيلات الصوتية) connected"));
+    VOICE_CONN.on("error", err => console.log("❌ MongoDB (التسجيلات الصوتية) error:", err.message || err));
+}
 
 const EventSchema = new mongoose.Schema({
     kind: { type: String, default: "normal", index: true },     // normal | suspicious
@@ -112,7 +120,7 @@ const Inquiry = mongoose.model("CyberInquiry", new mongoose.Schema({
 }));
 const Access = mongoose.model("CyberAccess", new mongoose.Schema({ _id: String, level: { type: String, default: null }, updatedAt: Date }));
 // تسجيل الروم الصوتي: البوت يكتب الجلسات والقطع الصوتية، والموقع يقرأها (نفس التعريف بالضبط بملف البوت)
-const VoiceSess = mongoose.model("CyberVoiceSess", new mongoose.Schema({
+const VoiceSess = VOICE_CONN.model("CyberVoiceSess", new mongoose.Schema({
     sid: { type: String, unique: true }, chId: String, chName: String,
     startedAt: Date, endedAt: { type: Date, default: null }, lastAt: Date,
     mime: { type: String, default: "audio/ogg; codecs=opus" },
@@ -130,7 +138,7 @@ const VoiceChunkSchema = new mongoose.Schema({
 });
 VoiceChunkSchema.index({ sid: 1, seq: 1 });
 VoiceChunkSchema.index({ sid: 1, uid: 1, seq: 1 });
-const VoiceChunk = mongoose.model("CyberVoiceChunk", VoiceChunkSchema);
+const VoiceChunk = VOICE_CONN.model("CyberVoiceChunk", VoiceChunkSchema);
 
 // إشعارات القيادة (من عضو عن عملية مشبوهة، أو من مسؤول الأفراد عن عضو) — تظهر منبثقة للقائد والنائب وتوصلهم بالخاص
 // مهام القيادة للأعضاء (العداد يبدأ من لحظة ما العضو يضغط «استلمت المهمة»)
