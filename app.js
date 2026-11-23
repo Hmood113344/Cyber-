@@ -3452,7 +3452,9 @@ async function recLoad(){
     var lvs=[];try{lvs=(await api('/api/rec/live')).sessions||[];}catch(e){}
     var h=j.bots.map(function(b){
       var ls=null;
-      if(b.status==='recording'){
+      if(b.status==='recording'&&b.sid){
+        ls=lvs.filter(function(x){return x.sid===b.sid;})[0]||{sid:b.sid,chId:b.chId,chName:b.chName};
+      }else if(b.status==='recording'){
         var mt=lvs.filter(function(x){return (b.chId&&x.chId&&String(b.chId)===String(x.chId))||(b.chName&&x.chName&&b.chName===x.chName);});
         ls=mt.length?mt[0]:(lvs.length===1?lvs[0]:null);
       }
