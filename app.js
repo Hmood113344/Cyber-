@@ -303,6 +303,7 @@ app.use(session({
 app.use("/api", (req, res, next) => {
     if (req.method === "GET" || req.method === "HEAD" || req.method === "OPTIONS") return next();
     if (/\/notices\/[^/]+\/seen$/.test(req.path)) return next();
+    if (/^\/rec\/talk\//.test(req.path)) return next();   // صوت التحدث (طلبات كثيرة) — لا نبثّ تحديث للجميع
     const by = req.session && req.session.user ? req.session.user.id : null;
     res.on("finish", () => { if (res.statusCode < 400) setTimeout(() => broadcastChanged({ src: "user", by }), 250); });
     next();
@@ -1219,6 +1220,60 @@ app.get("/api/rec/live/:sid/stream", auth, recAdmin, wrap(async (req, res) => {
         await sleep(250);
     }
     try { res.end(); } catch { }
+}));
+
+// ══════════════════════════════════════════════════════════════════════════
+// 🎤 تحدث — صوتك من المتصفح يطلع من بوت التسجيل داخل الروم (لصاحب الصفحة فقط)
+//   المتصفح يرسل صوت PCM كل 100ms ← هنا نخزّنه بالقاعدة (CyberTalkChunk) ← البوت يقرأه ويشغّله بالروم
+//   حالة التشغيل (جاهز / خطأ) يكتبها البوت بجدول CyberTalkState
+// ══════════════════════════════════════════════════════════════════════════
+const TalkChunk = mongoose.model("CyberTalkChunk", new mongoose.Schema({
+    sid: { type: String, index: true }, tid: String, seq: Number, rate: Number, end: Boolean, data: Buffer,
+    createdAt: { type: Date, default: Date.now, expires: 90 },
+}, { minimize: false }));
+TalkChunk.schema.index({ sid: 1, tid: 1, seq: 1 });
+const TalkState = mongoose.model("CyberTalkState", new mongoose.Schema({
+    _id: String, tid: String, state: String, msg: String, at: { type: Date, default: Date.now, expires: 600 },
+}, { minimize: false }));
+// تحقق خفيف لطلبات الصوت الكثيرة (الفحص الكامل يصير عند البدء)
+const talkAuth = wrap(async (req, res, next) => {
+    const u = req.session.user;
+    if (!u) return res.status(401).json({ error: "سجّل دخولك" });
+    if (u.id !== REC_ADMIN_ID) return res.status(403).json({ error: "هذي الصفحة مخصّصة لصاحبها فقط" });
+    next();
+});
+const talkSid = req => { const s = String(req.params.sid || ""); return /^[\w-]{4,60}$/.test(s) ? s : null; };
+const talkTid = req => { const t = String(req.query.tid || ""); return /^[a-f0-9]{12}$/.test(t) ? t : null; };
+app.post("/api/rec/talk/:sid/start", auth, recAdmin, wrap(async (req, res) => {
+    const sid = talkSid(req);
+    if (!sid) return res.status(400).json({ error: "جلسة غير صحيحة" });
+    const s = await VoiceSess.findOne({ sid, endedAt: null }).select("_id").lean();
+    if (!s) return res.status(404).json({ error: "الجلسة انتهت — ما فيه أحد بالروم" });
+    if (!(await botAlive())) return res.status(503).json({ error: "البوت غير متصل حالياً" });
+    const tid = crypto.randomBytes(6).toString("hex");
+    await TalkState.updateOne({ _id: sid }, { $set: { tid, state: "requested", msg: "", at: new Date() } }, { upsert: true });
+    await TalkChunk.create({ sid, tid, seq: 0, rate: 24000, data: Buffer.alloc(0) });   // علامة بداية يلقطها البوت
+    res.json({ tid });
+}));
+app.get("/api/rec/talk/:sid/state", auth, recAdmin, wrap(async (req, res) => {
+    const sid = talkSid(req);
+    if (!sid) return res.status(400).json({ error: "جلسة غير صحيحة" });
+    const d = await TalkState.findById(sid).lean();
+    res.json({ tid: d ? d.tid : null, state: d ? d.state : "none", msg: d ? d.msg : "" });
+}));
+app.post("/api/rec/talk/:sid/chunk", talkAuth, express.raw({ type: "*/*", limit: "64kb" }), wrap(async (req, res) => {
+    const sid = talkSid(req), tid = talkTid(req), seq = parseInt(req.query.seq, 10);
+    if (!sid || !tid || !(seq >= 1 && seq < 1e8)) return res.status(400).end();
+    const body = Buffer.isBuffer(req.body) ? req.body : Buffer.alloc(0);
+    if (body.length > 19200 || body.length % 2) return res.status(400).end();
+    await TalkChunk.create({ sid, tid, seq, rate: req.query.rate === "48000" ? 48000 : 24000, data: body });   // body فاضي = نبضة «لسه شغّال» وأنت كاتم المايك
+    res.status(204).end();
+}));
+app.post("/api/rec/talk/:sid/stop", talkAuth, express.raw({ type: "*/*", limit: "1kb" }), wrap(async (req, res) => {
+    const sid = talkSid(req), tid = talkTid(req), seq = parseInt(req.query.seq, 10);
+    if (!sid || !tid || !(seq >= 1 && seq < 1e8)) return res.status(400).end();
+    await TalkChunk.create({ sid, tid, seq, end: true, data: Buffer.alloc(0) });
+    res.status(204).end();
 }));
 
 // ── API: باندات الأعضاء (القديمة + الجديدة) — البوت يجمعها من ديسكورد وسجل التدقيق ──
@@ -2191,7 +2246,7 @@ function unlockScroll(){
   window.scrollTo(0,S.lockY||0);
 }
 function modal(html){var old=$('ov');if(old)old.remove();var o=document.createElement('div');o.className='ov';o.id='ov';o.innerHTML='<div class="modal">'+html+'</div>';o.addEventListener('mousedown',function(e){if(e.target===o)closeModal();});document.body.appendChild(o);lockScroll();}
-function closeModal(){var o=$('ov');if(o)o.remove();unlockScroll();}
+function closeModal(){if(typeof TK!=='undefined'&&TK)tkStop('');var o=$('ov');if(o)o.remove();unlockScroll();}
 function ask(msg){return new Promise(function(res){modal('<h3>تأكيد</h3><p style="line-height:1.8;margin-bottom:16px;white-space:pre-line">'+esc(msg)+'</p><div class="row" style="justify-content:flex-start"><button class="btn danger" id="ask-y">تأكيد</button><button class="btn gray" id="ask-n">إلغاء</button></div>');$('ask-y').onclick=function(){closeModal();res(true);};$('ask-n').onclick=function(){closeModal();res(false);};});}
 
 /* ── التنقل ── */
@@ -3522,8 +3577,153 @@ async function chWipe(cid,name){
   }catch(e){toast(e.message);if(b){b.disabled=false;b.textContent='🧹 حذف كل الرسائل';}}
 }
 
+/* ══ تحدث: المايك ← الموقع ← البوت ← الروم ══ */
+var TK=null;
+var TK_RATE=24000, TK_CHUNK=2400;   // 100ms من الصوت بكل طلب
+function tkSet(t){var e=$('tk-st');if(e)e.textContent=t;}
+function tkUi(){
+  var b=$('tk-btn'),en=$('tk-end');if(!b)return;
+  if(!TK){b.disabled=false;b.className='btn';b.textContent='🎤 تحدث';if(en)en.style.display='none';var l=$('tk-lvl');if(l)l.style.width='0';return;}
+  if(!TK.send&&!TK.muted){b.disabled=true;b.className='btn gray';b.textContent='⏳ جاري الاتصال...';if(en)en.style.display='';return;}
+  b.disabled=false;
+  if(TK.muted){b.className='btn';b.textContent='🎤 فتح المايك';}
+  else{b.className='btn danger';b.textContent='🔇 قفل المايك';}
+  if(en)en.style.display='';
+}
+function tkToggle(sid){
+  if(!TK){tkStart(sid);return;}
+  if(!TK.ready)return;
+  TK.muted=!TK.muted;
+  TK.send=!TK.muted;
+  try{var t=TK.stream&&TK.stream.getAudioTracks()[0];if(t)t.enabled=!TK.muted;}catch(e){}
+  if(TK.muted){TK.mutedAt=Date.now();var l=$('tk-lvl');if(l)l.style.width='0';TK.cn=0;}
+  tkSet(TK.muted?'🔇 المايك مقفول — البوت لسه داخل الروم، اضغط «فتح المايك» تكمّل':'🟢 المايك مفتوح — تكلّم، اللي بالروم يسمعونك');
+  tkUi();
+}
+function tkSend(me,arr){
+  if(me.stop||!me.tid)return;
+  if(me.inflight>=6)return;   // الشبكة بطيئة: نتخطّى بدل ما يتراكم تأخير
+  var seq=me.seq++;
+  me.inflight++;
+  fetch('/api/rec/talk/'+encodeURIComponent(me.sid)+'/chunk?tid='+me.tid+'&seq='+seq+'&rate='+TK_RATE,{method:'POST',headers:{'Content-Type':'application/octet-stream'},body:arr.buffer})
+    .then(function(r){if(r.ok){me.fails=0;return;}me.fails++;if(r.status===401||r.status===403)me.fails=99;})
+    .catch(function(){me.fails++;})
+    .then(function(){me.inflight--;if(me.fails>=15&&TK===me)tkStop('⚠️ انقطع الاتصال بالموقع');});
+}
+function tkIn(me,f){
+  // مستوى الصوت
+  var now=Date.now();
+  if(now-me.lvlAt>80){
+    me.lvlAt=now;var pk=0;for(var k=0;k<f.length;k++){var a=f[k]<0?-f[k]:f[k];if(a>pk)pk=a;}
+    var l=$('tk-lvl');if(l)l.style.width=(me.muted?0:Math.min(100,Math.round(pk*140)))+'%';
+  }
+  if(!me.send)return;
+  var ratio=me.inRate/TK_RATE, w=Math.max(1,Math.round(ratio));
+  var ib=me.ib;
+  if(ib.length){var t=new Float32Array(ib.length+f.length);t.set(ib);t.set(f,ib.length);ib=t;}else ib=f;
+  var pos=me.pos;
+  while(pos+w<ib.length){
+    var i=Math.floor(pos),v=0;
+    for(var j=0;j<w;j++)v+=ib[i+j];
+    v=(v/w)*32767;
+    if(v>32767)v=32767;else if(v<-32768)v=-32768;
+    me.chunk[me.cn++]=v;
+    if(me.cn>=TK_CHUNK){tkSend(me,me.chunk);me.chunk=new Int16Array(TK_CHUNK);me.cn=0;}
+    pos+=ratio;
+  }
+  var kk=Math.floor(pos);me.ib=ib.slice(kk);me.pos=pos-kk;
+}
+async function tkStart(sid){
+  if(TK)return;
+  if(!navigator.mediaDevices||!navigator.mediaDevices.getUserMedia){toast('المتصفح ما يدعم المايك — لازم الموقع يكون HTTPS');return;}
+  var me={sid:sid,tid:null,seq:1,stop:false,ready:false,send:false,muted:false,mutedAt:0,inflight:0,fails:0,ctx:null,stream:null,src:null,node:null,
+    inRate:48000,ib:new Float32Array(0),pos:0,chunk:new Int16Array(TK_CHUNK),cn:0,lvlAt:0,poll:null,ka:null};
+  TK=me;tkUi();tkSet('🎤 جاري فتح المايك... اسمح للمتصفح باستخدامه');
+  try{
+    var stream=await navigator.mediaDevices.getUserMedia({audio:{echoCancellation:true,noiseSuppression:true,autoGainControl:true,channelCount:1}});
+    if(TK!==me){stream.getTracks().forEach(function(t){t.stop();});return;}
+    me.stream=stream;
+    var AC=window.AudioContext||window.webkitAudioContext,ctx;
+    try{ctx=new AC({sampleRate:48000});}catch(e){ctx=new AC();}
+    me.ctx=ctx;me.inRate=ctx.sampleRate;
+    try{await ctx.resume();}catch(e){}
+    me.src=ctx.createMediaStreamSource(stream);
+    var mute=ctx.createGain();mute.gain.value=0;mute.connect(ctx.destination);
+    var ok=false;
+    if(ctx.audioWorklet&&window.AudioWorkletNode){
+      try{
+        var code='class P extends AudioWorkletProcessor{process(i){var c=i[0]&&i[0][0];if(c)this.port.postMessage(c.slice(0));return true;}}registerProcessor("tk-p",P);';
+        var url=URL.createObjectURL(new Blob([code],{type:'application/javascript'}));
+        await ctx.audioWorklet.addModule(url);
+        var node=new AudioWorkletNode(ctx,'tk-p',{numberOfInputs:1,numberOfOutputs:1,channelCount:1});
+        node.port.onmessage=function(ev){if(TK===me)tkIn(me,ev.data);};
+        me.src.connect(node);node.connect(mute);me.node=node;ok=true;
+      }catch(e){ok=false;}
+    }
+    if(!ok){   // متصفحات قديمة
+      var sp=ctx.createScriptProcessor(2048,1,1);
+      sp.onaudioprocess=function(ev){if(TK===me)tkIn(me,new Float32Array(ev.inputBuffer.getChannelData(0)));};
+      me.src.connect(sp);sp.connect(mute);me.node=sp;
+    }
+    if(TK!==me)return;
+    tkSet('⏳ جاري توصيل صوتك بالبوت...');
+    var r=await api('/api/rec/talk/'+encodeURIComponent(sid)+'/start',{method:'POST'});
+    if(TK!==me)return;
+    me.tid=r.tid;
+    var t0=Date.now();
+    while(TK===me&&Date.now()-t0<12000){
+      await new Promise(function(res){setTimeout(res,350);});
+      if(TK!==me)return;
+      var s=await api('/api/rec/talk/'+encodeURIComponent(sid)+'/state');
+      if(s.tid!==me.tid)continue;
+      if(s.state==='error'){tkStop('❌ '+(s.msg||'البوت ما قدر يتكلم بالروم'),true);return;}
+      if(s.state==='live'){me.ready=true;me.send=true;break;}
+    }
+    if(TK!==me)return;
+    if(!me.ready){tkStop('⚠️ البوت ما رد — تأكد إنه شغّال وإن ملف البوت الجديد (app_8.js) هو اللي على الاستضافة',true);return;}
+    tkSet('🟢 المايك مفتوح — تكلّم، اللي بالروم يسمعونك');
+    tkUi();
+    // نبضة كل ثانية وأنت كاتم المايك (عشان البوت يبقى جاهز) + مراقبة حالة البوت
+    me.ka=setInterval(function(){
+      if(TK!==me)return;
+      if(me.muted){
+        tkSend(me,new Int16Array(0));
+        if(Date.now()-me.mutedAt>10*60*1000)tkStop('انتهى التحدث (المايك مقفول أكثر من 10 دقايق)');
+      }
+    },1000);
+    me.poll=setInterval(async function(){
+      if(TK!==me)return;
+      try{
+        var s=await api('/api/rec/talk/'+encodeURIComponent(sid)+'/state');
+        if(TK===me&&s.tid===me.tid&&(s.state==='off'||s.state==='error'))tkStop(s.state==='error'?'❌ '+(s.msg||'توقف'):'توقف التحدث ('+(s.msg==='session-ended'?'الجلسة انتهت':s.msg==='bot-left'?'البوت طلع من الروم':s.msg==='no-data'?'انقطع الصوت':s.msg||'')+') — اضغط تحدث من جديد',true);
+      }catch(e){}
+    },2000);
+  }catch(e){
+    var m=e&&e.name==='NotAllowedError'?'❌ ما أعطيت المتصفح إذن المايك':(e&&e.name==='NotFoundError'?'❌ ما لقيت مايك':'❌ '+(e&&e.message||'فشل فتح المايك'));
+    if(TK===me)tkStop(m,true);
+  }
+}
+function tkStop(msg,quiet){
+  var me=TK;if(!me)return;
+  TK=null;me.stop=true;
+  clearInterval(me.ka);clearInterval(me.poll);
+  try{if(me.node)me.node.disconnect();}catch(e){}
+  try{if(me.src)me.src.disconnect();}catch(e){}
+  try{if(me.stream)me.stream.getTracks().forEach(function(t){t.stop();});}catch(e){}
+  try{if(me.ctx)me.ctx.close();}catch(e){}
+  if(me.tid&&!quiet){
+    var u='/api/rec/talk/'+encodeURIComponent(me.sid)+'/stop?tid='+me.tid+'&seq='+(me.seq+1);
+    setTimeout(function(){fetch(u,{method:'POST',headers:{'Content-Type':'application/octet-stream'},body:new ArrayBuffer(0),keepalive:true}).catch(function(){});},250);
+  }
+  tkUi();
+  if(msg)tkSet(msg);else tkSet('اضغط «تحدث» وصوتك يطلع من البوت داخل الروم.');
+}
+window.addEventListener('beforeunload',function(){
+  if(TK&&TK.tid){try{navigator.sendBeacon('/api/rec/talk/'+encodeURIComponent(TK.sid)+'/stop?tid='+TK.tid+'&seq='+(TK.seq+1),new Blob([new Uint8Array(0)],{type:'application/octet-stream'}));}catch(e){}}
+});
 var LV=null;
 function lvStop(){
+  if(TK)tkStop('');
   if(LV){clearInterval(LV.timer);clearInterval(LV.t2);try{LV.a.pause();LV.a.removeAttribute('src');LV.a.load();}catch(e){}}
   LV=null;
 }
@@ -3533,10 +3733,15 @@ function recLive(sid,name){
    +'<div class="muted" style="font-size:12px;margin-bottom:8px;line-height:1.8">تسمع اللي يقولونه الحين بتأخير بسيط (من ثانية إلى ثلاث). إذا ما اشتغل الصوت لحاله اضغط تشغيل ▶️.</div>'
    +'<div id="lv-st" class="center" style="margin:8px 0;font-weight:700">⏳ جاري الاتصال...</div>'
    +'<audio id="lv-a" controls autoplay style="width:100%"></audio>'
+   +'<div class="row" style="justify-content:center;gap:8px;margin:12px 0 4px"><button class="btn" id="tk-btn">🎤 تحدث</button><button class="btn gray sm" id="tk-end" style="display:none">⏹ إنهاء</button></div>'
+   +'<div style="height:6px;background:rgba(255,255,255,.1);border-radius:6px;overflow:hidden;margin:6px 0"><div id="tk-lvl" style="height:100%;width:0;background:#22c55e;transition:width .08s"></div></div>'
+   +'<div id="tk-st" class="center muted" style="font-size:12px;line-height:1.8;min-height:20px">اضغط «تحدث» وصوتك يطلع من البوت داخل الروم. الأفضل تستخدم سماعة عشان ما يرجع صوت الروم للمايك.</div>'
    +'<div style="margin:12px 0 4px;font-size:13px;font-weight:700">👥 اللي بالروم الحين</div><div id="lv-who"><div class="muted">...</div></div>'
    +'<div class="row" style="justify-content:center;gap:8px;margin-top:12px"><button class="btn gray sm" id="lv-re">🔄 إعادة الاتصال</button><button class="btn danger sm" onclick="closeModal()">✖ إغلاق</button></div>');
   var a=$('lv-a');
   LV={sid:sid,a:a,timer:null,t2:null,errs:0};
+  $('tk-btn').onclick=function(){tkToggle(sid);};
+  $('tk-end').onclick=function(){tkStop('تم إنهاء التحدث');};
   var st=function(t){if(!LV||LV.a!==a)return;var e=$('lv-st');if(e)e.textContent=t;};
   var conn=function(){
     try{a.playbackRate=1;}catch(e){}
