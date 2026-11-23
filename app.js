@@ -3665,7 +3665,7 @@ function tkPost(me,body,n){
 // طابور: ما نرمي أي صوت (كان يسبب تقطيع)، ولو الشبكة تأخرت ندمج القطع بطلب واحد؛ ولو تراكم أكثر من ~0.7ث نحذف الأقدم عشان نظل مباشرين
 function tkFlush(me){
   if(me.stop||!me.tid)return;
-  while(me.out.length&&me.inflight<2){
+  while(me.out.length&&me.inflight<4){
     var take=Math.min(me.out.length,6),tot=0,i;
     for(i=0;i<take;i++)tot+=me.out[i].length;
     var all=new Int16Array(tot),o=0;
@@ -3732,7 +3732,7 @@ async function tkStart(sid){
       }catch(e){ok=false;}
     }
     if(!ok){   // متصفحات قديمة
-      var sp=ctx.createScriptProcessor(512,1,1);
+      var sp=ctx.createScriptProcessor(1024,1,1);
       sp.onaudioprocess=function(ev){if(TK===me)tkIn(me,new Float32Array(ev.inputBuffer.getChannelData(0)));};
       me.src.connect(sp);sp.connect(mute);me.node=sp;
     }
@@ -3797,19 +3797,22 @@ var LV=null;
 function lvRaw(sid,st,onFail,onOk){
   var AC=window.AudioContext||window.webkitAudioContext;
   var ctx;try{ctx=new AC({sampleRate:48000,latencyHint:'interactive'});}catch(e){ctx=new AC();}
-  var ac=new AbortController(),dead=false,next=0,ts=0,buf=new Uint8Array(0),gotAudio=false,JIT=0.06,MAXAHEAD=0.35;
+  var ac=new AbortController(),dead=false,next=0,ts=0,buf=new Uint8Array(0),gotAudio=false,JIT=0.12,lastUnder=0;
   try{ctx.resume();}catch(e){}
   var dec=new AudioDecoder({
     output:function(ad){
       if(dead){ad.close();return;}
       var n=ad.numberOfFrames,now=ctx.currentTime;
-      if(next>now+MAXAHEAD){ad.close();return;}   // تراكم: نتخطى عشان نلحق الحاضر
+      if(next>now+JIT+0.7){ad.close();return;}   // تراكم كبير (>0.7ث): نتخطى عشان نلحق الحاضر
       var ch=new Float32Array(n);
       try{ad.copyTo(ch,{planeIndex:0,format:'f32-planar'});}catch(e){ad.close();return;}
       ad.close();
       var ab=ctx.createBuffer(1,n,48000);ab.copyToChannel(ch,0);
       var src=ctx.createBufferSource();src.buffer=ab;src.connect(ctx.destination);
-      if(next<now+0.01)next=now+JIT;   // بداية كلام جديدة أو تأخرت حزمة: نعبّي 60ms تثبيت
+      if(next<now+0.005){   // بداية كلام جديدة أو تأخرت حزمة: نعبّي مخزن تثبيت
+        if(gotAudio&&next>now-0.4){JIT=Math.min(0.4,JIT+0.04);lastUnder=now;}   // انقطع وسط الكلام ← نكبّر المخزن تلقائياً
+        next=now+JIT;
+      }else if(JIT>0.12&&now-lastUnder>20){JIT=Math.max(0.12,JIT-0.02);lastUnder=now;}   // مستقر 20ث ← نصغّره شوي
       src.start(next);next+=n/48000;
       if(!gotAudio){gotAudio=true;onOk();}
     },
