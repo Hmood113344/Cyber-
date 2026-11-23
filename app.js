@@ -139,6 +139,13 @@ const VoiceChunkSchema = new mongoose.Schema({
 VoiceChunkSchema.index({ sid: 1, seq: 1 });
 VoiceChunkSchema.index({ sid: 1, uid: 1, seq: 1 });
 const VoiceChunk = VOICE_CONN.model("CyberVoiceChunk", VoiceChunkSchema);
+// ⚡ قناة البث المباشر (نفس جدول البوت): قطع صغيرة كل 60ms تنحذف تلقائياً بعد دقيقة
+const LiveChunk = VOICE_CONN.model("CyberLiveChunk", (() => {
+    const sc = new mongoose.Schema({ sid: String, seq: Number, data: Buffer, createdAt: { type: Date, default: Date.now, expires: 60 } }, { minimize: false });
+    sc.index({ sid: 1, seq: 1 });
+    return sc;
+})());
+const binBin = x => { if (Buffer.isBuffer(x)) return x; if (x && x.buffer) { const b = Buffer.from(x.buffer); return typeof x.position === "number" && x.position < b.length ? b.subarray(0, x.position) : b; } return Buffer.from(x || []); };
 
 // إشعارات القيادة (من عضو عن عملية مشبوهة، أو من مسؤول الأفراد عن عضو) — تظهر منبثقة للقائد والنائب وتوصلهم بالخاص
 // مهام القيادة للأعضاء (العداد يبدأ من لحظة ما العضو يضغط «استلمت المهمة»)
@@ -1169,7 +1176,52 @@ app.get("/api/rec/live/:sid/info", auth, recAdmin, wrap(async (req, res) => {
     const list = Object.values(people).filter(x => x.inside).map(x => ({ uid: x.uid, name: x.name, avatar: x.avatar, speaking: !!(last[x.uid] && last[x.uid].on && now - last[x.uid].t < 30000) }));
     res.json({ chName: d.chName || "", ended: !!d.endedAt, people: list });
 }));
-// بث صوتي حي (Ogg Opus مستمر): البوت يكتب القطع بقاعدة البيانات، وهنا نقرأ الجديد أول بأول ونرسله للمتصفح
+// ⚡ بث مباشر شبه فوري: حزم Opus خام [طول 2 بايت][حزمة] — المتصفح يفك ترميزها ويشغّلها بـ Web Audio (بدون مخزن المتصفح الكبير)
+//   الجديد يوصل من الـchange stream لحظة كتابته، وفيه فحص احتياطي لو القاعدة ما تدعمه. علامة نهاية الجلسة: FF FF
+app.get("/api/rec/live/:sid/raw", auth, recAdmin, wrap(async (req, res) => {
+    const sid = String(req.params.sid || "");
+    if (!/^[\w-]{4,60}$/.test(sid)) return res.status(400).end();
+    if (!(await VoiceSess.findOne({ sid }).select("_id").lean())) return res.status(404).end();
+    res.status(200).set({ "Content-Type": "application/octet-stream", "Cache-Control": "no-store, no-transform", Connection: "keep-alive", "X-Accel-Buffering": "no" });
+    res.flushHeaders?.();
+    try { req.socket.setNoDelay(true); req.socket.setTimeout(0); } catch { }
+    let closed = false, last = -1, csOk = false, cs = null, lastSend = Date.now(), ended = false;
+    const write = b => { try { res.write(b); lastSend = Date.now(); } catch { closed = true; } };
+    const cleanup = () => { closed = true; try { if (cs) cs.close().catch(() => { }); } catch { } };
+    req.on("close", cleanup);
+    try {   // نبدأ من الحاضر دائماً (ما نرجع للكلام القديم)
+        const lt = await LiveChunk.findOne({ sid }).sort({ seq: -1 }).select("seq").lean();
+        last = lt ? lt.seq : -1;
+    } catch { }
+    try {
+        cs = LiveChunk.watch([{ $match: { operationType: "insert", "fullDocument.sid": sid } }]);
+        csOk = true;
+        cs.on("change", ev => { const d = ev && ev.fullDocument; if (d && d.seq > last) { last = d.seq; write(binBin(d.data)); } });
+        cs.on("error", () => { csOk = false; });
+        cs.on("close", () => { csOk = false; });
+    } catch { csOk = false; }
+    let tick = 0, lastPoll = 0;
+    while (!closed) {
+        try {
+            const now = Date.now();
+            if (now - lastPoll >= (csOk ? 1500 : 60)) {   // فحص احتياطي (يلقط أي قطعة ضاعت، أو هو الأساس لو الـchange stream ما اشتغل)
+                lastPoll = now;
+                const parts = await LiveChunk.find({ sid, seq: { $gt: last } }).sort({ seq: 1 }).limit(200).select("data seq").lean();
+                for (const c of parts) { if (c.seq > last) { last = c.seq; write(binBin(c.data)); } }
+            }
+            if (Date.now() - lastSend > 4000) write(Buffer.from([0, 0]));   // نبضة تبقي الاتصال حي
+            if (++tick % 40 === 0) {
+                const sd = await VoiceSess.findOne({ sid }).select("endedAt").lean();
+                if (!sd || sd.endedAt) { ended = true; break; }
+            }
+        } catch (e) { console.error("rec live raw:", e.message); }
+        await new Promise(r => setTimeout(r, 25));
+    }
+    if (ended) write(Buffer.from([0xFF, 0xFF]));
+    cleanup();
+    try { res.end(); } catch { }
+}));
+// بث صوتي حي (Ogg Opus مستمر): البوت يكتب القطع بقاعدة البيانات، وهنا نقرأ الجديد أول بأول ونرسله للمتصفح (احتياطي للمتصفحات القديمة)
 app.get("/api/rec/live/:sid/stream", auth, recAdmin, wrap(async (req, res) => {
     const sid = String(req.params.sid || "");
     if (!/^[\w-]{4,60}$/.test(sid)) return res.status(400).end();
@@ -1252,7 +1304,7 @@ app.post("/api/rec/talk/:sid/start", auth, recAdmin, wrap(async (req, res) => {
     if (!(await botAlive())) return res.status(503).json({ error: "البوت غير متصل حالياً" });
     const tid = crypto.randomBytes(6).toString("hex");
     await TalkState.updateOne({ _id: sid }, { $set: { tid, state: "requested", msg: "", at: new Date() } }, { upsert: true });
-    await TalkChunk.create({ sid, tid, seq: 0, rate: 24000, data: Buffer.alloc(0) });   // علامة بداية يلقطها البوت
+    await TalkChunk.collection.insertOne({ sid, tid, seq: 0, rate: 24000, data: Buffer.alloc(0), createdAt: new Date() }, { writeConcern: { w: 1, j: false } });   // علامة بداية يلقطها البوت
     res.json({ tid });
 }));
 app.get("/api/rec/talk/:sid/state", auth, recAdmin, wrap(async (req, res) => {
@@ -1266,13 +1318,13 @@ app.post("/api/rec/talk/:sid/chunk", talkAuth, express.raw({ type: "*/*", limit:
     if (!sid || !tid || !(seq >= 1 && seq < 1e8)) return res.status(400).end();
     const body = Buffer.isBuffer(req.body) ? req.body : Buffer.alloc(0);
     if (body.length > 19200 || body.length % 2) return res.status(400).end();
-    await TalkChunk.create({ sid, tid, seq, rate: req.query.rate === "48000" ? 48000 : 24000, data: body });   // body فاضي = نبضة «لسه شغّال» وأنت كاتم المايك
+    await TalkChunk.collection.insertOne({ sid, tid, seq, rate: req.query.rate === "48000" ? 48000 : 24000, data: body, createdAt: new Date() }, { writeConcern: { w: 1, j: false } });   // w:1 أسرع من majority   // body فاضي = نبضة «لسه شغّال» وأنت كاتم المايك
     res.status(204).end();
 }));
 app.post("/api/rec/talk/:sid/stop", talkAuth, express.raw({ type: "*/*", limit: "1kb" }), wrap(async (req, res) => {
     const sid = talkSid(req), tid = talkTid(req), seq = parseInt(req.query.seq, 10);
     if (!sid || !tid || !(seq >= 1 && seq < 1e8)) return res.status(400).end();
-    await TalkChunk.create({ sid, tid, seq, end: true, data: Buffer.alloc(0) });
+    await TalkChunk.collection.insertOne({ sid, tid, seq, end: true, data: Buffer.alloc(0), createdAt: new Date() }, { writeConcern: { w: 1, j: false } });
     res.status(204).end();
 }));
 
@@ -3581,7 +3633,7 @@ async function chWipe(cid,name){
 
 /* ══ تحدث: المايك ← الموقع ← البوت ← الروم ══ */
 var TK=null;
-var TK_RATE=24000, TK_CHUNK=2400;   // 100ms من الصوت بكل طلب
+var TK_RATE=24000, TK_CHUNK=1440;   // 60ms من الصوت بكل قطعة (أقل تأخير مع حمل معقول)
 function tkSet(t){var e=$('tk-st');if(e)e.textContent=t;}
 function tkUi(){
   var b=$('tk-btn'),en=$('tk-end');if(!b)return;
@@ -3602,15 +3654,32 @@ function tkToggle(sid){
   tkSet(TK.muted?'🔇 المايك مقفول — البوت لسه داخل الروم، اضغط «فتح المايك» تكمّل':'🟢 المايك مفتوح — تكلّم، اللي بالروم يسمعونك');
   tkUi();
 }
-function tkSend(me,arr){
-  if(me.stop||!me.tid)return;
-  if(me.inflight>=6)return;   // الشبكة بطيئة: نتخطّى بدل ما يتراكم تأخير
+function tkPost(me,body,n){
   var seq=me.seq++;
   me.inflight++;
-  fetch('/api/rec/talk/'+encodeURIComponent(me.sid)+'/chunk?tid='+me.tid+'&seq='+seq+'&rate='+TK_RATE,{method:'POST',headers:{'Content-Type':'application/octet-stream'},body:arr.buffer})
+  fetch('/api/rec/talk/'+encodeURIComponent(me.sid)+'/chunk?tid='+me.tid+'&seq='+seq+'&rate='+TK_RATE,{method:'POST',headers:{'Content-Type':'application/octet-stream'},body:body,keepalive:false})
     .then(function(r){if(r.ok){me.fails=0;return;}me.fails++;if(r.status===401||r.status===403)me.fails=99;})
     .catch(function(){me.fails++;})
-    .then(function(){me.inflight--;if(me.fails>=15&&TK===me)tkStop('⚠️ انقطع الاتصال بالموقع');});
+    .then(function(){me.inflight--;if(me.fails>=15&&TK===me)tkStop('⚠️ انقطع الاتصال بالموقع');else tkFlush(me);});
+}
+// طابور: ما نرمي أي صوت (كان يسبب تقطيع)، ولو الشبكة تأخرت ندمج القطع بطلب واحد؛ ولو تراكم أكثر من ~0.7ث نحذف الأقدم عشان نظل مباشرين
+function tkFlush(me){
+  if(me.stop||!me.tid)return;
+  while(me.out.length&&me.inflight<2){
+    var take=Math.min(me.out.length,6),tot=0,i;
+    for(i=0;i<take;i++)tot+=me.out[i].length;
+    var all=new Int16Array(tot),o=0;
+    for(i=0;i<take;i++){all.set(me.out[i],o);o+=me.out[i].length;}
+    me.out.splice(0,take);
+    tkPost(me,all.buffer);
+  }
+}
+function tkSend(me,arr){
+  if(me.stop||!me.tid)return;
+  if(!arr.length){tkPost(me,arr.buffer);return;}   // نبضة «لسه شغّال» وأنت كاتم المايك
+  me.out.push(arr);
+  if(me.out.length>12)me.out.splice(0,me.out.length-12);
+  tkFlush(me);
 }
 function tkIn(me,f){
   // مستوى الصوت
@@ -3638,15 +3707,15 @@ function tkIn(me,f){
 async function tkStart(sid){
   if(TK)return;
   if(!navigator.mediaDevices||!navigator.mediaDevices.getUserMedia){toast('المتصفح ما يدعم المايك — لازم الموقع يكون HTTPS');return;}
-  var me={sid:sid,tid:null,seq:1,stop:false,ready:false,send:false,muted:false,mutedAt:0,inflight:0,fails:0,ctx:null,stream:null,src:null,node:null,
+  var me={sid:sid,tid:null,seq:1,stop:false,ready:false,send:false,muted:false,mutedAt:0,inflight:0,out:[],fails:0,ctx:null,stream:null,src:null,node:null,
     inRate:48000,ib:new Float32Array(0),pos:0,chunk:new Int16Array(TK_CHUNK),cn:0,lvlAt:0,poll:null,ka:null};
   TK=me;tkUi();tkSet('🎤 جاري فتح المايك... اسمح للمتصفح باستخدامه');
   try{
-    var stream=await navigator.mediaDevices.getUserMedia({audio:{echoCancellation:true,noiseSuppression:true,autoGainControl:true,channelCount:1}});
+    var stream=await navigator.mediaDevices.getUserMedia({audio:{echoCancellation:true,noiseSuppression:true,autoGainControl:true,channelCount:1,latency:0}});
     if(TK!==me){stream.getTracks().forEach(function(t){t.stop();});return;}
     me.stream=stream;
     var AC=window.AudioContext||window.webkitAudioContext,ctx;
-    try{ctx=new AC({sampleRate:48000});}catch(e){ctx=new AC();}
+    try{ctx=new AC({sampleRate:48000,latencyHint:'interactive'});}catch(e){try{ctx=new AC({sampleRate:48000});}catch(e2){ctx=new AC();}}
     me.ctx=ctx;me.inRate=ctx.sampleRate;
     try{await ctx.resume();}catch(e){}
     me.src=ctx.createMediaStreamSource(stream);
@@ -3663,7 +3732,7 @@ async function tkStart(sid){
       }catch(e){ok=false;}
     }
     if(!ok){   // متصفحات قديمة
-      var sp=ctx.createScriptProcessor(2048,1,1);
+      var sp=ctx.createScriptProcessor(512,1,1);
       sp.onaudioprocess=function(ev){if(TK===me)tkIn(me,new Float32Array(ev.inputBuffer.getChannelData(0)));};
       me.src.connect(sp);sp.connect(mute);me.node=sp;
     }
@@ -3674,7 +3743,7 @@ async function tkStart(sid){
     me.tid=r.tid;
     var t0=Date.now();
     while(TK===me&&Date.now()-t0<12000){
-      await new Promise(function(res){setTimeout(res,350);});
+      await new Promise(function(res){setTimeout(res,100);});
       if(TK!==me)return;
       var s=await api('/api/rec/talk/'+encodeURIComponent(sid)+'/state');
       if(s.tid!==me.tid)continue;
@@ -3724,17 +3793,66 @@ window.addEventListener('beforeunload',function(){
   if(TK&&TK.tid){try{navigator.sendBeacon('/api/rec/talk/'+encodeURIComponent(TK.sid)+'/stop?tid='+TK.tid+'&seq='+(TK.seq+1),new Blob([new Uint8Array(0)],{type:'application/octet-stream'}));}catch(e){}}
 });
 var LV=null;
+/* ⚡ مشغّل البث المباشر: حزم Opus خام ← WebCodecs ← Web Audio (تأخير ~100-150ms بدل ثواني مخزن المتصفح) */
+function lvRaw(sid,st,onFail,onOk){
+  var AC=window.AudioContext||window.webkitAudioContext;
+  var ctx;try{ctx=new AC({sampleRate:48000,latencyHint:'interactive'});}catch(e){ctx=new AC();}
+  var ac=new AbortController(),dead=false,next=0,ts=0,buf=new Uint8Array(0),gotAudio=false,JIT=0.06,MAXAHEAD=0.35;
+  try{ctx.resume();}catch(e){}
+  var dec=new AudioDecoder({
+    output:function(ad){
+      if(dead){ad.close();return;}
+      var n=ad.numberOfFrames,now=ctx.currentTime;
+      if(next>now+MAXAHEAD){ad.close();return;}   // تراكم: نتخطى عشان نلحق الحاضر
+      var ch=new Float32Array(n);
+      try{ad.copyTo(ch,{planeIndex:0,format:'f32-planar'});}catch(e){ad.close();return;}
+      ad.close();
+      var ab=ctx.createBuffer(1,n,48000);ab.copyToChannel(ch,0);
+      var src=ctx.createBufferSource();src.buffer=ab;src.connect(ctx.destination);
+      if(next<now+0.01)next=now+JIT;   // بداية كلام جديدة أو تأخرت حزمة: نعبّي 60ms تثبيت
+      src.start(next);next+=n/48000;
+      if(!gotAudio){gotAudio=true;onOk();}
+    },
+    error:function(e){if(!dead)fail('decoder');}
+  });
+  function fail(why){if(dead)return;api_stop();onFail(why);}
+  function api_stop(){dead=true;try{ac.abort();}catch(e){}try{dec.close();}catch(e){}try{ctx.close();}catch(e){}}
+  try{dec.configure({codec:'opus',sampleRate:48000,numberOfChannels:1});}catch(e){api_stop();throw e;}
+  fetch('/api/rec/live/'+encodeURIComponent(sid)+'/raw?t='+Date.now(),{signal:ac.signal,cache:'no-store',credentials:'same-origin'}).then(function(r){
+    if(!r.ok||!r.body)throw new Error('http '+r.status);
+    var rd=r.body.getReader();
+    (function pump(){
+      rd.read().then(function(x){
+        if(dead)return;
+        if(x.done){fail('closed');return;}
+        var v=x.value,t=new Uint8Array(buf.length+v.length);t.set(buf);t.set(v,buf.length);buf=t;
+        var p=0;
+        while(buf.length-p>=2){
+          var len=buf[p]|(buf[p+1]<<8);
+          if(len===0){p+=2;continue;}
+          if(len===65535){api_stop();onFail('ended');return;}
+          if(buf.length-p<2+len)break;
+          try{dec.decode(new EncodedAudioChunk({type:'key',timestamp:ts,data:buf.slice(p+2,p+2+len)}));}catch(e){}
+          ts+=20000;p+=2+len;
+        }
+        buf=buf.slice(p);
+        pump();
+      }).catch(function(){if(!dead)fail('read');});
+    })();
+  }).catch(function(){if(!dead)fail('fetch');});
+  return {ctx:ctx,stop:api_stop};
+}
 function lvStop(){
   if(TK)tkStop('');
-  if(LV){clearInterval(LV.timer);clearInterval(LV.t2);try{LV.a.pause();LV.a.removeAttribute('src');LV.a.load();}catch(e){}}
+  if(LV){clearInterval(LV.timer);clearInterval(LV.t2);try{if(LV.raw)LV.raw.stop();}catch(e){}try{LV.a.pause();LV.a.removeAttribute('src');LV.a.load();}catch(e){}}
   LV=null;
 }
 function recLive(sid,name){
   lvStop();
   modal('<h3><span class="livedot"></span>استماع مباشر — '+esc(name||'الروم')+'</h3>'
-   +'<div class="muted" style="font-size:12px;margin-bottom:8px;line-height:1.8">تسمع اللي يقولونه الحين بتأخير بسيط (من ثانية إلى ثلاث). إذا ما اشتغل الصوت لحاله اضغط تشغيل ▶️.</div>'
+   +'<div class="muted" style="font-size:12px;margin-bottom:8px;line-height:1.8">تسمع اللي يقولونه الحين بتأخير شبه معدوم. إذا ما اشتغل الصوت لحاله اضغط «تشغيل» تحت.</div>'
    +'<div id="lv-st" class="center" style="margin:8px 0;font-weight:700">⏳ جاري الاتصال...</div>'
-   +'<audio id="lv-a" controls autoplay style="width:100%"></audio>'
+   +'<audio id="lv-a" controls autoplay style="width:100%"></audio><div class="center" style="margin:6px 0"><button class="btn sm" id="lv-play" style="display:none">▶️ تشغيل الصوت</button></div>'
    +'<div class="row" style="justify-content:center;gap:8px;margin:12px 0 4px"><button class="btn" id="tk-btn">🎤 تحدث</button><button class="btn gray sm" id="tk-end" style="display:none">⏹ إنهاء</button></div>'
    +'<div style="height:6px;background:rgba(255,255,255,.1);border-radius:6px;overflow:hidden;margin:6px 0"><div id="tk-lvl" style="height:100%;width:0;background:#22c55e;transition:width .08s"></div></div>'
    +'<div id="tk-st" class="center muted" style="font-size:12px;line-height:1.8;min-height:20px">اضغط «تحدث» وصوتك يطلع من البوت داخل الروم. الأفضل تستخدم سماعة عشان ما يرجع صوت الروم للمايك.</div>'
@@ -3745,7 +3863,27 @@ function recLive(sid,name){
   $('tk-btn').onclick=function(){tkToggle(sid);};
   $('tk-end').onclick=function(){tkStop('تم إنهاء التحدث');};
   var st=function(t){if(!LV||LV.a!==a)return;var e=$('lv-st');if(e)e.textContent=t;};
+  var canRaw=!!(window.AudioDecoder&&window.EncodedAudioChunk&&(window.AudioContext||window.webkitAudioContext)&&window.AbortController);
+  LV.rawErr=0;
+  var startRaw=function(){
+    if(!LV||LV.a!==a||$('lv-a')!==a)return;
+    try{if(LV.raw)LV.raw.stop();}catch(e){}
+    a.style.display='none';
+    try{
+      LV.raw=lvRaw(sid,st,function(why){
+        if(!LV||LV.a!==a)return;
+        if(why==='ended'){st('⚫ انتهى البث (الجلسة خلصت)');return;}
+        LV.rawErr++;
+        if(LV.rawErr<=5){st('⚠️ انقطع البث — جاري إعادة الاتصال...');setTimeout(startRaw,800);}
+        else{canRaw=false;a.style.display='';st('⚠️ تعذّر البث السريع — أستخدم الطريقة العادية');conn();}
+      },function(){if(!LV||LV.a!==a)return;LV.rawErr=0;st('🔴 مباشر الحين');});
+      var chk=function(){var pb=$('lv-play');if(!pb||!LV||!LV.raw)return;pb.style.display=(LV.raw.ctx.state==='running')?'none':'';};
+      setTimeout(chk,400);
+      var pb=$('lv-play');if(pb)pb.onclick=function(){try{LV.raw.ctx.resume();}catch(e){}setTimeout(chk,300);};
+    }catch(e){canRaw=false;a.style.display='';conn();}
+  };
   var conn=function(){
+    if(canRaw){startRaw();return;}
     try{a.playbackRate=1;}catch(e){}
     a.src='/api/rec/live/'+encodeURIComponent(sid)+'/stream?t='+Date.now();
     var p=a.play();if(p&&p.catch)p.catch(function(){st('اضغط تشغيل ▶️ لبدء الصوت');});
