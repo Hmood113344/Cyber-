@@ -127,6 +127,7 @@ const VoiceSess = VOICE_CONN.model("CyberVoiceSess", new mongoose.Schema({
     chunks: { type: Number, default: 0 }, bytes: { type: Number, default: 0 },
     stays: { type: [mongoose.Schema.Types.Mixed], default: [] },
     speech: { type: [mongoose.Schema.Types.Mixed], default: [] }, speechN: { type: Number, default: 0 },
+    mutes: { type: [mongoose.Schema.Types.Mixed], default: [] },
     pkts: { type: Number, default: 0 }, decErr: { type: String, default: null },
     dbg: { type: String, default: null }, dep: { type: String, default: null },
     tracks: { type: mongoose.Schema.Types.Mixed, default: {} },
@@ -676,6 +677,7 @@ app.get("/api/voice/:sid", auth, full, wrap(async (req, res) => {
         live: !!live, hasAudio: (d.chunks || 0) > 0, pkts: d.pkts || 0, decErr: d.decErr || null, dbg: d.dbg || "", dep: d.dep || "", tracks: d.tracks || {},
         stays: (d.stays || []).map(x => ({ uid: String(x.uid), name: x.name || x.tag || x.uid, avatar: x.avatar || null, start: Number(x.start), end: x.end ? Number(x.end) : null })),
         speech: (d.speech || []).filter(e => Array.isArray(e) && e.length >= 3),
+        mutes: (d.mutes || []).filter(e => Array.isArray(e) && e.length >= 3),
     } });
 }));
 app.get("/api/voice/:sid/audio", auth, full, wrap(async (req, res) => {
@@ -1177,7 +1179,7 @@ app.get("/api/rec/sessions", auth, wrap(async (req, res) => {
 app.get("/api/rec/live/:sid/info", auth, wrap(async (req, res) => {
     const sid = String(req.params.sid || "");
     if (!/^[\w-]{4,60}$/.test(sid)) return res.status(400).json({ error: "جلسة غير صحيحة" });
-    const d = await VoiceSess.findOne({ sid }).select("chName startedAt endedAt lastAt stays speech").lean();
+    const d = await VoiceSess.findOne({ sid }).select("chName startedAt endedAt lastAt stays speech mutes").lean();
     if (!d) return res.status(404).json({ error: "الجلسة غير موجودة" });
     const now = Date.now(), last = {}, people = {};
     (d.speech || []).forEach(e => { if (Array.isArray(e) && e.length >= 3) { const u = String(e[0]), t = Number(e[2]); if (!last[u] || t >= last[u].t) last[u] = { on: e[1] === 1, t }; } });
@@ -1187,7 +1189,13 @@ app.get("/api/rec/live/:sid/info", auth, wrap(async (req, res) => {
         if (!people[u]) people[u] = { uid: u, name: x.name || x.tag || u, avatar: x.avatar || null, inside: false };
         if (!x.end) people[u].inside = true;
     });
-    const list = Object.values(people).filter(x => x.inside).map(x => ({ uid: x.uid, name: x.name, avatar: x.avatar, speaking: !!(last[x.uid] && last[x.uid].on && now - last[x.uid].t < 30000) }));
+    const mlast = {};
+    (d.mutes || []).forEach(e => { if (Array.isArray(e) && e.length >= 3) { const u = String(e[0]), t = Number(e[2]); if (!mlast[u] || t >= mlast[u].t) mlast[u] = { m: e[1] === 1, t }; } });
+    const list = Object.values(people).filter(x => x.inside).map(x => {
+        const speaking = !!(last[x.uid] && last[x.uid].on && now - last[x.uid].t < 30000);
+        const mic = speaking ? "open" : (mlast[x.uid] ? (mlast[x.uid].m ? "muted" : "open") : null);   // null = تسجيل قديم بدون بيانات المايك
+        return { uid: x.uid, name: x.name, avatar: x.avatar, speaking, mic };
+    });
     res.json({ chName: d.chName || "", ended: !!d.endedAt, people: list });
 }));
 // ⚡ بث مباشر شبه فوري: حزم Opus خام [طول 2 بايت][حزمة] — المتصفح يفك ترميزها ويشغّلها بـ Web Audio (بدون مخزن المتصفح الكبير)
@@ -1866,6 +1874,16 @@ input:focus, select:focus { outline:none; border-color:var(--gold-soft); }
 #tk-btn.danger { background:#16a34a; border-color:#16a34a; }
 .rm-b.gray { opacity:.6; }
 .rm-b:disabled { cursor:wait; }
+.rm-card { cursor:pointer; }
+.rm-card.out { opacity:.4; }
+.rm-card.pick:not(.sp) { border-color:#22c55e; box-shadow:0 0 0 2px rgba(34,197,94,.55); }
+.rm-pk { display:none; font-size:11px; color:#4ade80; margin-top:6px; font-weight:700; }
+.rm-card.pick .rm-pk { display:block; }
+.rm-mic.open { color:#86efac; border:1px solid rgba(34,197,94,.6); background:rgba(34,197,94,.12); }
+.rm-mic.unk { color:#94a3b8; border:1px solid rgba(148,163,184,.4); background:rgba(148,163,184,.08); }
+.rm-mic.out { color:#94a3b8; border:1px solid rgba(148,163,184,.4); background:rgba(148,163,184,.08); }
+.rm-clock { font-size:30px; font-weight:800; color:#e2e8f0; text-align:center; direction:ltr; margin-top:6px; }
+.rm-seek { width:100%; direction:ltr; margin:4px 0 8px; }
 .card.clk { cursor:pointer; }
 .card.clk:hover { border-color:rgba(248,113,113,0.7); }
 #toast { position:fixed; bottom:20px; left:50%; transform:translateX(-50%); background:#0d1f3c; padding:10px 20px; border-radius:10px; border:1px solid var(--gold); z-index:6000; display:none; max-width:90vw; text-align:center; }
@@ -2058,6 +2076,9 @@ async function vrOpen(sid){
     if(cur!==null)iv[u].push([cur,Math.min(span,cur+1500)]);
   });
   VR={s:s,E:E,span:span,att:att,iv:iv,T:0,playing:false,rate:1,sel:{},els:{},r0:null,r1:null,clip:false,drag:false,last:Date.now(),timer:null,sid:sid,wait:0};
+  VR.mv={};
+  (s.mutes||[]).forEach(function(e){(VR.mv[e[0]]=VR.mv[e[0]]||[]).push([Number(e[2]),e[1]]);});
+  Object.keys(VR.mv).forEach(function(u){VR.mv[u].sort(function(a,b){return a[0]-b[0];});});
   var hasTracks=Object.keys(s.tracks).length>0;
   var h='<h3>🎬 تسجيل توضيحي — '+esc(s.chName||'الروم المسجّل')+'</h3>'
     +'<div style="text-align:center;margin:14px 0"><div style="font-size:46px">'+(s.hasAudio?'🎧':'🎬')+'</div>'
@@ -2067,11 +2088,12 @@ async function vrOpen(sid){
     +'<div class="prow"><span class="muted">⏱️ المدة</span><b>'+esc(vrDur(span))+(s.live?' (جارية الحين)':'')+'</b></div>'
     +'<div class="prow" style="border:none"><span class="muted">👥 عدد الحضور</span><b>'+att.length+'</b></div></div>'
     +vrDiag(s)
-    +'<div class="row" style="justify-content:center;gap:8px"><button class="btn" onclick="vrStart()">▶️ فتح المشغّل</button><button class="btn gray sm" onclick="vrClose()">✖ إغلاق</button></div>';
+    +'<div class="row" style="justify-content:center;gap:8px"><button class="btn" onclick="vrRoomOpen()">🖥️ تحويل للنافذة الجديدة</button><button class="btn" onclick="vrStart()">▶️ فتح المشغّل</button><button class="btn gray sm" onclick="vrClose()">✖ إغلاق</button></div>';
   modal(h);
 }
 function vrShell(){
   var s=VR.s,h='<h3>🎬 '+esc(s.chName||'الروم المسجّل')+'</h3>';
+  h+='<div class="center" style="margin:6px 0 10px"><button class="btn rec-wide" onclick="vrRoomOpen()">🖥️ تحويل للنافذة الجديدة</button></div>';
   h+='<div class="rp-clock" id="rp-clock">--</div>';
   h+='<div style="text-align:center;font-size:12px;color:var(--muted)"><span id="vr-el">0:00</span> / '+vrMS(VR.span)+' <span id="vr-now" style="color:#4ade80"></span></div>';
   h+='<div id="vr-lanes" style="position:relative;direction:ltr;margin:10px 0 4px"><div id="vr-rng" style="position:absolute;top:0;bottom:0;left:0;width:0;background:rgba(250,204,21,.13);border-left:1px solid #facc15;border-right:1px solid #facc15;pointer-events:none;z-index:1;display:none"></div><div id="vr-ph" style="position:absolute;top:0;bottom:0;left:0;width:2px;background:#fff;pointer-events:none;z-index:2"></div>';
@@ -2295,6 +2317,7 @@ function vrPaint(){
     for(var i=0;i<iv.length;i++){if(VR.T>=iv[i][0]&&VR.T<=iv[i][1]){now.push(p.name);break;}}
   });
   var n=$('vr-now');if(n)n.textContent=now.length?('🎤 '+now.join('، ')):'';
+  if($('vrroom'))vrRoomPaint();
 }
 function vrTick(){
   if(!VR)return;
@@ -3537,7 +3560,7 @@ async function pgRec(){
   };
   await recLoad();
   clearInterval(S.timer);
-  S.timer=setInterval(function(){if(S.page==='rec'&&!$('ov'))recLoad();},5000);
+  S.timer=setInterval(function(){if(S.page==='rec'&&!$('ov')&&!$('lvroom'))recLoad();},5000);
 }
 async function recLoad(){
   try{
@@ -3893,7 +3916,8 @@ function lvStop(){
   if(LV){clearInterval(LV.timer);clearInterval(LV.t2);try{if(LV.raw)LV.raw.stop();}catch(e){}try{LV.a.pause();LV.a.removeAttribute('src');LV.a.load();}catch(e){}}
   LV=null;
 }
-function recLive(sid,name){
+function recLive(sid,name){liveRoom(sid,name);}
+function recLiveOld(sid,name){
   lvStop();
   modal('<h3><span class="livedot"></span>استماع مباشر — '+esc(name||'الروم')+'</h3>'
    +'<div class="muted" style="font-size:12px;margin-bottom:8px;line-height:1.8">تسمع اللي يقولونه الحين بتأخير شبه معدوم. إذا ما اشتغل الصوت لحاله اضغط «تشغيل» تحت.</div>'
@@ -3987,7 +4011,7 @@ async function pgLive(){
   };
   await liveLoad();
   clearInterval(S.timer);
-  S.timer=setInterval(function(){if(S.page==='live'&&!$('lvroom')&&!$('ov'))liveLoad();},5000);
+  S.timer=setInterval(function(){if(S.page==='live'&&!$('lvroom')&&!$('vrroom')&&!$('ov'))liveLoad();},5000);
 }
 function lvWhen(t){try{return new Date(t).toLocaleString('ar-SA',{dateStyle:'short',timeStyle:'short'});}catch(e){return '';}}
 async function liveLoad(){
@@ -4006,7 +4030,7 @@ function rmCard(p){
   var me=S.meId&&p.uid===S.meId;
   var av=p.avatar?'<img class="rm-av" src="'+esc(p.avatar)+'" alt="">':'<div class="rm-av">'+esc((p.name||'?').trim().charAt(0))+'</div>';
   return '<div class="rm-card'+(p.speaking?' sp':'')+'">'+av+'<div class="rm-name">'+esc(p.name)+(me?' (أنت)':'')+'</div>'
-    +(p.speaking?'<div class="rm-mic on">🎤 يتكلم</div>':'<div class="rm-mic off">🔇 المايك مقفل</div>')+'</div>';
+    +(p.speaking?'<div class="rm-mic on">🎤 يتكلم</div>':(p.mic==='open'?'<div class="rm-mic open">🎙️ المايك مفتوح</div>':(p.mic==='muted'?'<div class="rm-mic off">🔇 المايك مقفل</div>':'<div class="rm-mic unk">⚪ في الروم</div>')))+'</div>';
 }
 function rmBar(){
   var b=$('rm-bar');if(!b||!RM)return;
@@ -4107,7 +4131,67 @@ function liveRoom(sid,name){
     }catch(e){}
   };
   poll();
-  LV.timer=setInterval(poll,2000);
+  LV.timer=setInterval(poll,1000);
+}
+
+
+/* ══ النافذة الجديدة لتسجيل منتهي (شكل الديسكورد + اختيار من تسمعه + تقديم الوقت) ══ */
+function vrRoomOpen(){
+  if(!VR)return;
+  var s=VR.s,wasPlaying=VR.playing;
+  if(!VR.timer){VR.last=Date.now();VR.timer=setInterval(vrTick,100);}
+  closeModal();
+  var old=$('vrroom');if(old)old.remove();
+  var o=document.createElement('div');o.id='vrroom';o.className='lvroom';
+  var cards=VR.att.map(function(p){
+    var av=(p.stays[0]&&p.stays[0].avatar)?'<img class="rm-av" src="'+esc(p.stays[0].avatar)+'" alt="">':'<div class="rm-av">'+esc((p.name||'?').trim().charAt(0))+'</div>';
+    return '<div class="rm-card out" id="vc-'+esc(p.uid)+'" data-vcu="'+esc(p.uid)+'">'+av+'<div class="rm-name">'+esc(p.name)+(S.meId&&p.uid===S.meId?' (أنت)':'')+'</div><div class="rm-mic out" id="vcm-'+esc(p.uid)+'">⚪ خارج الروم</div><div class="rm-pk">🎧 يسمعه ✓</div></div>';
+  }).join('')||'<div class="muted center" style="grid-column:1/-1;padding:40px 0">ما فيه أحد بهذا التسجيل</div>';
+  o.innerHTML='<div class="rm-top"><div class="rm-title">🎬 '+esc(s.chName||'الروم المسجّل')+'</div>'
+    +'<div class="rm-live"><span>⚫ تسجيل منتهي • المدة '+esc(vrDur(VR.span))+'</span><span id="vr-now" style="margin-right:10px;color:#93c5fd"></span></div>'
+    +'<div class="rm-clock" id="rp-clock">--</div></div>'
+    +'<div class="rm-body"><div class="muted center" style="font-size:12px;margin-bottom:8px">اضغط على بطاقة شخص أو شخصين عشان تسمعهم بس • اللي يتكلم تصير بطاقته زرقاء</div><div class="rm-grid" id="vr-cards">'+cards+'</div></div>'
+    +'<div class="rm-foot"><div class="center" style="font-size:12px;color:#94a3b8;direction:ltr"><span id="vr-el">0:00</span> / '+vrMS(VR.span)+'</div>'
+    +'<input type="range" class="rm-seek" id="vr-seek" min="0" max="'+VR.span+'" step="100" value="0" oninput="vrDrag(this.value)" onchange="vrCommit(this.value)">'
+    +'<div id="vr-listen" class="rm-st"></div>'
+    +'<div class="rm-bar"><button class="rm-b" onclick="vrSkip(-10000)">⏪ 10</button><button class="rm-b blue" id="vr-pp" onclick="vrToggle()">▶️ تشغيل</button><button class="rm-b" onclick="vrSkip(10000)">10 ⏩</button><button class="rm-b" id="vr-sp" onclick="vrSpeed()">×'+VR.rate+'</button><button class="rm-b" onclick="vrSelAll()">🔊 الكل</button><button class="rm-b danger" onclick="vrRoomClose()">📞 خروج</button></div></div>';
+  o.addEventListener('click',function(ev){var c=ev.target.closest('[data-vcu]');if(c){vrSel(c.getAttribute('data-vcu'));vrRoomPaint();}});
+  document.body.appendChild(o);lockScroll();
+  vrSelPaint();vrPaint();
+  if(s.hasAudio&&!wasPlaying)vrPlay();
+}
+function vrRoomPaint(){
+  if(!VR||!$('vrroom'))return;
+  var s=VR.s,T=VR.drag?VR.dragT:VR.T;
+  VR.att.forEach(function(p){
+    var el=$('vc-'+p.uid);if(!el)return;
+    var inn=false,sp=false,i;
+    for(i=0;i<p.stays.length;i++){var st=p.stays[i],a=st.start-s.startedAt,b=(st.end||VR.E)-s.startedAt;if(T>=a&&T<=b){inn=true;break;}}
+    var iv=VR.iv[p.uid]||[];
+    for(i=0;i<iv.length;i++){if(T>=iv[i][0]&&T<=iv[i][1]){sp=true;break;}}
+    if(sp)inn=true;
+    var pk=!!VR.sel[p.uid]&&s.tracks[p.uid]!==undefined;
+    var cls='rm-card'+(sp?' sp':'')+(pk?' pick':'')+(inn?'':' out');
+    if(el.className!==cls)el.className=cls;
+    var m=$('vcm-'+p.uid);
+    if(m){
+      var mu=(VR.mv&&VR.mv[p.uid])||[],ms=null,k;
+      for(k=0;k<mu.length;k++){if(mu[k][0]<=T)ms=mu[k][1];else break;}
+      var txt,mc;
+      if(sp){txt='🎤 يتكلم';mc='rm-mic on';}
+      else if(!inn){txt='⚪ خارج الروم';mc='rm-mic out';}
+      else if(ms===1){txt='🔇 المايك مقفل';mc='rm-mic off';}
+      else if(ms===0){txt='🎙️ المايك مفتوح';mc='rm-mic open';}
+      else{txt='⚪ في الروم';mc='rm-mic unk';}
+      if(m.textContent!==txt)m.textContent=txt;
+      if(m.className!==mc)m.className=mc;
+    }
+  });
+}
+function vrRoomClose(){
+  vrStop();
+  var o=$('vrroom');if(o)o.remove();
+  unlockScroll();
 }
 
 /* ══ نظام الخطر (لصاحب الصفحة فقط) — الزر مخفي، ويظهر/يختفي بالضغط على كلام «الأمن السيبراني» ══ */
@@ -4134,7 +4218,7 @@ function liveRefresh(d){
     if($('ov')||$('dismissed'))return;
     var a=document.activeElement;
     if(a&&(a.tagName==='INPUT'||a.tagName==='TEXTAREA'||a.tagName==='SELECT'))return;
-    if(S.page==='rec'||S.page==='chans'||S.page==='live'||$('lvroom')||(S.page==='perms'&&S.chEdit))return;
+    if(S.page==='rec'||S.page==='chans'||S.page==='live'||$('lvroom')||$('vrroom')||(S.page==='perms'&&S.chEdit))return;
     var y=window.pageYOffset||0;
     render();
     setTimeout(function(){window.scrollTo(0,y);},350);
