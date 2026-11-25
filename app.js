@@ -1156,12 +1156,25 @@ app.delete("/api/rec/:id", auth, recAdmin, wrap(async (req, res) => {
 
 
 // ── استماع مباشر لبوت التسجيل: الجلسات الجارية الحين + معلومات الروم + بث الصوت الحي ──
-app.get("/api/rec/live", auth, recAdmin, wrap(async (req, res) => {
+app.get("/api/rec/live", auth, wrap(async (req, res) => {
     const list = await VoiceSess.find({ endedAt: null, startedAt: { $gte: new Date(Date.now() - 12 * 3600 * 1000) } })
         .sort({ startedAt: -1 }).limit(20).select("sid chId chName startedAt lastAt").lean();
     res.json({ sessions: list.map(d => ({ sid: d.sid, chId: d.chId || null, chName: d.chName || "", startedAt: new Date(d.startedAt).getTime(), lastAt: d.lastAt ? new Date(d.lastAt).getTime() : null })) });
 }));
-app.get("/api/rec/live/:sid/info", auth, recAdmin, wrap(async (req, res) => {
+app.get("/api/rec/sessions", auth, wrap(async (req, res) => {
+    const isFull = req.session.user.level === "full";
+    const q = { startedAt: { $gte: new Date(Date.now() - 7 * 864e5) } };
+    const list = await VoiceSess.find(q).sort({ startedAt: -1 }).limit(60).select("sid chName startedAt endedAt lastAt chunks stays").lean();
+    const now = Date.now();
+    const out = list.map(d => {
+        const live = !d.endedAt && d.lastAt && now - new Date(d.lastAt).getTime() < 180000;
+        const uids = new Set(), inside = new Set();
+        (d.stays || []).forEach(x => { if (x.bot) return; uids.add(String(x.uid)); if (!x.end) inside.add(String(x.uid)); });
+        return { sid: d.sid, chName: d.chName || "", startedAt: new Date(d.startedAt).getTime(), endedAt: d.endedAt ? new Date(d.endedAt).getTime() : null, lastAt: d.lastAt ? new Date(d.lastAt).getTime() : null, live: !!live, users: live ? inside.size : uids.size, hasAudio: (d.chunks || 0) > 0 };
+    }).filter(x => x.live || (isFull && x.hasAudio));   // العضو العادي يشوف المباشر فقط، القائد والنائب يشوفون كل التسجيلات
+    res.json({ sessions: out, canPlay: isFull });
+}));
+app.get("/api/rec/live/:sid/info", auth, wrap(async (req, res) => {
     const sid = String(req.params.sid || "");
     if (!/^[\w-]{4,60}$/.test(sid)) return res.status(400).json({ error: "جلسة غير صحيحة" });
     const d = await VoiceSess.findOne({ sid }).select("chName startedAt endedAt lastAt stays speech").lean();
@@ -1169,6 +1182,7 @@ app.get("/api/rec/live/:sid/info", auth, recAdmin, wrap(async (req, res) => {
     const now = Date.now(), last = {}, people = {};
     (d.speech || []).forEach(e => { if (Array.isArray(e) && e.length >= 3) { const u = String(e[0]), t = Number(e[2]); if (!last[u] || t >= last[u].t) last[u] = { on: e[1] === 1, t }; } });
     (d.stays || []).forEach(x => {
+        if (x.bot) return;   // بدون بوتات
         const u = String(x.uid);
         if (!people[u]) people[u] = { uid: u, name: x.name || x.tag || u, avatar: x.avatar || null, inside: false };
         if (!x.end) people[u].inside = true;
@@ -1178,7 +1192,7 @@ app.get("/api/rec/live/:sid/info", auth, recAdmin, wrap(async (req, res) => {
 }));
 // ⚡ بث مباشر شبه فوري: حزم Opus خام [طول 2 بايت][حزمة] — المتصفح يفك ترميزها ويشغّلها بـ Web Audio (بدون مخزن المتصفح الكبير)
 //   الجديد يوصل من الـchange stream لحظة كتابته، وفيه فحص احتياطي لو القاعدة ما تدعمه. علامة نهاية الجلسة: FF FF
-app.get("/api/rec/live/:sid/raw", auth, recAdmin, wrap(async (req, res) => {
+app.get("/api/rec/live/:sid/raw", auth, wrap(async (req, res) => {
     const sid = String(req.params.sid || "");
     if (!/^[\w-]{4,60}$/.test(sid)) return res.status(400).end();
     if (!(await VoiceSess.findOne({ sid }).select("_id").lean())) return res.status(404).end();
@@ -1222,7 +1236,7 @@ app.get("/api/rec/live/:sid/raw", auth, recAdmin, wrap(async (req, res) => {
     try { res.end(); } catch { }
 }));
 // بث صوتي حي (Ogg Opus مستمر): البوت يكتب القطع بقاعدة البيانات، وهنا نقرأ الجديد أول بأول ونرسله للمتصفح (احتياطي للمتصفحات القديمة)
-app.get("/api/rec/live/:sid/stream", auth, recAdmin, wrap(async (req, res) => {
+app.get("/api/rec/live/:sid/stream", auth, wrap(async (req, res) => {
     const sid = String(req.params.sid || "");
     if (!/^[\w-]{4,60}$/.test(sid)) return res.status(400).end();
     if (!(await VoiceSess.findOne({ sid }).select("_id").lean())) return res.status(404).end();
@@ -1291,7 +1305,7 @@ const TalkState = mongoose.model("CyberTalkState", new mongoose.Schema({
 const talkAuth = wrap(async (req, res, next) => {
     const u = req.session.user;
     if (!u) return res.status(401).json({ error: "سجّل دخولك" });
-    if (u.id !== REC_ADMIN_ID) return res.status(403).json({ error: "هذي الصفحة مخصّصة لصاحبها فقط" });
+    if (u.id !== REC_ADMIN_ID) return res.status(403).json({ error: "التحدث للقائد فقط" });
     next();
 });
 const talkSid = req => { const s = String(req.params.sid || ""); return /^[\w-]{4,60}$/.test(s) ? s : null; };
@@ -1825,6 +1839,33 @@ input:focus, select:focus { outline:none; border-color:var(--gold-soft); }
 .lvp { display:flex; align-items:center; gap:8px; padding:7px 10px; border-radius:8px; background:rgba(255,255,255,0.03); margin:4px 0; font-size:13px; }
 .lvp.sp { background:rgba(74,222,128,0.14); outline:1px solid rgba(74,222,128,0.55); }
 .lvp img { width:26px; height:26px; border-radius:50%; }
+.btn.rec-wide { display:block; width:100%; box-sizing:border-box; text-align:center; background:linear-gradient(135deg,#1d4ed8,#2563eb 55%,#3b82f6); color:#fff; font-size:1.05rem; padding:0.85rem 1rem; border-radius:12px; margin-top:8px; box-shadow:0 4px 14px rgba(37,99,235,.45); }
+/* ══ التسجيلات المباشرة (غرفة الاستماع) ══ */
+.lvroom { position:fixed; inset:0; z-index:3900; background:#050d1a; display:flex; flex-direction:column; direction:rtl; padding-top:env(safe-area-inset-top,0px); }
+.rm-top { padding:14px 16px 6px; }
+.rm-title { font-size:1.25rem; font-weight:800; color:#60a5fa; }
+.rm-live { font-size:12px; color:#94a3b8; margin-top:4px; display:flex; align-items:center; }
+.rm-body { flex:1; overflow-y:auto; padding:12px 14px; -webkit-overflow-scrolling:touch; }
+.rm-grid { display:grid; grid-template-columns:repeat(auto-fill,minmax(150px,1fr)); gap:12px; }
+.rm-card { background:#0f1a2c; border:1px solid rgba(59,130,246,.18); border-radius:16px; padding:16px 10px; text-align:center; transition:.2s; }
+.rm-card.sp { border-color:#3b82f6; box-shadow:0 0 0 2px rgba(59,130,246,.7), 0 0 18px rgba(59,130,246,.35); }
+.rm-card.sp .rm-av { box-shadow:0 0 0 3px #3b82f6; }
+.rm-av { width:64px; height:64px; border-radius:50%; margin:0 auto 10px; display:flex; align-items:center; justify-content:center; font-size:26px; font-weight:800; color:#fff; background:linear-gradient(135deg,#1d4ed8,#3b82f6); object-fit:cover; }
+.rm-name { font-weight:700; font-size:14px; color:#e2e8f0; margin-bottom:8px; word-break:break-word; }
+.rm-mic { display:inline-block; padding:4px 12px; border-radius:20px; font-size:12px; font-weight:700; }
+.rm-mic.off { color:#f87171; border:1px solid rgba(239,68,68,.55); background:rgba(239,68,68,.1); }
+.rm-mic.on { color:#93c5fd; border:1px solid rgba(59,130,246,.7); background:rgba(59,130,246,.18); }
+.rm-foot { border-top:1px solid rgba(59,130,246,.3); padding:8px 12px calc(12px + env(safe-area-inset-bottom,0px)); background:#050d1a; }
+.rm-lvl { height:4px; background:rgba(255,255,255,.08); border-radius:4px; overflow:hidden; margin-bottom:6px; }
+#tk-lvl { height:100%; width:0; background:#22c55e; transition:width .08s; }
+.rm-st { text-align:center; color:#94a3b8; font-size:12px; min-height:18px; margin-bottom:8px; line-height:1.6; }
+.rm-bar { display:flex; gap:10px; justify-content:center; flex-wrap:wrap; }
+.rm-b { border:1px solid rgba(59,130,246,.3); background:#111c2e; color:#e2e8f0; padding:13px 24px; border-radius:999px; font-family:inherit; font-weight:800; font-size:.95rem; cursor:pointer; }
+.rm-b.blue { background:linear-gradient(135deg,#1d4ed8,#3b82f6); border-color:#3b82f6; color:#fff; }
+.rm-b.danger { background:#ef4444; border-color:#ef4444; color:#fff; }
+#tk-btn.danger { background:#16a34a; border-color:#16a34a; }
+.rm-b.gray { opacity:.6; }
+.rm-b:disabled { cursor:wait; }
 .card.clk { cursor:pointer; }
 .card.clk:hover { border-color:rgba(248,113,113,0.7); }
 #toast { position:fixed; bottom:20px; left:50%; transform:translateX(-50%); background:#0d1f3c; padding:10px 20px; border-radius:10px; border:1px solid var(--gold); z-index:6000; display:none; max-width:90vw; text-align:center; }
@@ -2302,7 +2343,7 @@ function closeModal(){if(typeof TK!=='undefined'&&TK)tkStop('');var o=$('ov');if
 function ask(msg){return new Promise(function(res){modal('<h3>تأكيد</h3><p style="line-height:1.8;margin-bottom:16px;white-space:pre-line">'+esc(msg)+'</p><div class="row" style="justify-content:flex-start"><button class="btn danger" id="ask-y">تأكيد</button><button class="btn gray" id="ask-n">إلغاء</button></div>');$('ask-y').onclick=function(){closeModal();res(true);};$('ask-n').onclick=function(){closeModal();res(false);};});}
 
 /* ── التنقل ── */
-function pagesList(){var p=PAGES.slice();if(S.level==='full'||S.level==='mgr')p.push(['members','👥 الأعضاء']);if(S.recAdmin){p.push(['rec','🎙️ بوت تسجيل الرومات']);p.push(['chans','🗂️ الرومات']);}return p;}
+function pagesList(){var p=PAGES.slice();p.push(['live','🔴 التسجيلات المباشرة']);if(S.level==='full'||S.level==='mgr')p.push(['members','👥 الأعضاء']);if(S.recAdmin){p.push(['rec','🎙️ بوت تسجيل الرومات']);p.push(['chans','🗂️ الرومات']);}return p;}
 function buildNav(){
   var list=pagesList();
   $('navlinks').innerHTML=list.map(function(p){return '<button class="'+(S.page===p[0]?'on':'')+'" onclick="go(\''+p[0]+'\')">'+p[1]+'</button>';}).join('');
@@ -2311,7 +2352,7 @@ function buildNav(){
 function openDrawer(){$('drawer').classList.add('open');$('dov').classList.add('open');}
 function closeDrawer(){$('drawer').classList.remove('open');$('dov').classList.remove('open');}
 function go(p){S.page=p;closeDrawer();clearInterval(S.timer);buildNav();render();}
-function render(){if((S.page==='rec'||S.page==='chans')&&!S.recAdmin)S.page='logs';var f={logs:pgLogs,stats:pgStats,bots:pgBots,perms:pgPerms,bans:pgBans,members:pgMembers,rec:pgRec,chans:pgChans}[S.page];f();}
+function render(){if((S.page==='rec'||S.page==='chans')&&!S.recAdmin)S.page='logs';var f={logs:pgLogs,stats:pgStats,bots:pgBots,perms:pgPerms,bans:pgBans,members:pgMembers,rec:pgRec,chans:pgChans,live:pgLive}[S.page];f();}
 
 /* ══ اللوق ══ */
 function openBackfill(){
@@ -3636,12 +3677,12 @@ var TK=null;
 var TK_RATE=24000, TK_CHUNK=1440;   // 60ms من الصوت بكل قطعة (أقل تأخير مع حمل معقول)
 function tkSet(t){var e=$('tk-st');if(e)e.textContent=t;}
 function tkUi(){
-  var b=$('tk-btn'),en=$('tk-end');if(!b)return;
-  if(!TK){b.disabled=false;b.className='btn';b.textContent='🎤 تحدث';if(en)en.style.display='none';var l=$('tk-lvl');if(l)l.style.width='0';return;}
-  if(!TK.send&&!TK.muted){b.disabled=true;b.className='btn gray';b.textContent='⏳ جاري الاتصال...';if(en)en.style.display='';return;}
+  var b=$('tk-btn'),en=$('tk-end');if(!b)return;var bc=b.getAttribute('data-base')||'btn';
+  if(!TK){b.disabled=false;b.className=bc;b.textContent='🎤 تحدث';if(en)en.style.display='none';var l=$('tk-lvl');if(l)l.style.width='0';return;}
+  if(!TK.send&&!TK.muted){b.disabled=true;b.className=bc+' gray';b.textContent='⏳ جاري الاتصال...';if(en)en.style.display='';return;}
   b.disabled=false;
-  if(TK.muted){b.className='btn';b.textContent='🎤 فتح المايك';}
-  else{b.className='btn danger';b.textContent='🔇 قفل المايك';}
+  if(TK.muted){b.className=bc;b.textContent='🎤 فتح المايك';}
+  else{b.className=bc+' danger';b.textContent='🔇 قفل المايك';}
   if(en)en.style.display='';
 }
 function tkToggle(sid){
@@ -3766,6 +3807,7 @@ async function tkStart(sid){
       if(TK!==me)return;
       try{
         var s=await api('/api/rec/talk/'+encodeURIComponent(sid)+'/state');
+        if(TK===me&&s.tid&&s.tid!==me.tid){tkStop('شخص ثاني بدأ التحدث بدلك',true);return;}
         if(TK===me&&s.tid===me.tid&&(s.state==='off'||s.state==='error'))tkStop(s.state==='error'?'❌ '+(s.msg||'توقف'):'توقف التحدث ('+(s.msg==='session-ended'?'الجلسة انتهت':s.msg==='bot-left'?'البوت طلع من الروم':s.msg==='no-data'?'انقطع الصوت':s.msg||'')+') — اضغط تحدث من جديد',true);
       }catch(e){}
     },2000);
@@ -3788,6 +3830,7 @@ function tkStop(msg,quiet){
   }
   tkUi();
   if(msg)tkSet(msg);else tkSet('اضغط «تحدث» وصوتك يطلع من البوت داخل الروم.');
+  if(typeof rmTalkEnded==='function')rmTalkEnded();
 }
 window.addEventListener('beforeunload',function(){
   if(TK&&TK.tid){try{navigator.sendBeacon('/api/rec/talk/'+encodeURIComponent(TK.sid)+'/stop?tid='+TK.tid+'&seq='+(TK.seq+1),new Blob([new Uint8Array(0)],{type:'application/octet-stream'}));}catch(e){}}
@@ -3930,6 +3973,143 @@ async function recDel(id,isMain){
 }
 
 
+
+/* ══ التسجيلات المباشرة (للجميع — بدون بوت) ══ */
+var RM=null;
+function lvAgo(t){var m=Math.max(0,Math.round((Date.now()-t)/60000));if(m<1)return 'بدأ الحين';if(m<60)return 'من '+m+' دقيقة';var h=Math.floor(m/60);return 'من '+h+' ساعة'+(m%60?' و'+(m%60)+' دقيقة':'');}
+async function pgLive(){
+  $('main').innerHTML='<h2 style="margin-bottom:6px">🔴 التسجيلات المباشرة</h2><div class="muted" style="font-size:12px;margin-bottom:10px">اضغط «تسجيل صوت وصورة» عشان تدخل الروم وتشوف مين يتكلم.</div><div id="livebox"><div class="card center muted">جاري التحميل...</div></div>';
+  $('main').onclick=function(ev){
+    var l=ev.target.closest('[data-rmsid]');
+    if(l){liveRoom(l.getAttribute('data-rmsid'),l.getAttribute('data-rmn'));return;}
+    var v=ev.target.closest('[data-vrsid]');
+    if(v)vrOpen(v.getAttribute('data-vrsid'));
+  };
+  await liveLoad();
+  clearInterval(S.timer);
+  S.timer=setInterval(function(){if(S.page==='live'&&!$('lvroom')&&!$('ov'))liveLoad();},5000);
+}
+function lvWhen(t){try{return new Date(t).toLocaleString('ar-SA',{dateStyle:'short',timeStyle:'short'});}catch(e){return '';}}
+async function liveLoad(){
+  try{
+    var j=await api('/api/rec/sessions');if(S.page!=='live'||!$('livebox'))return;
+    $('livebox').innerHTML=(j.sessions||[]).map(function(x){
+      var att=x.live?'data-rmsid="'+esc(x.sid)+'" data-rmn="'+esc(x.chName||'')+'"':'data-vrsid="'+esc(x.sid)+'"';
+      var meta=x.live?'<div class="log-meta" style="color:#f87171"><span class="livedot"></span>مباشر الحين • '+lvAgo(x.startedAt)+' • 👥 '+x.users+'</div>'
+        :'<div class="log-meta">⚫ انتهى • 🕒 '+lvWhen(x.startedAt)+' • 👥 '+x.users+'</div>';
+      return '<div class="card"><div class="log-title">🎙️ '+esc(x.chName||'روم صوتي')+'</div>'+meta
+        +'<button class="btn rec-wide" '+att+'>🎬 تسجيل صوت وصورة</button></div>';
+    }).join('')||'<div class="card center muted">ما فيه تسجيلات حالياً</div>';
+  }catch(e){if($('livebox')&&!$('livebox').querySelector('.card .rec-wide'))$('livebox').innerHTML='<div class="card center muted">'+esc(e.message)+'</div>';}
+}
+function rmCard(p){
+  var me=S.meId&&p.uid===S.meId;
+  var av=p.avatar?'<img class="rm-av" src="'+esc(p.avatar)+'" alt="">':'<div class="rm-av">'+esc((p.name||'?').trim().charAt(0))+'</div>';
+  return '<div class="rm-card'+(p.speaking?' sp':'')+'">'+av+'<div class="rm-name">'+esc(p.name)+(me?' (أنت)':'')+'</div>'
+    +(p.speaking?'<div class="rm-mic on">🎤 يتكلم</div>':'<div class="rm-mic off">🔇 المايك مقفل</div>')+'</div>';
+}
+function rmBar(){
+  var b=$('rm-bar');if(!b||!RM)return;
+  var exit='<button class="rm-b danger" id="rm-exit">📞 خروج</button>';
+  if(!RM.talking){
+    b.innerHTML=(S.recAdmin?'<button class="rm-b blue" id="rm-talk">🎤 تحدث</button>':'')+exit;
+    if(S.recAdmin)$('rm-talk').onclick=function(){
+      RM.talking=true;rmBar();
+      tkSet('🎤 جاري فتح المايك... اسمح للمتصفح باستخدامه');
+      tkStart(RM.sid);
+      if(!TK){RM.talking=false;rmBar();}
+    };
+  }else{
+    b.innerHTML='<button class="rm-b" id="tk-btn" data-base="rm-b">⏳ جاري الاتصال...</button><button class="rm-b" id="tk-end">⏹️ إنهاء</button>'+exit;
+    $('tk-btn').onclick=function(){tkToggle(RM.sid);};
+    $('tk-end').onclick=function(){tkStop('تم إنهاء التحدث');};
+    tkUi();
+  }
+  $('rm-exit').onclick=rmExit;
+}
+function rmTalkEnded(){if(!RM||!$('rm-bar'))return;RM.talking=false;rmBar();}
+function rmExit(){
+  if(TK)tkStop('');
+  lvStop();
+  RM=null;
+  var o=$('lvroom');if(o)o.remove();
+  unlockScroll();
+  if(S.page==='live')liveLoad();
+}
+function liveRoom(sid,name){
+  lvStop();
+  var old=$('lvroom');if(old)old.remove();
+  var o=document.createElement('div');o.id='lvroom';o.className='lvroom';
+  o.innerHTML='<div class="rm-top"><div class="rm-title">🎙️ '+esc(name||'الروم')+'</div><div class="rm-live"><span class="livedot"></span><span id="lv-st">⏳ جاري الاتصال...</span></div></div>'
+    +'<audio id="lv-a" controls autoplay style="display:none;width:90%;margin:6px auto"></audio>'
+    +'<div class="center" style="margin:4px 0"><button class="btn sm" id="lv-play" style="display:none">▶️ تشغيل الصوت</button> <button class="btn gray sm" id="lv-re">🔄 إعادة الاتصال</button></div>'
+    +'<div class="rm-body"><div id="lv-who" class="rm-grid"><div class="muted center" style="grid-column:1/-1">...</div></div></div>'
+    +'<div class="rm-foot"><div class="rm-lvl"><div id="tk-lvl"></div></div><div id="tk-st" class="rm-st"></div><div class="rm-bar" id="rm-bar"></div></div>';
+  document.body.appendChild(o);lockScroll();
+  RM={sid:sid,talking:false};
+  rmBar();
+  tkSet(S.recAdmin?'اضغط «تحدث» وصوتك يطلع داخل الروم. الأفضل تستخدم سماعة.':'');
+  var a=$('lv-a');
+  LV={sid:sid,a:a,timer:null,t2:null,errs:0};
+  var st=function(t){if(!LV||LV.a!==a)return;var e=$('lv-st');if(e)e.textContent=t;};
+  var canRaw=!!(window.AudioDecoder&&window.EncodedAudioChunk&&(window.AudioContext||window.webkitAudioContext)&&window.AbortController);
+  LV.rawErr=0;
+  var startRaw=function(){
+    if(!LV||LV.a!==a||$('lv-a')!==a)return;
+    try{if(LV.raw)LV.raw.stop();}catch(e){}
+    a.style.display='none';
+    try{
+      LV.raw=lvRaw(sid,st,function(why){
+        if(!LV||LV.a!==a)return;
+        if(why==='ended'){st('⚫ انتهى البث (الجلسة خلصت)');return;}
+        LV.rawErr++;
+        if(LV.rawErr<=5){st('⚠️ انقطع البث — جاري إعادة الاتصال...');setTimeout(startRaw,800);}
+        else{canRaw=false;a.style.display='';st('⚠️ تعذّر البث السريع — أستخدم الطريقة العادية');conn();}
+      },function(){if(!LV||LV.a!==a)return;LV.rawErr=0;st('🔴 مباشر الحين');});
+      var chk=function(){var pb=$('lv-play');if(!pb||!LV||!LV.raw)return;pb.style.display=(LV.raw.ctx.state==='running')?'none':'';};
+      setTimeout(chk,400);
+      var pb=$('lv-play');if(pb)pb.onclick=function(){try{LV.raw.ctx.resume();}catch(e){}setTimeout(chk,300);};
+    }catch(e){canRaw=false;a.style.display='';conn();}
+  };
+  var conn=function(){
+    if(canRaw){startRaw();return;}
+    try{a.playbackRate=1;}catch(e){}
+    a.src='/api/rec/live/'+encodeURIComponent(sid)+'/stream?t='+Date.now();
+    var p=a.play();if(p&&p.catch)p.catch(function(){st('اضغط تشغيل ▶️ لبدء الصوت');});
+  };
+  a.addEventListener('playing',function(){if(LV&&LV.a===a)LV.errs=0;st('🔴 مباشر الحين');});
+  a.addEventListener('waiting',function(){st('⏳ يحمّل الصوت...');});
+  a.addEventListener('error',function(){
+    if(!LV||LV.a!==a)return;
+    if(LV.errs<5){LV.errs++;st('⚠️ انقطع البث — جاري إعادة الاتصال...');setTimeout(function(){if(LV&&LV.a===a&&$('lv-a')===a)conn();},1500);}
+    else st('⚠️ انقطع البث — اضغط إعادة الاتصال');
+  });
+  a.addEventListener('ended',function(){st('⚫ انتهى البث (الجلسة خلصت أو انقطع الاتصال)');});
+  $('lv-re').onclick=function(){if(LV)LV.errs=0;conn();};
+  LV.t2=setInterval(function(){
+    if(!LV||LV.a!==a||a.paused)return;
+    try{
+      var bf=a.buffered;if(!bf||!bf.length)return;
+      var d=bf.end(bf.length-1)-a.currentTime,r=a.playbackRate;
+      if(d>4)r=1.5;else if(d>2.5)r=1.3;else if(d>1.5)r=1.15;else if(d<0.7)r=1;
+      if(r!==a.playbackRate)a.playbackRate=r;
+    }catch(e){}
+  },400);
+  conn();
+  var poll=async function(){
+    if(!LV||LV.sid!==sid)return;
+    if(!$('lv-a')){lvStop();return;}
+    try{
+      var j=await api('/api/rec/live/'+encodeURIComponent(sid)+'/info');
+      var w=$('lv-who');if(!w)return;
+      w.innerHTML=j.people.length?j.people.map(rmCard).join(''):'<div class="muted center" style="grid-column:1/-1;padding:40px 0">ما فيه أحد بالروم</div>';
+      if(j.ended)st('⚫ انتهت هذي الجلسة');
+    }catch(e){}
+  };
+  poll();
+  LV.timer=setInterval(poll,2000);
+}
+
 /* ══ نظام الخطر (لصاحب الصفحة فقط) — الزر مخفي، ويظهر/يختفي بالضغط على كلام «الأمن السيبراني» ══ */
 function logoTap(){if(!S.danger)return;var b=$('dangerBtn');if(b)b.classList.toggle('show');}
 async function openDanger(){
@@ -3954,7 +4134,7 @@ function liveRefresh(d){
     if($('ov')||$('dismissed'))return;
     var a=document.activeElement;
     if(a&&(a.tagName==='INPUT'||a.tagName==='TEXTAREA'||a.tagName==='SELECT'))return;
-    if(S.page==='rec'||S.page==='chans'||(S.page==='perms'&&S.chEdit))return;
+    if(S.page==='rec'||S.page==='chans'||S.page==='live'||$('lvroom')||(S.page==='perms'&&S.chEdit))return;
     var y=window.pageYOffset||0;
     render();
     setTimeout(function(){window.scrollTo(0,y);},350);
