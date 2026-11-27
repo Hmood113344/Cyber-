@@ -1168,7 +1168,7 @@ app.post("/api/rec/:id/channel", auth, recAdmin, wrap(async (req, res) => {
     const id = String(req.params.id || ""), chId = String((req.body && req.body.chId) || "");
     if (!/^[\w-]{1,40}$/.test(id)) return res.status(400).json({ error: "معرّف غير صحيح" });
     if (!/^\d{5,25}$/.test(chId)) return res.status(400).json({ error: "اختر روم صوتي" });
-    const r = await callRecBot("rec_setchan", { id, chId, ...recWho(req) }, 60000);
+    const r = await callRecBot("rec_setchan", { id, chId, pin: !(req.body && req.body.pin === false), ...recWho(req) }, 60000);
     await panelLog(req, "تعيين روم لبوت تسجيل", "المعرّف: " + id + "\n🎙️ الروم: " + (r.name || chId), { targetId: chId, targetTag: r.name || chId });
     res.json({ ok: true, ...r });
 }));
@@ -3691,7 +3691,7 @@ async function recLoad(){
       var title=main?'🤖 البوت الأساسي'+(b.botTag?' — '+esc(b.botTag):''):'🤖 '+esc(b.botTag||b.id);
       var kind=main?(b.isDefault?'الروم الافتراضي':'روم مختار من الموقع'):'بوت بتوكن';
       return '<div class="card'+(ls?' clk':'')+'"'+(ls?' data-reclive="'+esc(ls.sid)+'" data-chn="'+esc(b.chName||ls.chName||'')+'"':'')+'><div class="bot">'+(b.avatar?'<img src="'+esc(b.avatar)+'" alt="">':'')
-        +'<div style="flex:1;min-width:200px"><div class="log-title">'+title+' <span class="badge low">'+kind+'</span></div>'
+        +'<div style="flex:1;min-width:200px"><div class="log-title">'+title+' <span class="badge low">'+kind+'</span>'+(b.pinned?' <span class="badge low">📌 مثبّت</span>':'')+'</div>'
         +'<div class="log-meta">🎙️ الروم: '+(b.chName?esc(b.chName):'<span class="muted">غير موجود</span>')+'</div>'
         +'<div class="log-meta">'+st+'</div>'
         +(b.error?'<div class="log-meta" style="color:#f87171">'+esc(b.error)+'</div>':'')
@@ -3721,11 +3721,12 @@ function recChan(id,cur){
     modal('<h3 style="color:#60a5fa">تعيين شات محدد</h3>'
       +'<div class="muted" style="font-size:13px">اختر الروم اللي يسجّله هذا البوت.</div>'
       +'<label style="'+lb+'">الروم</label><select id="recChSel">'+opts+'</select>'
+      +'<label style="display:flex;align-items:center;gap:8px;margin-top:14px;font-size:13px"><input type="checkbox" id="recChPin" checked style="width:auto"> 📌 ثبّته على هذا الروم (خارج التوزيع التلقائي، ولا بوت ثاني يدخل رومه)</label>'
       +'<div class="row" style="justify-content:flex-start;gap:8px;margin-top:16px"><button class="btn" id="recChGo">تعيين</button><button class="btn gray" onclick="closeModal()">إلغاء</button></div>');
     $('recChGo').onclick=async function(){
       var btn=this;btn.disabled=true;btn.textContent='جاري التنفيذ...';
       try{
-        var r=await api('/api/rec/'+id+'/channel',{method:'POST',body:JSON.stringify({chId:$('recChSel').value})});
+        var r=await api('/api/rec/'+id+'/channel',{method:'POST',body:JSON.stringify({chId:$('recChSel').value,pin:$('recChPin').checked})});
         closeModal();toast('تم — البوت يسجّل الحين: '+(r.name||''));
         if(S.page==='rec')recLoad();
       }catch(e){toast(e.message);btn.disabled=false;btn.textContent='تعيين';}
