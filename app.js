@@ -1156,6 +1156,22 @@ app.delete("/api/rec/:id", auth, recAdmin, wrap(async (req, res) => {
     res.json({ ok: true });
 }));
 
+app.post("/api/rec/:id/pause", auth, recAdmin, wrap(async (req, res) => {
+    const id = String(req.params.id || "");
+    if (!/^[\w-]{1,40}$/.test(id)) return res.status(400).json({ error: "معرّف غير صحيح" });
+    const paused = !!(req.body && req.body.paused);
+    await callRecBot("rec_pause", { id, paused, ...recWho(req) }, 60000);
+    await panelLog(req, paused ? "إيقاف بوت تسجيل رومات" : "تشغيل بوت تسجيل رومات", "المعرّف: " + id);
+    res.json({ ok: true, paused });
+}));
+app.post("/api/rec/:id/channel", auth, recAdmin, wrap(async (req, res) => {
+    const id = String(req.params.id || ""), chId = String((req.body && req.body.chId) || "");
+    if (!/^[\w-]{1,40}$/.test(id)) return res.status(400).json({ error: "معرّف غير صحيح" });
+    if (!/^\d{5,25}$/.test(chId)) return res.status(400).json({ error: "اختر روم صوتي" });
+    const r = await callRecBot("rec_setchan", { id, chId, ...recWho(req) }, 60000);
+    await panelLog(req, "تعيين روم لبوت تسجيل", "المعرّف: " + id + "\n🎙️ الروم: " + (r.name || chId), { targetId: chId, targetTag: r.name || chId });
+    res.json({ ok: true, ...r });
+}));
 
 // ── استماع مباشر لبوت التسجيل: الجلسات الجارية الحين + معلومات الروم + بث الصوت الحي ──
 app.get("/api/rec/live", auth, wrap(async (req, res) => {
@@ -3638,12 +3654,16 @@ async function dismissMember(id,name){
 }
 
 /* ══ بوت تسجيل الرومات (لصاحب الصفحة فقط) ══ */
-var REC_ST={recording:'🔴 يسجّل الآن',live:'🟢 شغّال — ينتظر أحد يدخل الروم',starting:'🟡 جاري التشغيل...',error:'❌ فيه مشكلة',off:'⚫ متوقف'};
+var REC_ST={recording:'🔴 يسجّل الآن',live:'🟢 شغّال — ينتظر أحد يدخل الروم',starting:'🟡 جاري التشغيل...',error:'❌ فيه مشكلة',off:'⚫ متوقف',paused:'⏸️ موقوف — ما يسجّل'};
 async function pgRec(){
   $('main').innerHTML='<div class="row" style="justify-content:space-between;align-items:center;margin-bottom:10px"><h2 style="margin:0">🎙️ بوت تسجيل الرومات</h2><button class="btn" id="recNew">➕ إنشاء بوت</button></div>'
     +'<div class="muted" style="font-size:12px;margin-bottom:10px">البوت يدخل الروم أول ما يدخله أحد ويسجّل الصوت، ويطلع باللوق زر «التسجيل التوضيحي» لكل جلسة.</div><div id="recbox"><div class="card center muted">جاري التحميل...</div></div>';
   $('recNew').onclick=recNew;
   $('main').onclick=function(ev){
+    var pz=ev.target.closest('[data-recpause]');
+    if(pz){recPause(pz.getAttribute('data-recpause'),pz.getAttribute('data-to')==='1');return;}
+    var cz=ev.target.closest('[data-recchan]');
+    if(cz){recChan(cz.getAttribute('data-recchan'),cz.getAttribute('data-chid'));return;}
     var d=ev.target.closest('[data-recdel]');
     if(d){recDel(d.getAttribute('data-recdel'),d.getAttribute('data-main')==='1');return;}
     var l=ev.target.closest('[data-reclive]');
@@ -3651,7 +3671,7 @@ async function pgRec(){
   };
   await recLoad();
   clearInterval(S.timer);
-  S.timer=setInterval(function(){if(S.page==='rec'&&!$('ov')&&!$('lvroom'))recLoad();},5000);
+  S.timer=setInterval(function(){if(S.page==='rec'&&!$('ov')&&!$('lvroom'))recLoad();},3000);
 }
 async function recLoad(){
   try{
@@ -3665,7 +3685,7 @@ async function recLoad(){
         var mt=lvs.filter(function(x){return (b.chId&&x.chId&&String(b.chId)===String(x.chId))||(b.chName&&x.chName&&b.chName===x.chName);});
         ls=mt.length?mt[0]:(lvs.length===1?lvs[0]:null);
       }
-      var main=b.id==='main';
+      var main=b.id==='main',paused=b.status==='paused';
       var st=REC_ST[b.status]||b.status;
       if(b.status==='recording'&&b.users!=null)st+=' ('+b.users+')';
       var title=main?'🤖 البوت الأساسي'+(b.botTag?' — '+esc(b.botTag):''):'🤖 '+esc(b.botTag||b.id);
@@ -3678,11 +3698,39 @@ async function recLoad(){
         +(b.createdBy?'<div class="log-meta">👤 أنشأه: '+esc(b.createdBy)+'</div>':'')
         +(ls?'<div class="log-meta" style="color:#f87171">🔴 يسجّل الحين — اضغط على البوت للاستماع المباشر</div>':'')+'</div>'
         +(ls?'<button class="btn sm" data-reclive="'+esc(ls.sid)+'" data-chn="'+esc(b.chName||ls.chName||'')+'">🎧 استمع مباشر</button>':'')
+        +'<button class="btn sm gray" data-recpause="'+esc(b.id)+'" data-to="'+(paused?'0':'1')+'">'+(paused?'▶️ تشغيل':'⏸️ إيقاف')+'</button>'
+        +'<button class="btn sm" data-recchan="'+esc(b.id)+'" data-chid="'+esc(b.chId||'')+'">🎙️ تعيين شات محدد</button>'
         +((main&&b.isDefault)?'':'<button class="btn sm danger" data-recdel="'+esc(b.id)+'" data-main="'+(main?'1':'0')+'">'+(main?'↩️ رجّعه للافتراضي':'🗑️ حذف')+'</button>')
         +'</div></div>';
     }).join('');
     $('recbox').innerHTML=h||'<div class="card center muted">ما فيه بوتات</div>';
   }catch(e){if(S.page==='rec'&&$('recbox')&&!$('recbox').querySelector('.card .bot'))$('recbox').innerHTML='<div class="card center muted">'+esc(e.message)+'</div>';}
+}
+function recPause(id,to){
+  api('/api/rec/'+id+'/pause',{method:'POST',body:JSON.stringify({paused:to})})
+    .then(function(){toast(to?'تم الإيقاف — ما راح يسجّل':'تم التشغيل');if(S.page==='rec')recLoad();})
+    .catch(function(e){toast(e.message);});
+}
+function recChan(id,cur){
+  modal('<h3>تعيين شات محدد</h3><div class="card center muted">جاري تحميل الرومات الصوتية...</div>');
+  api('/api/rec/rooms').then(function(j){
+    var rooms=j.rooms;
+    if(!rooms.length){closeModal();toast('ما فيه رومات صوتية بالسيرفر');return;}
+    var opts=rooms.map(function(r){return '<option value="'+esc(r.id)+'"'+(String(r.id)===String(cur)?' selected':'')+'>'+esc(r.icon+' '+r.name+(r.parent?'  ('+r.parent+')':'')+(r.members?'  — '+r.members+' بالروم':''))+'</option>';}).join('');
+    var lb='display:block;color:#60a5fa;font-size:13px;margin:12px 0 6px';
+    modal('<h3 style="color:#60a5fa">تعيين شات محدد</h3>'
+      +'<div class="muted" style="font-size:13px">اختر الروم اللي يسجّله هذا البوت.</div>'
+      +'<label style="'+lb+'">الروم</label><select id="recChSel">'+opts+'</select>'
+      +'<div class="row" style="justify-content:flex-start;gap:8px;margin-top:16px"><button class="btn" id="recChGo">تعيين</button><button class="btn gray" onclick="closeModal()">إلغاء</button></div>');
+    $('recChGo').onclick=async function(){
+      var btn=this;btn.disabled=true;btn.textContent='جاري التنفيذ...';
+      try{
+        var r=await api('/api/rec/'+id+'/channel',{method:'POST',body:JSON.stringify({chId:$('recChSel').value})});
+        closeModal();toast('تم — البوت يسجّل الحين: '+(r.name||''));
+        if(S.page==='rec')recLoad();
+      }catch(e){toast(e.message);btn.disabled=false;btn.textContent='تعيين';}
+    };
+  }).catch(function(e){closeModal();toast(e.message);});
 }
 function recNew(){
   modal('<h3>إنشاء بوت تسجيل</h3><div class="card center muted">جاري تحميل الرومات الصوتية...</div>');
