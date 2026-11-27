@@ -2115,7 +2115,8 @@ function vrShell(){
   h+='<div id="vr-listen" class="muted" style="text-align:center;font-size:12px;margin-bottom:8px"></div>';
   h+='<div class="card" style="padding:8px 12px;margin:6px 0"><div style="font-size:13px;font-weight:700;margin-bottom:6px">✂️ تحديد مقطع</div>'
     +'<div class="row" style="gap:6px;flex-wrap:wrap;direction:ltr;justify-content:center"><input id="vr-r0" placeholder="من 0:00" style="width:78px;text-align:center" onchange="vrRangeInput(0,this.value)"><button class="btn gray sm" onclick="vrRangeSet(0)">📍 من هنا</button><button class="btn gray sm" onclick="vrRangeSet(1)">🏁 إلى هنا</button><input id="vr-r1" placeholder="إلى 0:00" style="width:78px;text-align:center" onchange="vrRangeInput(1,this.value)"></div>'
-    +'<div class="row" style="justify-content:center;gap:6px;margin-top:6px"><button class="btn sm" onclick="vrRangePlay()">▶️ شغّل المقطع</button><button class="btn gray sm" onclick="vrRangeClear()">🧹 مسح</button></div></div>';
+    +'<div class="row" style="justify-content:center;gap:6px;margin-top:6px"><button class="btn sm" onclick="vrRangePlay()">▶️ شغّل المقطع</button><button class="btn gray sm" onclick="vrRangeClear()">🧹 مسح</button></div>'
+    +(s.hasAudio?('<div class="row" style="justify-content:center;gap:6px;margin-top:6px"><button class="btn sm" id="vr-cut-go" onclick="vrCutExport()">⬇️ تحميل MP3</button></div><div id="vr-cut-st" class="muted" style="text-align:center;font-size:12px;min-height:16px;margin-top:4px"></div>'):'')+'</div>';
   h+='<div class="card" style="padding:8px 12px;margin:6px 0"><div id="vr-who-t" style="font-size:13px;font-weight:700;margin-bottom:6px"></div><div id="vr-who"></div></div>';
   h+='<div class="row" style="justify-content:center;margin-top:8px"><button class="btn danger sm" onclick="vrClose()">✖ إغلاق</button></div>';
   return h;
@@ -2253,6 +2254,96 @@ function vrRangeInput(w,val){
   vrRangePaint();
 }
 function vrRangeClear(){if(!VR)return;VR.r0=null;VR.r1=null;VR.clip=false;vrRangePaint();}
+
+/* ✂️ قص مقطع من تسجيل الروم الصوتي وتحميله MP3 */
+function vrCutLoadLame(){
+  if(window.lamejs)return Promise.resolve();
+  var urls=['https://cdnjs.cloudflare.com/ajax/libs/lamejs/1.2.1/lame.min.js','https://cdn.jsdelivr.net/npm/lamejs@1.2.1/lame.min.js'];
+  var go=function(i){
+    if(i>=urls.length)return Promise.reject(new Error('lame'));
+    return new Promise(function(ok,no){
+      var s=document.createElement('script');
+      s.src=urls[i];
+      s.onload=function(){if(window.lamejs)ok();else no(new Error('lame'));};
+      s.onerror=function(){no(new Error('lame'));};
+      document.head.appendChild(s);
+    }).catch(function(){return go(i+1);});
+  };
+  return go(0);
+}
+function vrCutWav(pcm,rate){
+  var n=pcm.length,buf=new ArrayBuffer(44+n*2),v=new DataView(buf),i;
+  function w(o,s){for(var k=0;k<s.length;k++)v.setUint8(o+k,s.charCodeAt(k));}
+  w(0,'RIFF');v.setUint32(4,36+n*2,true);w(8,'WAVE');w(12,'fmt ');v.setUint32(16,16,true);v.setUint16(20,1,true);v.setUint16(22,1,true);
+  v.setUint32(24,rate,true);v.setUint32(28,rate*2,true);v.setUint16(32,2,true);v.setUint16(34,16,true);w(36,'data');v.setUint32(40,n*2,true);
+  for(i=0;i<n;i++)v.setInt16(44+i*2,pcm[i],true);
+  return new Blob([buf],{type:'audio/wav'});
+}
+async function vrCutExport(){
+  if(!VR||VR.cutBusy)return;
+  if(VR.r0==null){toast('حدد بداية المقطع أول (📍 من هنا)');return;}
+  var a=Math.max(0,Math.round(VR.r0)),b=VR.r1!=null?Math.round(VR.r1):VR.span;
+  if(b<=a){toast('نهاية المقطع لازم تكون بعد بدايته');return;}
+  if(b-a>3600000){toast('اختر مقطع أقل من ساعة');return;}
+  var keys=vrKeys(),key=keys.length===1?keys[0]:'mix';
+  var off=vrOff(key),url='/api/voice/'+encodeURIComponent(VR.sid)+'/audio?v=2'+(key==='mix'?'':'&u='+encodeURIComponent(key));
+  var btn=$('vr-cut-go'),st=$('vr-cut-st');
+  var say=function(t){if(st)st.textContent=t;};
+  VR.cutBusy=true;if(btn)btn.disabled=true;
+  var ctx=null;
+  try{
+    say('جاري تحميل الصوت...');
+    var resp=await fetch(url,{credentials:'same-origin'});
+    if(!resp.ok)throw new Error('تعذر تحميل التسجيل');
+    var ab=await resp.arrayBuffer();
+    var AC=window.AudioContext||window.webkitAudioContext;
+    try{ctx=new AC({sampleRate:22050});}catch(e){ctx=new AC();}
+    var buf=await new Promise(function(ok,no){
+      var pr=ctx.decodeAudioData(ab,ok,no);
+      if(pr&&pr.catch)pr.catch(no);
+    });
+    var rate=buf.sampleRate;
+    var s0=Math.max(0,Math.round((a-off)/1000*rate)),s1=Math.max(s0,Math.round((b-off)/1000*rate));
+    s0=Math.min(s0,buf.length);s1=Math.min(s1,buf.length);
+    var n=Math.max(1,s1-s0),pcm=new Int16Array(n);
+    var c0=buf.getChannelData(0),c1=buf.numberOfChannels>1?buf.getChannelData(1):null;
+    for(var i=0;i<n;i++){
+      var idx=s0+i;
+      var v=idx<buf.length?(c1?(c0[idx]+c1[idx])/2:c0[idx]):0;
+      if(v>1)v=1;else if(v<-1)v=-1;
+      pcm[i]=v<0?v*32768:v*32767;
+    }
+    say('جاري التحويل إلى MP3...');
+    var blob=null,ext='mp3';
+    try{
+      await vrCutLoadLame();
+      var enc=new lamejs.Mp3Encoder(1,rate,64),out=[],step=1152*10;
+      for(var p=0,q=0;p<pcm.length;p+=step,q++){
+        var d=enc.encodeBuffer(pcm.subarray(p,p+step));
+        if(d.length)out.push(d);
+        if(q%20===19)await new Promise(function(ok){setTimeout(ok,0);});
+      }
+      var f=enc.flush();
+      if(f.length)out.push(f);
+      blob=new Blob(out,{type:'audio/mpeg'});
+    }catch(e){
+      blob=vrCutWav(pcm,rate);ext='wav';
+      toast('تعذر تحميل مشفّر MP3، تم التحميل بصيغة WAV');
+    }
+    var dlUrl=URL.createObjectURL(blob),el=document.createElement('a');
+    el.href=dlUrl;
+    el.download='voice_'+(VR.sid||'rec')+'_'+Math.round(a/1000)+'s-'+Math.round(b/1000)+'s.'+ext;
+    document.body.appendChild(el);el.click();el.remove();
+    setTimeout(function(){URL.revokeObjectURL(dlUrl);},10000);
+    say('✅ تم التحميل ('+vrDur(b-a)+')');
+  }catch(e){
+    say('');
+    toast(e&&e.message?e.message:'تعذر قص التسجيل');
+  }finally{
+    VR.cutBusy=false;if(btn)btn.disabled=false;
+    try{if(ctx)ctx.close();}catch(e){}
+  }
+}
 function vrRangePlay(){
   if(!VR)return;
   if(VR.r0==null){toast('حدد بداية المقطع أول');return;}
