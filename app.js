@@ -1164,11 +1164,19 @@ app.post("/api/rec/:id/pause", auth, recAdmin, wrap(async (req, res) => {
     await panelLog(req, paused ? "إيقاف بوت تسجيل رومات" : "تشغيل بوت تسجيل رومات", "المعرّف: " + id);
     res.json({ ok: true, paused });
 }));
+app.post("/api/rec/:id/dist", auth, recAdmin, wrap(async (req, res) => {
+    const id = String(req.params.id || "");
+    if (!/^[\w-]{1,40}$/.test(id)) return res.status(400).json({ error: "معرّف غير صحيح" });
+    const on = !!(req.body && req.body.on);
+    await callRecBot("rec_dist", { id, on, ...recWho(req) }, 60000);
+    await panelLog(req, on ? "إدخال بوت تسجيل بالتوزيع" : "إخراج بوت تسجيل من التوزيع", "المعرّف: " + id);
+    res.json({ ok: true, on });
+}));
 app.post("/api/rec/:id/channel", auth, recAdmin, wrap(async (req, res) => {
     const id = String(req.params.id || ""), chId = String((req.body && req.body.chId) || "");
     if (!/^[\w-]{1,40}$/.test(id)) return res.status(400).json({ error: "معرّف غير صحيح" });
     if (!/^\d{5,25}$/.test(chId)) return res.status(400).json({ error: "اختر روم صوتي" });
-    const r = await callRecBot("rec_setchan", { id, chId, pin: !(req.body && req.body.pin === false), ...recWho(req) }, 60000);
+    const r = await callRecBot("rec_setchan", { id, chId, ...recWho(req) }, 60000);
     await panelLog(req, "تعيين روم لبوت تسجيل", "المعرّف: " + id + "\n🎙️ الروم: " + (r.name || chId), { targetId: chId, targetTag: r.name || chId });
     res.json({ ok: true, ...r });
 }));
@@ -3662,6 +3670,8 @@ async function pgRec(){
   $('main').onclick=function(ev){
     var pz=ev.target.closest('[data-recpause]');
     if(pz){recPause(pz.getAttribute('data-recpause'),pz.getAttribute('data-to')==='1');return;}
+    var dz=ev.target.closest('[data-recdist]');
+    if(dz){recDist(dz.getAttribute('data-recdist'),dz.getAttribute('data-to')==='1');return;}
     var cz=ev.target.closest('[data-recchan]');
     if(cz){recChan(cz.getAttribute('data-recchan'),cz.getAttribute('data-chid'));return;}
     var d=ev.target.closest('[data-recdel]');
@@ -3691,7 +3701,7 @@ async function recLoad(){
       var title=main?'🤖 البوت الأساسي'+(b.botTag?' — '+esc(b.botTag):''):'🤖 '+esc(b.botTag||b.id);
       var kind=main?(b.isDefault?'الروم الافتراضي':'روم مختار من الموقع'):'بوت بتوكن';
       return '<div class="card'+(ls?' clk':'')+'"'+(ls?' data-reclive="'+esc(ls.sid)+'" data-chn="'+esc(b.chName||ls.chName||'')+'"':'')+'><div class="bot">'+(b.avatar?'<img src="'+esc(b.avatar)+'" alt="">':'')
-        +'<div style="flex:1;min-width:200px"><div class="log-title">'+title+' <span class="badge low">'+kind+'</span>'+(b.pinned?' <span class="badge low">📌 مثبّت</span>':'')+'</div>'
+        +'<div style="flex:1;min-width:200px"><div class="log-title">'+title+' <span class="badge low">'+kind+'</span>'+(b.pinned?' <span class="badge low">📌 خارج التوزيع</span>':'')+'</div>'
         +'<div class="log-meta">🎙️ الروم: '+(b.chName?esc(b.chName):'<span class="muted">غير موجود</span>')+'</div>'
         +'<div class="log-meta">'+st+'</div>'
         +(b.error?'<div class="log-meta" style="color:#f87171">'+esc(b.error)+'</div>':'')
@@ -3699,6 +3709,7 @@ async function recLoad(){
         +(ls?'<div class="log-meta" style="color:#f87171">🔴 يسجّل الحين — اضغط على البوت للاستماع المباشر</div>':'')+'</div>'
         +(ls?'<button class="btn sm" data-reclive="'+esc(ls.sid)+'" data-chn="'+esc(b.chName||ls.chName||'')+'">🎧 استمع مباشر</button>':'')
         +'<button class="btn sm gray" data-recpause="'+esc(b.id)+'" data-to="'+(paused?'0':'1')+'">'+(paused?'▶️ تشغيل':'⏸️ إيقاف')+'</button>'
+        +'<button class="btn sm gray" data-recdist="'+esc(b.id)+'" data-to="'+(b.pinned?'1':'0')+'">🔀 التوزيع: '+(b.pinned?'مطفي':'شغّال')+'</button>'
         +'<button class="btn sm" data-recchan="'+esc(b.id)+'" data-chid="'+esc(b.chId||'')+'">🎙️ تعيين شات محدد</button>'
         +((main&&b.isDefault)?'':'<button class="btn sm danger" data-recdel="'+esc(b.id)+'" data-main="'+(main?'1':'0')+'">'+(main?'↩️ رجّعه للافتراضي':'🗑️ حذف')+'</button>')
         +'</div></div>';
@@ -3711,6 +3722,11 @@ function recPause(id,to){
     .then(function(){toast(to?'تم الإيقاف — ما راح يسجّل':'تم التشغيل');if(S.page==='rec')recLoad();})
     .catch(function(e){toast(e.message);});
 }
+function recDist(id,on){
+  api('/api/rec/'+id+'/dist',{method:'POST',body:JSON.stringify({on:on})})
+    .then(function(){toast(on?'تم — البوت دخل بالتوزيع التلقائي':'تم — البوت ثابت على رومه وخارج التوزيع');if(S.page==='rec')recLoad();})
+    .catch(function(e){toast(e.message);});
+}
 function recChan(id,cur){
   modal('<h3>تعيين شات محدد</h3><div class="card center muted">جاري تحميل الرومات الصوتية...</div>');
   api('/api/rec/rooms').then(function(j){
@@ -3721,12 +3737,11 @@ function recChan(id,cur){
     modal('<h3 style="color:#60a5fa">تعيين شات محدد</h3>'
       +'<div class="muted" style="font-size:13px">اختر الروم اللي يسجّله هذا البوت.</div>'
       +'<label style="'+lb+'">الروم</label><select id="recChSel">'+opts+'</select>'
-      +'<label style="display:flex;align-items:center;gap:8px;margin-top:14px;font-size:13px"><input type="checkbox" id="recChPin" checked style="width:auto"> 📌 ثبّته على هذا الروم (خارج التوزيع التلقائي، ولا بوت ثاني يدخل رومه)</label>'
       +'<div class="row" style="justify-content:flex-start;gap:8px;margin-top:16px"><button class="btn" id="recChGo">تعيين</button><button class="btn gray" onclick="closeModal()">إلغاء</button></div>');
     $('recChGo').onclick=async function(){
       var btn=this;btn.disabled=true;btn.textContent='جاري التنفيذ...';
       try{
-        var r=await api('/api/rec/'+id+'/channel',{method:'POST',body:JSON.stringify({chId:$('recChSel').value,pin:$('recChPin').checked})});
+        var r=await api('/api/rec/'+id+'/channel',{method:'POST',body:JSON.stringify({chId:$('recChSel').value})});
         closeModal();toast('تم — البوت يسجّل الحين: '+(r.name||''));
         if(S.page==='rec')recLoad();
       }catch(e){toast(e.message);btn.disabled=false;btn.textContent='تعيين';}
